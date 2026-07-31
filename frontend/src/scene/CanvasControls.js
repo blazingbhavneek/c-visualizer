@@ -385,11 +385,13 @@ export default class CanvasControls {
     if (this._mode === "tilt") {
       // No yaw limit at all: keep dragging and the view swings behind the tree.
       //
-      // Sign note: an orbit's apparent motion is dominated by the camera's
-      // rotation, not its translation. Swinging the camera left rotates the
-      // scene left too, so the content moved *against* the mouse. Measured on a
-      // tree, a 180px right-drag shifted content -32px before this flip.
-      this.yaw = resistedRotation(this.yaw, dx * ROTATE_SPEED, YAW_SCALE);
+      // Sign note: rotation is judged by which face of the tree comes into
+      // view, not by which way the pixels slide. Dragging right swings the
+      // camera to the tree's LEFT, so its left side is what you end up looking
+      // at - the same thing turning your head does in the two-plane view.
+      // Optimising instead for "content follows the pointer" sends the camera
+      // the other way and was wrong.
+      this.yaw = resistedRotation(this.yaw, -dx * ROTATE_SPEED, YAW_SCALE);
       this.pitch = resistedRotation(this.pitch, dy * ROTATE_SPEED, PITCH_SCALE, {
         hardLimit: HARD_PITCH,
       });
