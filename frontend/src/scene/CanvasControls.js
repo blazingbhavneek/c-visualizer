@@ -23,9 +23,15 @@ import * as THREE from "three";
  * amount of screen there as it does on a flat canvas.
  */
 
-const MAX_YAW = THREE.MathUtils.degToRad(24);
-const MAX_PITCH = THREE.MathUtils.degToRad(18);
-const PIVOT_MAX_PITCH = THREE.MathUtils.degToRad(28);
+/**
+ * These are resistance *scales*, not walls. Rotation gets heavy around them but
+ * never stops: a determined drag can carry the view all the way behind a tree.
+ * Only pitch has a genuine limit, to keep the up-vector from inverting.
+ */
+const YAW_SCALE = THREE.MathUtils.degToRad(24);
+const PITCH_SCALE = THREE.MathUtils.degToRad(18);
+const HARD_PITCH = THREE.MathUtils.degToRad(85);
+const PIVOT_PITCH_SCALE = THREE.MathUtils.degToRad(28);
 const ROTATE_SPEED = 0.0042;
 const LOOK_SPEED = 0.0032;
 const ZOOM_SPEED = 0.0012;
@@ -33,18 +39,25 @@ const DAMPING = 0.14;
 /** Fraction of the current tilt kept when the active canvas changes. */
 const TILT_CARRYOVER = 0.25;
 /**
- * Rotation is spring-loaded rather than free inside a hard wall.
+ * Rotation is spring-loaded, not fenced.
  *
- * Turning away from the resting angle gets progressively heavier the further
- * out you are, turning back is easier than neutral, and letting go lets the
- * view drift home. The straight-on view of a plane is the one worth being in,
- * so it should take effort to leave and none to return.
+ * Turning away from the resting angle gets heavier the further out you are,
+ * turning back is easier than neutral, and letting go lets the view drift home.
+ * The straight-on view of a plane is the one worth being in, so it takes effort
+ * to leave and none to return - but it is never forbidden. The resistance is
+ * floored so that continued dragging always makes progress; swinging right
+ * around to the back of a tree is roughly two full-width drags.
  */
 const RETURN_ASSIST = 1.4;
-const MIN_RESISTANCE = 0.1;
+const MIN_RESISTANCE = 0.22;
 /** Per-frame fraction of the remaining offset given back while idle. */
 const RECENTER_CANVAS = 0.05;
 const RECENTER_PIVOT = 0.03;
+/**
+ * Ceiling on the drift-home speed. Without it a view pushed right around snaps
+ * back before it can be looked at; with it the return takes a few seconds.
+ */
+const MAX_RECENTER_STEP = THREE.MathUtils.degToRad(0.8);
 /** How much of the gap to a plane the viewer may cross when walking. */
 const PIVOT_ADVANCE_LIMIT = 0.78;
 
@@ -52,12 +65,22 @@ const PIVOT_ADVANCE_LIMIT = 0.78;
  * Move a rotation toward `delta`, resisting movement away from rest and
  * assisting movement back toward it.
  */
-function resistedRotation(current, delta, limit, rest = 0) {
+function resistedRotation(current, delta, scale, { rest = 0, hardLimit = Infinity } = {}) {
   const offset = current - rest;
   const movingAway = offset === 0 || Math.sign(delta) === Math.sign(offset);
-  const ratio = Math.min(1, Math.abs(offset) / limit);
-  const factor = movingAway ? Math.max(MIN_RESISTANCE, 1 - ratio * ratio) : RETURN_ASSIST;
-  return THREE.MathUtils.clamp(offset + delta * factor, -limit, limit) + rest;
+  const ratio = Math.abs(offset) / scale;
+  const factor = movingAway ? Math.max(MIN_RESISTANCE, 1 / (1 + ratio * ratio)) : RETURN_ASSIST;
+  let next = offset + delta * factor;
+  if (hardLimit !== Infinity) next = THREE.MathUtils.clamp(next, -hardLimit, hardLimit);
+  return next + rest;
+}
+
+/** Ease a value toward zero, proportionally but never faster than the cap. */
+function driftToward(value, target, rate) {
+  const offset = value - target;
+  if (Math.abs(offset) < 1e-4) return target;
+  const step = Math.min(Math.abs(offset) * rate, MAX_RECENTER_STEP);
+  return value - Math.sign(offset) * step;
 }
 
 export default class CanvasControls {
@@ -281,14 +304,13 @@ export default class CanvasControls {
   _recenter() {
     if (this._mode === "tilt" || this._mode === "look") return;
     if (this.mode === "pivot") {
-      this.pitch += -this.pitch * RECENTER_PIVOT;
+      this.pitch = driftToward(this.pitch, 0, RECENTER_PIVOT);
       // Settle onto whichever tree is being looked at rather than between them.
-      const heading = this._nearestHeading();
-      this.pivotHeading += (heading - this.pivotHeading) * RECENTER_PIVOT;
+      this.pivotHeading = driftToward(this.pivotHeading, this._nearestHeading(), RECENTER_PIVOT);
       return;
     }
-    this.yaw += -this.yaw * RECENTER_CANVAS;
-    this.pitch += -this.pitch * RECENTER_CANVAS;
+    this.yaw = driftToward(this.yaw, 0, RECENTER_CANVAS);
+    this.pitch = driftToward(this.pitch, 0, RECENTER_CANVAS);
   }
 
   _snap() {
@@ -344,9 +366,13 @@ export default class CanvasControls {
 
     if (this._mode === "look") {
       this.pivotHeading = this._clampYaw(
-        resistedRotation(this.pivotHeading, dx * LOOK_SPEED, this.pivotYawLimit, this._nearestHeading()),
+        resistedRotation(this.pivotHeading, dx * LOOK_SPEED, this.pivotYawLimit, {
+          rest: this._nearestHeading(),
+        }),
       );
-      this.pitch = resistedRotation(this.pitch, dy * LOOK_SPEED, PIVOT_MAX_PITCH);
+      this.pitch = resistedRotation(this.pitch, dy * LOOK_SPEED, PIVOT_PITCH_SCALE, {
+        hardLimit: HARD_PITCH,
+      });
       return;
     }
 
@@ -362,8 +388,11 @@ export default class CanvasControls {
     }
 
     if (this._mode === "tilt") {
-      this.yaw = resistedRotation(this.yaw, -dx * ROTATE_SPEED, MAX_YAW);
-      this.pitch = resistedRotation(this.pitch, dy * ROTATE_SPEED, MAX_PITCH);
+      // No yaw limit at all: keep dragging and the view swings behind the tree.
+      this.yaw = resistedRotation(this.yaw, -dx * ROTATE_SPEED, YAW_SCALE);
+      this.pitch = resistedRotation(this.pitch, dy * ROTATE_SPEED, PITCH_SCALE, {
+        hardLimit: HARD_PITCH,
+      });
       return;
     }
 
