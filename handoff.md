@@ -1,447 +1,401 @@
-# Frontend replacement handoff
+# Frontend cleanup handoff
 
-## Purpose
+## Who this is for
 
-Replace the current frontend freely. Its only job is to explore **immutable
-static-analysis snapshots**: a process's functions and calls, plus any
-daemon-resource evidence inferred during analysis. It is not a live C parser,
-does not run the analysis pipeline, and should not scrape the legacy CSV,
-Mermaid, or PyVis outputs.
+You are being asked to **simplify and harden an existing frontend**, not to
+rewrite it. It works and the owner is happy with its behaviour; the complaint is
+about the code.
 
-The source of truth for a new UI is `graph.json`, served through the small
-read-only API in `frontend/server.py`.
+This document is written by the agent that built it, so treat the *opinions*
+here with suspicion and the *facts* as checkable. Everything under
+"Invariants" was learned by getting it wrong first — those are the parts most
+likely to be silently broken by a well-intentioned refactor, and each one names
+the symptom you'll see if you break it.
 
-## Where the data comes from
+There are **no automated tests**. That is the single biggest weakness. Read
+"Verification" before you change anything.
 
-```text
-project_aware.py
-  ├─ captures the complete static call graph and target-specific traces
-  ├─ records each validated analysis result (a `Combined` result)
-  └─ VisualizerCollector.write()
-       └─ results/csv_results/visualizer/<process>/runs/<run_id>/graph.json
-            └─ frontend/server.py
-                 └─ /api/runs, /api/graph, /api/source
-                      └─ browser UI
-```
+---
 
-`visualizer_export.py` owns the snapshot schema. `project_aware.py` creates a
-collector for a run, calls `capture_call_graph(...)` while tracing target APIs,
-calls `record_combined(...)` for each completed result, then calls `write()` at
-the end. The export is additive: each write creates a new run directory and
-does not modify an existing snapshot.
+## What the app is
 
-Important distinction:
+A viewer for **immutable static-analysis snapshots** of a C codebase: a
+process's functions and calls, plus daemon-resource evidence inferred during
+analysis. It does not parse C, does not run the pipeline, and must not scrape
+the legacy CSV/Mermaid/PyVis outputs.
 
-- **Functions and calls** come from static call-graph construction.
-- **Traces** are selected `main`-to-target display paths.
-- **Resources and interactions** come from the later model-assisted `Combined`
-  results. They may be empty even when the call graph is large.
+The visual model, which the owner cares about and which should survive:
 
-For example, the currently selected `proc_boiler` snapshot has 214 functions
-but zero resources and zero interactions. That is valid data, not a frontend
-error.
+> **Flat 2D drawings arranged in 3D.** Nothing is drawn with depth *inside* its
+> own plane. The ground plane holds a process/daemon-resource overview.
+> Expanding a process raises a vertical plane, anchored at that process's ground
+> node, holding its full call tree. The only true 3D geometry is the edges that
+> cross between planes. A plane seen edge-on collapses to a line — that is the
+> decluttering mechanism, not an accident.
 
-## Snapshot location and results-root resolution
+At most two process planes are open at once (FIFO). With two open they face each
+other and the camera stands between them.
 
-The expected directory layout is:
+---
+
+## Data contract
+
+Unchanged and not yours to modify. `visualizer_export.py` owns it;
+`project_aware.py` drives it.
 
 ```text
-<results-root>/
-  visualizer/
-    runs.json                              # optional convenience manifest
-    <process_name>/
-      runs/
-        <run_id>/
-          graph.json                       # one complete schema-v1 snapshot
+<results-root>/visualizer/<process_name>/runs/<run_id>/graph.json
 ```
 
-For this checkout, the normal location is:
+`frontend/server.py` is a stdlib-only static server plus three read endpoints.
+Run it with `--results-root <dir containing visualizer/>`, or set
+`VISUALIZER_RESULTS_ROOT`. It serves `frontend/dist` when that exists.
 
-```text
-/mnt/common/Code/c-repo/results/csv_results/visualizer/
-```
+| Endpoint | Returns |
+| --- | --- |
+| `GET /api/runs` | `{ results_root, runs: [{ process_name, run_id, generated_at, function_count, resource_count, interaction_count }] }` |
+| `GET /api/graph?process=&run=` | the snapshot verbatim; 404 `{error}` if absent |
+| `GET /api/source?process=&run=&function=` | `{ file, start_line, end_line, text }`; 404 external/missing, 403 outside `process.root` |
 
-Both the exporter and frontend honor `VISUALIZER_RESULTS_ROOT`. The frontend
-also accepts an explicit CLI value, which is the most reliable way to point a
-development UI at fixtures or another machine's output:
-
-```bash
-python frontend/server.py \
-  --results-root /absolute/path/to/results/csv_results \
-  --port 8765
-```
-
-Without either setting, the frontend prefers the former environment-specific
-path `/home/seigyo/c_repo/c_repo/results/csv_results` when it exists; otherwise
-it uses this repository's `results/csv_results` directory.
-
-The server scans `visualizer/*/runs/*/graph.json` directly. It does **not**
-read `visualizer/runs.json`; treat that file as optional tooling metadata.
-
-## HTTP interface
-
-The server binds to `127.0.0.1` and has no authentication because it is a local
-development server. It serves the frontend directory as static files and
-provides the following JSON endpoints.
-
-### `GET /api/runs`
-
-Scans every snapshot and returns lightweight metadata. The response is sorted
-by process name, then newest `generated_at` first within each process.
-
-```json
-{
-  "results_root": "/mnt/common/Code/c-repo/results/csv_results",
-  "runs": [
-    {
-      "process_name": "proc_boiler",
-      "run_id": "20260730_101700",
-      "generated_at": "2026-07-30T10:17:01.321052+00:00",
-      "function_count": 214,
-      "resource_count": 0,
-      "interaction_count": 0
-    }
-  ]
-}
-```
-
-An empty `runs` array is a normal "no snapshots yet" state.
-
-### `GET /api/graph?process=<process_name>&run=<run_id>`
-
-Returns the exact parsed contents of that snapshot's `graph.json`. Parameters
-are required. A missing or invalid pair returns:
-
-```json
-{ "error": "Graph snapshot not found." }
-```
-
-with HTTP 404. The server rejects path traversal by resolving the constructed
-path under `<results-root>/visualizer`.
-
-Example:
-
-```text
-/api/graph?process=proc_boiler&run=20260730_101700
-```
-
-### `GET /api/source?process=<process_name>&run=<run_id>&function=<function_id>`
-
-Returns the definition lines for an internal function:
-
-```json
-{
-  "file": "/absolute/path/to/bo_safety.c",
-  "start_line": 475,
-  "end_line": 523,
-  "text": "  475  static void example(void) {\\n..."
-}
-```
-
-`text` is a pre-numbered snippet, read as Latin-1 with replacement for invalid
-bytes. It is safe to render as plain text, never HTML. Expect a 404 for external
-functions, missing source files, and functions without a source path. Expect a
-403 if the function's source falls outside `process.root`.
-
-All frontend responses use `Cache-Control: no-store`; fetch current data rather
-than relying on browser cache behavior.
-
-## `graph.json` schema (version 1)
-
-Every snapshot has this top-level shape:
+`graph.json` (schema_version 1). All six collections are always arrays, any may
+be empty. Ignore unknown fields.
 
 ```ts
 interface GraphSnapshot {
   schema_version: 1;
-  generated_at: string; // ISO-8601 UTC timestamp
-  run_id: string;       // directory name; may have a _2 suffix on collision
-  process: Process;
+  generated_at: string;
+  run_id: string;
+  process: { id; name; root; main_file: string | null; entry_function_id: string | null };
   functions: FunctionNode[];
   calls: CallEdge[];
   resources: Resource[];
   interactions: Interaction[];
   traces: Trace[];
 }
-```
 
-All six collection fields are always arrays but any of them may be empty.
-Unknown fields should be ignored so a newer exporter can add metadata without
-breaking the UI.
-
-### `process`
-
-```ts
-interface Process {
-  id: string;                 // e.g. "process:5e5184ea48497dc1"
-  name: string;               // e.g. "proc_boiler"
-  root: string;               // absolute process directory
-  main_file: string | null;
-  entry_function_id: string | null;
-}
-```
-
-`entry_function_id` is the first non-external function named `main`, when one
-was found. Do not assume it is non-null; a UI should choose a sensible fallback
-such as graph roots.
-
-### `functions`
-
-```ts
 interface FunctionNode {
-  id: string;                 // opaque ID, e.g. "function:ee4626d46fc400ac"
-  kind: "function" | "external_function";
-  name: string;
-  file: string | null;        // absolute definition path when known
-  file_name: string | null;
-  start_line: number;         // -1 if not known
-  end_line: number;           // -1 if not known
-  is_external: boolean;
-  is_static: boolean;
+  id; kind: "function" | "external_function"; name;
+  file: string | null; file_name: string | null;
+  start_line: number;      // -1 when unknown
+  end_line: number;
+  is_external: boolean; is_static: boolean;
   summary_status: "pending" | "library";
-  summary: string | null;     // currently normally null
-  call_count: number;
-  resource_interaction_count: number;
-  summary_hint?: string;      // present for non-external functions
+  summary: string | null;  // currently null in every snapshot
+  call_count: number; resource_interaction_count: number;
+  summary_hint?: string;
 }
-```
 
-`id`, not `name`, is the identity. The same function name may occur in more
-than one source file. `is_static` means file-local C linkage. `is_external`
-includes unresolved/library/macro-style targets and normally has no usable
-source evidence.
-
-### `calls`
-
-```ts
 interface CallEdge {
-  id: string;
-  source: string;             // FunctionNode.id
-  target: string;             // FunctionNode.id
-  line: number | null;        // call-site line, not definition line
-  kind:
-    | "direct"
-    | "indirect"
-    | "external_call"
-    | "macro_call"
-    | "macro_expansion"
-    | "callback";
-  via: string | null;         // FunctionNode.id for a callback registrar
+  id; source; target;      // FunctionNode.id
+  line: number | null;     // call site, not definition
+  kind: "direct" | "indirect" | "external_call" | "macro_call" | "macro_expansion" | "callback";
+  via: string | null;      // registrar, for callbacks
 }
-```
 
-`calls` is the complete captured graph, not only the paths that successfully
-reached a target. Multiple calls between the same pair are distinct when their
-line/kind/via differs. Preserve rather than silently deduplicate them.
+interface Resource { id; kind: "file"|"queue"|"event"|"semaphore"|"process"|"message"|"daemon_resource"; name; resolved: boolean }
 
-`indirect` represents a call the static analyzer could not resolve (often a
-function pointer). `callback` is an inferred registrar-to-handler connection;
-its `via` identifies the registration target. Macro edges are also deliberate
-analysis artifacts and should remain visible.
-
-### `resources`
-
-```ts
-interface Resource {
-  id: string;
-  kind: "file" | "queue" | "event" | "semaphore" | "process"
-      | "message" | "daemon_resource";
-  name: string;               // an inferred value, not necessarily a file path
-  resolved: boolean;
-}
-```
-
-Resources are keyed by `kind + name` within a snapshot. They are derived from
-the values in `Combined.target_number.ans`; they are analysis evidence, not a
-live daemon inventory. `resolved: false` commonly corresponds to `UNRESOLVED`
-or `NO TARGET`.
-
-### `interactions`
-
-```ts
 interface Interaction {
-  id: string;
-  function_id: string | null; // FunctionNode.id when attribution succeeded
-  resource_id: string;        // Resource.id
-  target_api: string;
-  operation: string;          // e.g. READF, ENQ, EVENT, SEMAPHORE
-  launch_via: string | null;
-  call_number: number | string | null;
-  argument_binding: {
-    argument_index: number;   // one-based index in the target API
-    value: string | number | boolean | null;
-  };
-  path: string | null;        // display path supplied by the tracer
-  source: Record<string, unknown>;
-  function_source: Record<string, unknown>;
+  id; function_id: string | null;   // null = unattributed, show it anyway
+  resource_id; target_api; operation; launch_via: string | null;
+  call_number; argument_binding: { argument_index: number; value };
+  path: string | null; source; function_source;
 }
+
+interface Trace { id; target_api; labels: string[]; display_path: string }
 ```
 
-One `Combined` result with several resolved argument values produces one
-interaction per value. An interaction can have `function_id: null` when the
-exporter cannot match the model evidence back to a static call site; show it as
-unattributed instead of dropping it. In current snapshots, `source` and
-`function_source` normally contain `{ "path": string, "line_number": string }`.
+**Facts about the real data that the UI is shaped around.** Re-derive these if
+you doubt them; they are all measurable from `results/csv_results/visualizer/`.
 
-### `traces`
+- `id`, never `name`, is function identity. Names repeat across files.
+- **Only 51–74 of ~144–210 internal functions per process are reachable from
+  `main`.** The rest cannot appear in a tree. Two distinct reasons: some have
+  recorded calls but no path from `main`; some have no recorded call at all.
+  The UI distinguishes these.
+- **`summary` is `null` for all 4355 functions in every snapshot.** The AI panel
+  is therefore an empty state in practice. Keep it honest — do not fake content.
+- **No snapshot contains inter-process data.** The overview is derived by joining
+  snapshots on `(resource.kind, resource.name)`; resource `id`s are per-snapshot
+  hashes and cannot be used. 24 of 36 distinct resources are shared by 2+
+  processes.
+- **The newest run for 5 of 6 processes has zero resources and zero
+  interactions.** Picking "latest per process" naively renders an overview with
+  no daemon edges. See open TODO #2.
+- Multiple calls between the same pair are distinct records; do not silently
+  deduplicate them.
 
-```ts
-interface Trace {
-  id: string;
-  target_api: string;
-  labels: string[];
-  display_path: string;       // labels joined with " -> "
-}
+---
+
+## Current architecture
+
+4485 lines across `frontend/src`. Stack: React 19 + Vite + Tailwind v4 +
+three.js, plus `d3-hierarchy` and `d3-force` used only as layout maths.
+
+```
+src/
+  api.js                     31   three fetch wrappers
+  App.jsx                   228   data loading, run selection, scene lifecycle
+  components/
+    CanvasOverlay.jsx       240   run picker, plane chips, edge toggles, legend
+    Inspector.jsx           371   right sidebar; all evidence for a selection
+  graph/                          PURE — no three.js, runs headless
+    model.js                367   snapshot indexing, tree building, overview derivation
+    layout.js               263   tidy tree, unreached shelf, overview affinity layout
+    prepare.js               94   everything one plane needs, computed once
+    textMetrics.js           67   label geometry; single source of truth
+  scene/                          three.js
+    SceneManager.js         972   << the problem
+    CanvasControls.js       532   << the other problem
+    graphLayer.js           221   node/edge registry shared by both builders
+    relaxation.js           315   elastic drag physics
+    buildProcessPlane.js    274   one process plane's geometry
+    buildOverview.js        155   ground plane geometry
+    primitives.js           169   discs, rings, edge curves, arrowheads
+    labels.js                90   canvas-texture text meshes
+    palette.js               86   colours
 ```
 
-Traces are target-API paths, not a replacement for `calls`. Use `labels` for an
-ordered path view; use `display_path` for a readable compact representation.
-Labels are display strings rather than stable IDs, so do not use them for graph
-joins.
+**The `graph/` boundary is good and worth keeping.** It is pure, has no three.js
+import, and runs under plain `node`. That is what makes layout testable.
 
-## Representative snapshot fragment
+**`scene/` is where the mess is.**
 
-This is abbreviated from an existing `proc_boiler` snapshot. IDs are opaque;
-the cross-references are the important part.
+### Key concepts
 
-```json
-{
-  "schema_version": 1,
-  "generated_at": "2026-07-30T10:17:01.321052+00:00",
-  "run_id": "20260730_101700",
-  "process": {
-    "id": "process:5e5184ea48497dc1",
-    "name": "proc_boiler",
-    "root": "/mnt/common/Code/c-repo/test_scada/processes/proc_boiler",
-    "main_file": "main.c",
-    "entry_function_id": "function:ee4626d46fc400ac"
-  },
-  "functions": [{
-    "id": "function:2d7208cd7bd9845d",
-    "kind": "function",
-    "name": "bo_first_out_annunciate",
-    "file": "/mnt/common/Code/c-repo/test_scada/processes/proc_boiler/bo_safety.c",
-    "file_name": "bo_safety.c",
-    "start_line": 240,
-    "end_line": 260,
-    "is_external": false,
-    "is_static": true,
-    "summary_status": "pending",
-    "summary": null,
-    "call_count": 1,
-    "resource_interaction_count": 2,
-    "summary_hint": "Static analysis: 1 outgoing call(s), 2 daemon-resource interaction(s)."
-  }],
-  "calls": [{
-    "id": "call:6814bbd13bf51b78",
-    "source": "function:2d7208cd7bd9845d",
-    "target": "external:8c2f1873d4296f69",
-    "line": 257,
-    "kind": "external_call",
-    "via": null
-  }],
-  "resources": [{
-    "id": "resource:582117e481be3b08",
-    "kind": "queue",
-    "name": "10",
-    "resolved": true
-  }],
-  "interactions": [{
-    "id": "interaction:01ba8ac102b83404",
-    "function_id": "function:2d7208cd7bd9845d",
-    "resource_id": "resource:582117e481be3b08",
-    "target_api": "scf_alarmq_enq",
-    "operation": "ENQ",
-    "launch_via": "EVENT",
-    "call_number": -1,
-    "argument_binding": { "argument_index": 1, "value": 10 }
-  }],
-  "traces": [{
-    "id": "trace:104ca1d5f24e2ff3",
-    "target_api": "scf_evt_post",
-    "labels": [
-      "[main.c]main[312:373]",
-      "[358]scf_task_fork (accepts callback)-> bo_combust_task",
-      "[bo_combust.c:358]bo_combust_task[420:438]",
-      "[437]scf_evt_post"
-    ],
-    "display_path": "[main.c]main[312:373] -> [358]scf_task_fork (accepts callback)-> bo_combust_task -> [bo_combust.c:358]bo_combust_task[420:438] -> [437]scf_evt_post"
-  }]
-}
-```
+- **Layer** — one flat drawing: `{ group, pickables, registry, labels }`. Both
+  the ground and each process plane are layers.
+- **Registry** (`graphLayer.js`) — `nodes: Map(id -> {mesh, parts[], local, radius,
+  clearance, home})` and `edges[]` with `edgesByNode`. This is what makes
+  dragging, toggling, fading and hover possible; a bare `THREE.Group` cannot
+  answer "which edges touch this node".
+- **Canvas** — the plane the camera is currently locked to. `CanvasControls` has
+  two modes: `canvas` (locked to one plane) and `pivot` (standing between two).
 
-## Required joins and useful derived data
+---
 
-```text
-process.entry_function_id ──────────────► functions[].id
-calls[].source / calls[].target ────────► functions[].id
-interactions[].function_id (if present) ─► functions[].id
-interactions[].resource_id ─────────────► resources[].id
-```
+## Invariants
 
-Build maps keyed by ID once per snapshot. Good derived values are:
+Break these and the app regresses in ways that are hard to spot. Each was a real
+bug.
 
-- incoming/outgoing call lists per function;
-- interaction lists per function and per resource;
-- all resources grouped by `kind` and `resolved` status;
-- latest snapshot per `process.name`, based on `generated_at`;
-- graph roots: functions with no incoming internal call, if there is no entry
-  function.
+1. **Edge geometry must be a constant vertex count.**
+   `BufferGeometry.setFromPoints` only overwrites `min(points, capacity)`
+   vertices and *never shrinks*. Variable-length point arrays leave stale
+   vertices behind and the line draws a segment back to where the node used to
+   be. `edgePoints()` always returns `segments + 1` points and trims by the
+   curve's *parameter range*, not by dropping points. **Symptom if broken:**
+   torn, jumpy edges while dragging.
 
-Do not infer an interaction from an external call merely because the names look
-related. Only the `interactions` collection is evidence for a resource link.
+2. **Spacing must account for label width, not node radius.** A dot is 22 units
+   across; `compute_3element_feedwater_setpoint` renders over 300. Tree
+   separation and overview collision both measure through
+   `graph/textMetrics.js`, which is deliberately shared with the renderer so the
+   two cannot drift. **Symptom:** every tier collides into an unreadable smear.
 
-## Product requirements for the replacement UI
+3. **Gesture directions are measured, not derived.** They were repeatedly got
+   wrong by reasoning. The rules that hold:
+   - *Panning* — content follows the pointer exactly. Must use the **camera's**
+     screen axes projected onto the plane, not the plane's fixed `right`, or it
+     inverts once the view passes 90°.
+   - *Rotating* — judged by **which face comes into view**, which is the opposite
+     sign: drag right reveals the tree's left, drag down reveals its top.
+   - The two modes legitimately use different signs, because one orbits the
+     camera and the other turns it in place.
 
-1. Fetch `/api/runs`; give the user a clear empty state and a process/run
-   selector. Keep historical runs selectable.
-2. Fetch exactly one `/api/graph` snapshot for the selected run. Show loading,
-   404, malformed-data, and network-error states.
-3. Provide a usable call-graph view with pan/zoom, search, and filters for
-   internal/static/external functions and call kind. Large graphs are expected.
-4. Make node and edge selection reveal evidence: definition location, outgoing
-   calls, resource interactions, traces containing the function name, and the
-   raw ID/source fields when useful for debugging.
-5. When a selected internal function has a usable `file` and line range, offer
-   the `/api/source` snippet. Handle its 403/404 response without breaking the
-   inspector.
-6. Make resource evidence a separate, honest layer: distinguish resolved from
-   unresolved and attributed from unattributed interactions. A zero-resource
-   snapshot must still be a useful call-graph view.
-7. Treat `schema_version !== 1` as an explicit unsupported-version state until
-   a compatibility adapter is implemented.
+4. **The camera never goes below the ground plane.** From beneath, the overview
+   reads mirrored and the whole scene looks inverted. Positive pitch *lowers*
+   the camera (`camera.y = target.y - sin(pitch) * distance`), so the guard is a
+   *ceiling* on pitch, recomputed per frame because it tightens as you zoom in.
+   Pivot mode floors the viewer's height instead. Going over the top is
+   unrestricted, and so is yaw.
 
-The frontend may use a framework and graph library of its choice. Keep the
-data-fetching boundary above intact unless the server is deliberately replaced
-at the same time.
+5. **Rotation resists, it never fences.** Turning away is progressively heavier
+   with a floor on the resistance so continued dragging always makes progress;
+   turning back is assisted. Nothing recentres on its own — where the user lets
+   go is where the camera stays. Every hard limit that has ever been added here
+   was later reported as a bug.
 
-## Development and debugging
+6. **Drag influence falls off by hop distance.** Immediate neighbours follow;
+   rings beyond that are anchored to where they sat when the drag began, via a
+   *hard positional clamp*. Stiff anchor springs were tried and are numerically
+   unstable under explicit integration — that caused visible flicker. On
+   release, every node re-anchors to its current position, or the anchored
+   majority springs the dragged cluster back and the drag leaves no trace.
 
-Start the local server:
+7. **Simulation energy is measured from distance actually travelled**, not from
+   velocity. A node held against its clamp keeps velocity forever, so a
+   velocity-based test never settles and the sim runs every frame for the rest
+   of the session. Settling also waits for zero penetration, so it cannot stop
+   while marks overlap.
+
+8. **Edge labels are hidden by default** and appear only for edges highlighted by
+   hover. Always-on they are the messiest thing on either plane.
+
+9. **In process view, daemon-link edges start OFF.** The tree is the subject; the
+   user opts in to seeing which function touches which resource.
+
+10. **`schema_version !== 1` is an explicit unsupported state.** Do not attempt
+    to render it.
+
+---
+
+## Where the complexity actually is
+
+Ranked by how much pain they cause. This is the part you were brought in for.
+
+### 1. `SceneManager.js` is a god object (972 lines, 38 methods)
+
+It owns: scene/renderer lifecycle, the layer registry, camera framing, plane
+open/close/FIFO, the two-plane arrangement, cross-plane edge construction,
+picking, node dragging, the drag→physics handoff, opacity/visibility resolution,
+label LOD, selection rings, and the frame loop.
+
+Natural seams, roughly in order of payoff:
+
+- **`PlaneSet`** — open/close/FIFO, arrangement, anchoring, framing.
+- **`CrossPlaneEdges`** — build/update the world-space edges.
+- **`Presentation`** — everything that decides an object's opacity/visibility.
+- **`Interaction`** — pointer → pick/drag/hover.
+- What remains is a thin scene + frame loop.
+
+### 2. Visibility and opacity are decided in three places that fight
+
+`_applyStyling` (hover + category + recede), `_updateLabelVisibility` (distance
+LOD), and the initial `visible = false` in `graphLayer.addEdge`. `.visible` is
+assigned from 9 sites. There is no single function that answers "should this
+object be visible right now", so ordering bugs are easy and have happened.
+
+**Suggested direction:** one pure resolver, `resolve(object, state) -> {visible,
+opacity}`, driven by a small explicit state object (activeCanvas, focusedPlane,
+hoveredNode, edgeVisibility, cameraDistance). Everything else calls it.
+
+### 3. Positions are represented twice
+
+`registry.nodes[].local` (authoritative, drives meshes) and the relaxation's own
+`entry.x/y`. They are hand-synced at the top of `relaxStep` and again when
+writing back. `moveNode()` and the inline mesh-moving loop inside `relaxStep`
+duplicate the same logic for performance reasons that were never measured.
+
+**Suggested direction:** make the registry the only owner of position, and give
+the simulation a narrow read/write interface over it. Measure before assuming
+the duplication is needed.
+
+### 4. Cross-plane edges are rebuilt from scratch every frame
+
+While dragging or animating, `_rebuildCrossPlaneEdges()` disposes and recreates
+every world-space line. In-plane edges update their buffers in place
+(`refreshEdge`); these do not. It is inconsistent and churns GC on exactly the
+frames that need to be smooth.
+
+### 5. `_rebuildOverview()` destroys and rebuilds the entire ground layer
+
+...to change a handful of colours when a process expands, then replays saved
+positions on top. It is wasteful and a plausible source of subtle state loss
+(anything held on the old objects is gone). Expansion state should be a style
+input, not a reason to rebuild geometry.
+
+### 6. `CanvasControls.js` (532 lines) has two modes with parallel gesture paths
+
+Four near-duplicate constants (`YAW_SCALE`, `PITCH_SCALE`,
+`PIVOT_PITCH_SCALE`, `PIVOT_LOOK_SCALE`) and two resistance helpers
+(`resistedRotation`, `_resistedLook`) that differ only in where "rest" is.
+The sign conventions live inline in event handlers, which is exactly why they
+were wrong so often.
+
+**Suggested direction:** extract the sign/resistance maths into a pure module
+with unit tests, and express the two modes as data (a frame + a set of enabled
+gestures) rather than branches.
+
+### 7. Small things
+
+- Dead exports: `getLabelTexture`, `disposeLabelCache`, `RESOURCE_COLORS`,
+  `PROCESS_COLORS`, `FONT_STACK`.
+- `graphLayer.addEdge` takes a 14-key options object.
+- `localPosition()` is a trivial `new Vector3` wrapper.
+- `window.__viz` is a debug global; it is genuinely useful for driving the scene
+  from a test harness, so keep it but make it deliberate.
+- `layout.js` mixes three unrelated layouts (tree, shelf, overview affinity).
+- `relaxation.js` collision is O(n²) per frame over up to ~300 nodes. Fine today,
+  measured at well under a millisecond, but it is the first thing to bite if
+  planes get bigger.
+
+---
+
+## Verification
+
+**There are no tests.** Everything so far was checked with throwaway Playwright
+scripts that were not kept. Do not trust "it builds" — every regression in this
+project's history built cleanly.
+
+The highest-value thing you can do alongside the cleanup is leave tests behind.
+
+**Cheap and worth it (pure, no browser):** `graph/` runs under plain `node`.
+Assert on real snapshots from `results/csv_results/visualizer/`:
+
+- tree node counts and depth per process (63–120 nodes, depth 5–8)
+- coverage: tree ∪ shelf = every internal function, exactly once, no overlap
+- **zero overlapping bounding boxes** among node dots and label boxes, in both
+  the tree and the overview layouts
+- overview join produces the expected shared-resource count (24 of 36)
+
+**Worth the setup (browser):** `window.__viz` exposes the `SceneManager`, so a
+Playwright script can drive gestures and assert on scene state rather than
+pixels. The checks that caught real bugs:
+
+- every edge line has an identical vertex count, and no vertex sits far off the
+  curve (catches invariant 1)
+- drag a node, measure displacement bucketed by hop distance (catches 6)
+- assert simulation energy reaches zero and stays (catches 7)
+- for each gesture, measure whether on-screen content moves with the pointer, at
+  several camera angles including past 90° (catches 3)
+- camera `y` never drops below the floor during aggressive rotation (catches 4)
+
+**Manual:** the owner tests by hand and gives direct feedback. Behaviour changes
+they have not asked for will be noticed.
+
+---
+
+## Deliberately not done
+
+Not bugs. Do not "fix" them without asking.
+
+- **Node duplication in the tree.** Functions reached by multiple paths are
+  duplicated so the tree is a real tree. Parallel calls from the same parent to
+  the same target are *not* duplicated (that clones whole subtrees: 127 nodes →
+  500, 3.9k units wide → 19k). Every call site is preserved on the node.
+- **The unreached shelf.** Deliberate honesty about the ~60% of functions that
+  cannot be in the tree.
+- **Free camera movement.** The only limit is the ground plane. You can walk
+  behind a tree and see it mirrored; "Reset view" is the escape hatch. This was
+  requested explicitly after several rounds of the opposite.
+- **No layout persistence.** Dragged positions live in memory only; "Reset
+  layout" restores the computed layout.
+
+### Open TODOs
+
+1. **Alternate cross-plane edge origin.** Interaction edges currently leave the
+   green external-API leaf. The alternate is to leave the internal calling
+   function (`interactions[].function_id`) and skip the leaf. Wanted as a toggle.
+2. **Run-selection policy.** Interim rule is "newest run that has interaction
+   evidence", because the newest run alone is empty for most processes. Needs a
+   real decision.
+3. **Light-theme completeness.** The scene and UI were re-themed for white; the
+   palette reasoning and its validator output are recorded in
+   `scene/palette.js`. Two residual notes: an aggressive drag can leave ~1
+   overlapping label pair (the relaxation models clearance as a circle centred
+   on the node, but labels are wide rectangles offset below it), and cross-plane
+   edges dim uniformly on hover instead of participating in the highlight.
+
+---
+
+## Running it
 
 ```bash
-python frontend/server.py --port 8765
+python frontend/server.py --port 8765     # API + built bundle
+cd frontend && npm install && npm run dev # vite on :5173, proxies /api to :8765
+npm run build                             # writes dist/, which server.py serves
 ```
 
-Inspect actual data without a UI:
-
-```bash
-curl -s http://127.0.0.1:8765/api/runs | jq
-curl -s 'http://127.0.0.1:8765/api/graph?process=proc_boiler&run=20260730_101700' | jq
-curl -s 'http://127.0.0.1:8765/api/source?process=proc_boiler&run=20260730_101700&function=<function-id>' | jq
-```
-
-Useful source files:
-
-| File | Responsibility |
-| --- | --- |
-| `visualizer_export.py` | Schema-v1 collector and JSON writer; change this only when intentionally evolving the contract. |
-| `project_aware.py` | Connects the analysis pipeline to the collector. |
-| `output_paths.py` | Shared `VISUALIZER_RESULTS_ROOT` resolution used by the exporter. |
-| `frontend/server.py` | Static-file server and the complete read API. |
-| `results/csv_results/visualizer/` | Real fixture data already in the repository. |
-| `models.py` | Definition of the richer `Combined` analysis data that becomes resource interactions. |
-
-When changing the exported shape, increment `schema_version`, document the
-migration, and keep a representative fixture for each important edge case:
-empty interactions, unresolved resources, callback/macro/indirect calls,
-external functions, and an unattributed interaction.
+`results/` is gitignored, so a fresh clone has no snapshots until the pipeline
+runs. `frontend/README.md` describes the layout model and the camera in more
+detail and should be updated if you change either.
