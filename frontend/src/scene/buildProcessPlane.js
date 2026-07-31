@@ -148,6 +148,7 @@ export function buildProcessPlaneLayer({
       fontSize: isEntry ? 16 : 14,
       color: isEntry ? COLORS.entry : isPort ? COLORS.port : COLORS.ink,
       bold: isEntry,
+      halo: COLORS.sheet,
     });
     label.position.set(point.x, point.y - radius - 8 - lines.length * 10, 0.6);
     // The root and the daemon API ports keep their labels at any distance -
@@ -196,13 +197,14 @@ export function buildProcessPlaneLayer({
       sourceId: node.parent.uid,
       targetId: node.uid,
       category: EDGE_CATEGORIES.CALL,
+      curveMode: "vertical",
       color: node.recursive ? COLORS.recursive : COLORS.edge,
       opacity: node.recursive ? 0.8 : 0.7,
       arrowSize: 11,
       arrowOpacity: 0.9,
       bow,
       labelLines: lineNumbers.length > 0 ? [shown] : null,
-      labelOptions: { worldHeight: 17, fontSize: 12, color: COLORS.inkMuted },
+      labelOptions: { worldHeight: 17, fontSize: 12, color: COLORS.inkMuted, halo: COLORS.sheet },
     });
   }
 
@@ -210,7 +212,7 @@ export function buildProcessPlaneLayer({
   for (const block of shelf.blocks) {
     const header = createLabel(
       [block.file, `${block.count} off-tree · ${block.isolated} with no calls at all`],
-      { worldHeight: 20, fontSize: 13, color: COLORS.inkMuted },
+      { worldHeight: 20, fontSize: 13, color: COLORS.inkMuted, halo: COLORS.sheet },
     );
     header.position.set(block.x + block.width / 2, block.y + 16, 0.4);
     header.userData.detailLabel = true;
@@ -257,7 +259,7 @@ export function buildProcessPlaneLayer({
         "NOT REACHABLE FROM main",
         `${coverage.unreached} of ${coverage.internal} internal functions · ${coverage.isolated} have no recorded call at all`,
       ],
-      { worldHeight: 24, fontSize: 14, color: COLORS.inkMuted },
+      { worldHeight: 24, fontSize: 14, color: COLORS.inkMuted, halo: COLORS.sheet },
     );
     caption.position.set(
       shelf.bounds.minX + (shelf.bounds.maxX - shelf.bounds.minX) / 2,

@@ -1,4 +1,5 @@
 import * as THREE from "three";
+import { DEVICE_SCALE, fontString, labelCanvasSize } from "../graph/textMetrics.js";
 
 /**
  * Text labels are canvas textures on flat plane meshes, never sprites.
@@ -6,36 +7,38 @@ import * as THREE from "three";
  * That is deliberate: a sprite billboards toward the camera, which would defeat
  * the whole design. A label has to be stuck to its plane and vanish with it
  * when the plane is viewed edge-on.
+ *
+ * Sizing goes through graph/textMetrics.js, the same module the layout measures
+ * with, so spacing decisions and rendered geometry cannot drift apart.
  */
 
 const cache = new Map();
-const DEVICE_SCALE = 2;
 
-function renderLabelTexture(lines, { fontSize, color, bold, background }) {
+function renderLabelTexture(lines, { fontSize, color, bold, halo }) {
   const canvas = document.createElement("canvas");
+  const metrics = labelCanvasSize(lines, { fontSize, bold });
+  canvas.width = metrics.width;
+  canvas.height = metrics.height;
+
   const context = canvas.getContext("2d");
-  const font = `${bold ? "700 " : ""}${fontSize * DEVICE_SCALE}px ui-monospace, "SF Mono", Menlo, monospace`;
+  context.font = fontString(fontSize, bold);
+  context.textBaseline = "middle";
+  context.textAlign = "center";
 
-  context.font = font;
-  const widths = lines.map((line) => context.measureText(line).width);
-  const lineHeight = fontSize * DEVICE_SCALE * 1.32;
-  const paddingX = fontSize * DEVICE_SCALE * 0.6;
-  const paddingY = fontSize * DEVICE_SCALE * 0.4;
-
-  canvas.width = Math.max(8, Math.ceil(Math.max(...widths) + paddingX * 2));
-  canvas.height = Math.max(8, Math.ceil(lineHeight * lines.length + paddingY * 2));
-
-  const context2 = canvas.getContext("2d");
-  if (background) {
-    context2.fillStyle = background;
-    context2.fillRect(0, 0, canvas.width, canvas.height);
-  }
-  context2.font = font;
-  context2.textBaseline = "middle";
-  context2.textAlign = "center";
-  context2.fillStyle = color;
   lines.forEach((line, index) => {
-    context2.fillText(line, canvas.width / 2, paddingY + lineHeight * (index + 0.5));
+    const y = metrics.paddingY + metrics.lineHeight * (index + 0.5);
+    // A halo in the surface colour punches the text out of whatever passes
+    // behind it. Edges cannot be routed around every label, so this is what
+    // keeps a label readable when one crosses it.
+    if (halo) {
+      context.strokeStyle = halo;
+      context.lineWidth = fontSize * DEVICE_SCALE * 0.42;
+      context.lineJoin = "round";
+      context.miterLimit = 2;
+      context.strokeText(line, canvas.width / 2, y);
+    }
+    context.fillStyle = color;
+    context.fillText(line, canvas.width / 2, y);
   });
 
   const texture = new THREE.CanvasTexture(canvas);
@@ -52,7 +55,7 @@ export function getLabelTexture(lines, options = {}) {
     fontSize: options.fontSize ?? 15,
     color: options.color ?? "#1c2430",
     bold: options.bold ?? false,
-    background: options.background ?? null,
+    halo: options.halo ?? null,
   };
   const key = JSON.stringify([lines, settings]);
   if (!cache.has(key)) cache.set(key, renderLabelTexture(lines, settings));

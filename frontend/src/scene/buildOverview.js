@@ -1,7 +1,7 @@
 import * as THREE from "three";
 import { createDisc, createRing } from "./primitives.js";
 import { createLabel } from "./labels.js";
-import { COLORS, processColor, resourceColor } from "./palette.js";
+import { COLORS, SURFACE, processColor, resourceColor } from "./palette.js";
 import { EDGE_CATEGORIES, addEdge, createRegistry, localPosition, registerNode } from "./graphLayer.js";
 
 const PROCESS_RADIUS = 46;
@@ -59,6 +59,7 @@ export function buildOverviewLayer(overview, layout, { expandedProcesses = new S
       worldHeight: 26,
       fontSize: 15,
       color: resource.resolved ? COLORS.ink : "#a3134b",
+      halo: SURFACE,
     });
     label.position.set(point.x, point.y - RESOURCE_RADIUS - 22, 0.6);
     group.add(label);
@@ -98,7 +99,7 @@ export function buildOverviewLayer(overview, layout, { expandedProcesses = new S
 
     const label = createLabel(
       [process.name, `${process.functionCount} fn · ${process.interactionCount} interactions`],
-      { worldHeight: 30, fontSize: 17, color: COLORS.ink, bold: true },
+      { worldHeight: 30, fontSize: 17, color: COLORS.ink, bold: true, halo: SURFACE },
     );
     label.position.set(point.x, point.y - PROCESS_RADIUS - 40, 0.9);
     group.add(label);
@@ -145,7 +146,7 @@ export function buildOverviewLayer(overview, layout, { expandedProcesses = new S
         `${[...link.operations].join(", ")}`,
         `${link.count} call${link.count === 1 ? "" : "s"}`,
       ],
-      labelOptions: { worldHeight: 20, fontSize: 13, color: COLORS.inkMuted },
+      labelOptions: { worldHeight: 20, fontSize: 13, color: COLORS.inkMuted, halo: SURFACE },
     });
   }
 

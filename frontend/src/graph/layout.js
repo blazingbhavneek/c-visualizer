@@ -8,13 +8,16 @@
 
 import { hierarchy, tree as d3tree } from "d3-hierarchy";
 import { forceCollide, forceSimulation } from "d3-force";
+import { LABEL_SPECS, labelWorldSize } from "./textMetrics.js";
 
 export const NODE_RADIUS = 11;
 export const PORT_RADIUS = 13;
 export const ROOT_RADIUS = 20;
 
-const NODE_SPACING_X = 64;
-const LEVEL_SEPARATION = 185;
+const LEVEL_SEPARATION = 215;
+/** Clear space left between two neighbouring footprints. */
+const SIBLING_GAP = 26;
+const LIBRARY_RADIUS = 8;
 
 const SHELF_GAP = 420;
 const SHELF_CELL = 34;
@@ -22,13 +25,51 @@ const SHELF_COLUMNS = 12;
 const SHELF_BLOCK_GAP = 60;
 
 /**
+ * Horizontal space one node needs: whichever is wider, its dot or its label.
+ *
+ * Spacing on the dot radius alone is what made every tier collide - a dot is 22
+ * units across and `compute_3element_feedwater_setpoint` is over 300.
+ */
+function footprintWidth(node, { entryFunctionId, portNames }) {
+  const isEntry = node.fn.id === entryFunctionId && !node.parent;
+  const isPort = portNames?.has(node.fn.name);
+  const radius = isEntry
+    ? ROOT_RADIUS
+    : isPort
+      ? PORT_RADIUS
+      : node.fn.is_external
+        ? LIBRARY_RADIUS
+        : NODE_RADIUS;
+  const spec = isEntry ? LABEL_SPECS.treeRoot : LABEL_SPECS.treeNode;
+  const label = labelWorldSize([node.fn.name], spec);
+  return Math.max(radius * 2, label.width);
+}
+
+/**
  * Tidy top-down tree, then flipped so `main` sits at local y = 0 and the tree
  * grows upward. The plane is anchored at the process node on the ground, so
  * "roots at the bottom, leaves at the top" is literal.
+ *
+ * Separation is measured, not fixed: `nodeSize` is one unit wide and the
+ * separation function returns the actual clearance the two neighbours need,
+ * which is what guarantees no node or label overlaps another.
  */
-export function layoutProcessTree(root) {
+export function layoutProcessTree(root, { entryFunctionId = null, portNames = null } = {}) {
   const rooted = hierarchy(root, (node) => node.children);
-  const layout = d3tree().nodeSize([NODE_SPACING_X, LEVEL_SEPARATION]);
+
+  const widths = new Map();
+  rooted.each((point) => {
+    widths.set(point.data.uid, footprintWidth(point.data, { entryFunctionId, portNames }));
+  });
+  const widthOf = (point) => widths.get(point.data.uid) ?? NODE_RADIUS * 2;
+
+  const layout = d3tree()
+    .nodeSize([1, LEVEL_SEPARATION])
+    .separation((a, b) => {
+      const clearance = (widthOf(a) + widthOf(b)) / 2 + SIBLING_GAP;
+      // Cousins get extra room so subtrees read as separate blocks.
+      return a.parent === b.parent ? clearance : clearance * 1.35;
+    });
   layout(rooted);
 
   const positions = new Map();
@@ -37,12 +78,10 @@ export function layoutProcessTree(root) {
   let maxY = 0;
 
   rooted.each((point) => {
-    const x = point.x;
-    const y = point.y;
-    positions.set(point.data.uid, { x, y });
-    minX = Math.min(minX, x);
-    maxX = Math.max(maxX, x);
-    maxY = Math.max(maxY, y);
+    positions.set(point.data.uid, { x: point.x, y: point.y });
+    minX = Math.min(minX, point.x - widthOf(point) / 2);
+    maxX = Math.max(maxX, point.x + widthOf(point) / 2);
+    maxY = Math.max(maxY, point.y);
   });
 
   // d3 keeps the root near x = 0 with nodeSize, but only exactly so for
@@ -53,6 +92,7 @@ export function layoutProcessTree(root) {
 
   return {
     positions,
+    widths,
     bounds: { minX: minX - shiftX, maxX: maxX - shiftX, minY: 0, maxY },
   };
 }
@@ -150,6 +190,11 @@ export function layoutOverview(overview, { radius = 1500 } = {}) {
     angleOf.set(process.name, angle);
     process.x = Math.cos(angle) * processRadius;
     process.y = Math.sin(angle) * processRadius;
+    // Pinned during relaxation: processes are the frame of reference, so
+    // resources must be pushed clear of their *final* positions. Re-pinning
+    // afterwards instead would undo the collision resolution around them.
+    process.fx = process.x;
+    process.fy = process.y;
   });
 
   // --- resources at the angular centroid of their users --------------------
@@ -187,24 +232,30 @@ export function layoutOverview(overview, { radius = 1500 } = {}) {
 
   // --- collision-only relaxation ------------------------------------------
   // Nudges overlapping marks apart without letting physics redesign the layout.
+  // Collision radius covers the label, not just the dot, so no mark overlaps
+  // another mark's text. Labels sit below their node, so the vertical extent is
+  // roughly the label height on top of the dot.
+  for (const node of nodes) {
+    const isProcess = node.type === "process";
+    const spec = isProcess ? LABEL_SPECS.process : LABEL_SPECS.resource;
+    const lines = isProcess
+      ? [node.name, `${node.functionCount} fn · ${node.interactionCount} interactions`]
+      : [`${node.kind} ${node.name}`];
+    const label = labelWorldSize(lines, spec);
+    const dot = isProcess ? 46 : 22;
+    node.clearance = Math.max(dot * 1.7, label.width / 2 + 26, label.height + dot * 1.2);
+  }
+
   const simulation = forceSimulation(nodes)
     .force(
       "collide",
       forceCollide()
-        .radius((node) => (node.type === "process" ? 150 : 96))
-        .strength(0.9),
+        .radius((node) => node.clearance)
+        .strength(0.95),
     )
-    .alphaDecay(0.06)
+    .alphaDecay(0.045)
     .stop();
-  for (let tick = 0; tick < 160; tick += 1) simulation.tick();
-
-  // Processes are the frame of reference; pin them back to the ring in case
-  // collision drift moved them.
-  for (const process of ordered) {
-    const angle = angleOf.get(process.name);
-    process.x = Math.cos(angle) * processRadius;
-    process.y = Math.sin(angle) * processRadius;
-  }
+  for (let tick = 0; tick < 500; tick += 1) simulation.tick();
 
   const positions = new Map();
   for (const node of nodes) positions.set(node.id, { x: node.x, y: node.y });

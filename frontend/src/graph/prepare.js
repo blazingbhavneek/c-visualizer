@@ -67,7 +67,11 @@ export function prepareProcess(index) {
   }
 
   const treeNodes = flattenTree(tree);
-  const treeLayout = layoutProcessTree(tree);
+  const portNames = portFunctionNames(index);
+  const treeLayout = layoutProcessTree(tree, {
+    entryFunctionId: syntheticRoot ? "__virtual_root__" : index.entryId,
+    portNames,
+  });
   const unreachedGroups = collectUnreached(index, treeNodes);
   const shelf = layoutUnreachedShelf(unreachedGroups, treeLayout.bounds);
   const coverage = coverageSummary(index, treeNodes, unreachedGroups);
@@ -83,7 +87,7 @@ export function prepareProcess(index) {
     shelf,
     coverage,
     attachments,
-    portNames: portFunctionNames(index),
+    portNames,
     entryFunctionId: syntheticRoot ? "__virtual_root__" : index.entryId,
     syntheticRoot,
   };

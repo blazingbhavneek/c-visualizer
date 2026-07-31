@@ -57,6 +57,7 @@ export function addEdge(
     arrowSize = 11,
     arrowOpacity = 0.9,
     bow = 0,
+    curveMode = "bowed",
     bidirectional = false,
     labelLines = null,
     labelOptions = {},
@@ -73,6 +74,7 @@ export function addEdge(
     targetId,
     category,
     bow,
+    curveMode,
     bidirectional,
     color,
     baseOpacity: opacity,
@@ -118,7 +120,7 @@ export function addEdge(
 }
 
 function edgeGeometryPoints(source, target, edge) {
-  const raw = edgePoints(source.local, target.local, { bow: edge.bow });
+  const raw = edgePoints(source.local, target.local, { bow: edge.bow, mode: edge.curveMode });
   return trimToRadius(raw, source.radius + 3, target.radius + 5);
 }
 

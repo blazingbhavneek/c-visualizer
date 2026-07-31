@@ -48,14 +48,26 @@ export function createRing(radius, color, { opacity = 1, renderOrder = 3 } = {})
  * bezier the existing pyvis output uses. `bow` bends sibling edges apart so
  * parallel calls between the same pair stay distinguishable.
  */
-export function edgePoints(from, to, { bow = 0, segments = 26 } = {}) {
+export function edgePoints(from, to, { bow = 0, segments = 26, mode = "bowed" } = {}) {
   const start = new THREE.Vector3(from.x, from.y, 0);
   const end = new THREE.Vector3(to.x, to.y, 0);
-  const middle = start.clone().add(end).multiplyScalar(0.5);
+  const delta = end.clone().sub(start);
+
+  if (mode === "vertical") {
+    // The reference pyvis artifact routes tree edges as a cubic bezier with
+    // `forceDirection: "vertical"`. The curve leaves the parent going straight
+    // up and arrives at the child going straight down, so it stays inside the
+    // corridor between two tiers instead of cutting diagonally across the
+    // neighbours' labels. The bow separates parallel edges between one pair.
+    const reach = Math.abs(delta.y) * 0.55 || 40;
+    const control1 = new THREE.Vector3(start.x + bow * 0.4, start.y + Math.sign(delta.y || 1) * reach, 0);
+    const control2 = new THREE.Vector3(end.x + bow * 0.4, end.y - Math.sign(delta.y || 1) * reach, 0);
+    return new THREE.CubicBezierCurve3(start, control1, control2, end).getPoints(segments);
+  }
 
   // Pull the control point along the perpendicular for the bow, and bias it
   // vertically so the curve leaves the source going "along the tree".
-  const delta = end.clone().sub(start);
+  const middle = start.clone().add(end).multiplyScalar(0.5);
   const perpendicular = new THREE.Vector3(-delta.y, delta.x, 0).normalize();
   middle.addScaledVector(perpendicular, bow);
   middle.y = middle.y + delta.y * 0.08;
