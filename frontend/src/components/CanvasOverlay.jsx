@@ -25,6 +25,7 @@ export default function CanvasOverlay({
   onClosePlane,
   onFrameOverview,
   onResetTilt,
+  onResetLayout,
   edgeVisibility,
   onToggleEdge,
   hoverHighlight,
@@ -70,6 +71,13 @@ export default function CanvasOverlay({
               className="rounded-md border border-rule bg-panel/90 px-3 py-1.5 text-xs font-medium text-ink shadow-sm backdrop-blur transition hover:border-rule-strong hover:bg-panel"
             >
               Look straight on
+            </button>
+            <button
+              type="button"
+              onClick={onResetLayout}
+              className="rounded-md border border-rule bg-panel/90 px-3 py-1.5 text-xs font-medium text-ink shadow-sm backdrop-blur transition hover:border-rule-strong hover:bg-panel"
+            >
+              Reset layout
             </button>
             <button
               type="button"

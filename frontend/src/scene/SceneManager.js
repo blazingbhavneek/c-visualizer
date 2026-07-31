@@ -12,6 +12,7 @@ import {
   setNodeOpacity,
   setPartOpacity,
 } from "./graphLayer.js";
+import { createRelaxation, isSettling, relaxStep, resetToHome } from "./relaxation.js";
 
 const UP = new THREE.Vector3(0, 1, 0);
 const MAX_OPEN_PLANES = 2;
@@ -345,7 +346,7 @@ export default class SceneManager {
     const centre = worldA.clone().add(worldB).multiplyScalar(0.5);
     centre.y = this._planeEyeHeight(a);
     this.activeCanvas = "facing";
-    this.controls.setPivot(centre, [toA.clone(), toB.clone()]);
+    this.controls.setPivot(centre, [toA.clone(), toB.clone()], { distance: half });
     this.lookAtPlane(this.focusedPlane || a.processName);
 
     this.stylingDirty = true;
@@ -542,6 +543,20 @@ export default class SceneManager {
 
   // ----------------------------------------------------------- presentation
 
+  /** Undo any dragging and put every graph back to its computed layout. */
+  resetLayout() {
+    for (const { layer } of this._layers()) {
+      resetToHome(layer.registry);
+      layer.simulation = null;
+    }
+    this.simulation = null;
+    for (const plane of this.planes.values()) {
+      plane.layer.group.position.copy(this._processAnchor(plane.processName));
+    }
+    this.needsCrossPlaneRebuild = true;
+    this.stylingDirty = true;
+  }
+
   setEdgeVisibility(category, visible) {
     this.edgeVisibility[category] = visible;
     if (category === EDGE_CATEGORIES.INTERACTION || category === EDGE_CATEGORIES.PLANE_TO_PLANE) {
@@ -700,6 +715,11 @@ export default class SceneManager {
     this.raycaster.ray.intersectPlane(dragPlane, point);
     const local = layer.group.worldToLocal(point.clone());
 
+    // Neighbours follow the dragged node elastically, so build (or reuse) the
+    // relaxation for this layer.
+    if (!layer.simulation) layer.simulation = createRelaxation(layer.registry);
+    this.simulation = { layer, sim: layer.simulation };
+
     this.drag = {
       layer,
       nodeId,
@@ -840,6 +860,19 @@ export default class SceneManager {
         this.needsCrossPlaneRebuild = true;
       } else {
         animating = true;
+      }
+    }
+
+    // Elastic settling: driven while a drag is active and afterwards until the
+    // graph runs out of energy, which is what makes the motion read as a graph
+    // view rather than a node teleporting on its own.
+    if (this.simulation) {
+      const pinnedId = this.drag?.layer === this.simulation.layer ? this.drag.nodeId : null;
+      if (pinnedId || isSettling(this.simulation.sim)) {
+        relaxStep(this.simulation.sim, pinnedId);
+        this.needsCrossPlaneRebuild = true;
+      } else {
+        this.simulation = null;
       }
     }
 

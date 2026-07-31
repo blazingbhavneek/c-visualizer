@@ -28,9 +28,24 @@ export function createRegistry() {
 }
 
 export function registerNode(registry, id, entry) {
-  registry.nodes.set(id, { id, parts: [], ...entry });
+  const node = { id, parts: [], ...entry };
+  // `home` is where the layout put it, so a rearrangement can be undone.
+  node.home = { x: node.local.x, y: node.local.y };
+  // `clearance` is the footprint the relaxation keeps free: the label is wider
+  // than the dot for almost every node, so using the radius would let text
+  // collide the moment anything moves.
+  if (node.clearance == null) {
+    let widest = node.radius * 2;
+    for (const part of node.parts) {
+      if (part.userData?.isLabel && part.geometry?.parameters) {
+        widest = Math.max(widest, part.geometry.parameters.width);
+      }
+    }
+    node.clearance = widest;
+  }
+  registry.nodes.set(id, node);
   if (!registry.edgesByNode.has(id)) registry.edgesByNode.set(id, []);
-  return registry.nodes.get(id);
+  return node;
 }
 
 function link(registry, nodeId, edge) {

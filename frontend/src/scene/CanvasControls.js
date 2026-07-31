@@ -11,10 +11,16 @@ import * as THREE from "three";
  * the surface, never enough to get lost behind the graph.
  *
  * **pivot** — used when two process planes are open facing each other. The
- * camera stands between them and turns its head: dragging looks around, the
- * wheel walks forward and back along the current heading. Yaw is clamped to the
- * arc that spans the two planes plus a margin, so the user can sweep from one
- * tree to the other but never end up staring into empty space behind them.
+ * camera stands between them and turns its head. Yaw is clamped to the arc that
+ * spans the two planes plus a margin, so the user can sweep from one tree to
+ * the other but never end up staring into empty space behind them.
+ *
+ * The gesture mapping is identical in both modes, because switching it under
+ * the user when a second plane opens is disorienting: **left-drag moves you**
+ * (pan across the canvas, or strafe between the planes), **right-drag rotates**
+ * (tilt, or turn the head), and the **wheel closes distance**. Pivot motion is
+ * scaled by the distance to the plane being faced, so a drag covers the same
+ * amount of screen there as it does on a flat canvas.
  */
 
 const MAX_YAW = THREE.MathUtils.degToRad(24);
@@ -54,6 +60,8 @@ export default class CanvasControls {
     // pivot mode
     this.pivotOrigin = new THREE.Vector3();
     this.pivotHeading = 0;
+    /** Distance to the plane being faced; sets the scale of pivot gestures. */
+    this.pivotDistance = 2000;
     this.pivotYawLimit = Math.PI;
     this.pivotCenterYaw = 0;
 
@@ -132,9 +140,12 @@ export default class CanvasControls {
    * directions (one per open plane); yaw is limited to the arc they span plus a
    * margin, so the sweep covers both trees and nothing else.
    */
-  setPivot(origin, headings, { snap = false } = {}) {
+  setPivot(origin, headings, { distance, snap = false } = {}) {
     this.mode = "pivot";
     this.pivotOrigin.copy(origin);
+    if (distance != null) {
+      this.pivotDistance = THREE.MathUtils.clamp(distance, this.minDistance, this.maxDistance);
+    }
 
     const angles = headings.map((direction) => Math.atan2(direction.x, direction.z));
     if (angles.length >= 2) {
@@ -232,9 +243,15 @@ export default class CanvasControls {
     if (!this.enabled || this._pointer !== null) return;
     this._pointer = event.pointerId;
     const secondary = event.button === 2 || event.button === 1 || event.shiftKey;
-    // In pivot mode the primary gesture is looking around, not panning: the
-    // whole point of standing between two planes is to turn your head.
-    this._mode = this.mode === "pivot" ? (secondary ? "walk" : "look") : secondary ? "tilt" : "pan";
+    // Same mapping in both modes: primary drag moves the viewer, secondary drag
+    // rotates. Swapping these when a second plane opens is disorienting.
+    this._mode = secondary
+      ? this.mode === "pivot"
+        ? "look"
+        : "tilt"
+      : this.mode === "pivot"
+        ? "walk"
+        : "pan";
     this._last.set(event.clientX, event.clientY);
     this.domElement.setPointerCapture?.(event.pointerId);
   }
@@ -256,9 +273,12 @@ export default class CanvasControls {
     }
 
     if (this._mode === "walk") {
+      // Same world-units-per-pixel rule as canvas panning, using the distance to
+      // the plane being faced, so a drag covers the same amount of screen.
+      const perPixel = this._perPixel(this.pivotDistance);
       const right = new THREE.Vector3(Math.cos(this.pivotHeading), 0, -Math.sin(this.pivotHeading));
-      this.pivotOrigin.addScaledVector(right, -dx * 2.2);
-      this.pivotOrigin.y = Math.max(40, this.pivotOrigin.y + dy * 2.2);
+      this.pivotOrigin.addScaledVector(right, -dx * perPixel);
+      this.pivotOrigin.y = Math.max(40, this.pivotOrigin.y + dy * perPixel);
       return;
     }
 
@@ -268,12 +288,16 @@ export default class CanvasControls {
       return;
     }
 
-    // Pan so the point under the cursor tracks it: at the canvas depth, one
-    // pixel is this many world units.
-    const height = this.domElement.clientHeight || 1;
-    const perPixel = (2 * this.distance * Math.tan((this.camera.fov * Math.PI) / 360)) / height;
+    // Pan so the point under the cursor tracks it.
+    const perPixel = this._perPixel(this.distance);
     this.pan.x -= dx * perPixel;
     this.pan.y += dy * perPixel;
+  }
+
+  /** World units covered by one pixel of drag at a given viewing distance. */
+  _perPixel(distance) {
+    const height = this.domElement.clientHeight || 1;
+    return (2 * distance * Math.tan((this.camera.fov * Math.PI) / 360)) / height;
   }
 
   _handlePointerUp(event) {
@@ -286,12 +310,20 @@ export default class CanvasControls {
   _handleWheel(event) {
     if (!this.enabled) return;
     event.preventDefault();
+    const factor = Math.exp(event.deltaY * ZOOM_SPEED);
     if (this.mode === "pivot") {
-      // Walk along the current heading rather than scaling a radius.
-      this.pivotOrigin.addScaledVector(this._pivotForward(), -event.deltaY * 1.1);
+      // Walk along the heading, closing a fraction of the remaining distance so
+      // the wheel behaves like the dolly on a flat canvas rather than a fixed
+      // step that crawls when far away and overshoots when close.
+      const next = THREE.MathUtils.clamp(
+        this.pivotDistance * factor,
+        this.minDistance,
+        this.maxDistance,
+      );
+      this.pivotOrigin.addScaledVector(this._pivotForward(), this.pivotDistance - next);
+      this.pivotDistance = next;
       return;
     }
-    const factor = Math.exp(event.deltaY * ZOOM_SPEED);
     this.distance = THREE.MathUtils.clamp(
       this.distance * factor,
       this.minDistance,
