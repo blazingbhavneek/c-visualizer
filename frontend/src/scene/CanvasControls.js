@@ -32,6 +32,33 @@ const ZOOM_SPEED = 0.0012;
 const DAMPING = 0.14;
 /** Fraction of the current tilt kept when the active canvas changes. */
 const TILT_CARRYOVER = 0.25;
+/**
+ * Rotation is spring-loaded rather than free inside a hard wall.
+ *
+ * Turning away from the resting angle gets progressively heavier the further
+ * out you are, turning back is easier than neutral, and letting go lets the
+ * view drift home. The straight-on view of a plane is the one worth being in,
+ * so it should take effort to leave and none to return.
+ */
+const RETURN_ASSIST = 1.4;
+const MIN_RESISTANCE = 0.1;
+/** Per-frame fraction of the remaining offset given back while idle. */
+const RECENTER_CANVAS = 0.05;
+const RECENTER_PIVOT = 0.03;
+/** How much of the gap to a plane the viewer may cross when walking. */
+const PIVOT_ADVANCE_LIMIT = 0.78;
+
+/**
+ * Move a rotation toward `delta`, resisting movement away from rest and
+ * assisting movement back toward it.
+ */
+function resistedRotation(current, delta, limit, rest = 0) {
+  const offset = current - rest;
+  const movingAway = offset === 0 || Math.sign(delta) === Math.sign(offset);
+  const ratio = Math.min(1, Math.abs(offset) / limit);
+  const factor = movingAway ? Math.max(MIN_RESISTANCE, 1 - ratio * ratio) : RETURN_ASSIST;
+  return THREE.MathUtils.clamp(offset + delta * factor, -limit, limit) + rest;
+}
 
 export default class CanvasControls {
   constructor(camera, domElement) {
@@ -143,6 +170,12 @@ export default class CanvasControls {
   setPivot(origin, headings, { distance, snap = false } = {}) {
     this.mode = "pivot";
     this.pivotOrigin.copy(origin);
+    this.pivotCentre = origin.clone();
+    this.pivotHeadings = headings.map((direction) => Math.atan2(direction.x, direction.z));
+    // The corridor between the two planes. Walking, not rotating, is what used
+    // to put the viewer behind a tree and show its back.
+    this.pivotAxis = headings.length >= 2 ? headings[1].clone().normalize() : null;
+    this.pivotSpan = distance ?? this.pivotDistance;
     if (distance != null) {
       this.pivotDistance = THREE.MathUtils.clamp(distance, this.minDistance, this.maxDistance);
     }
@@ -154,7 +187,8 @@ export default class CanvasControls {
       while (delta > Math.PI) delta -= Math.PI * 2;
       while (delta < -Math.PI) delta += Math.PI * 2;
       this.pivotCenterYaw = angles[0] + delta / 2;
-      this.pivotYawLimit = Math.abs(delta) / 2 + THREE.MathUtils.degToRad(20);
+      // Just enough past each plane to see it obliquely, not to get behind it.
+      this.pivotYawLimit = Math.abs(delta) / 2 + THREE.MathUtils.degToRad(8);
     } else {
       this.pivotCenterYaw = angles[0] ?? 0;
       this.pivotYawLimit = THREE.MathUtils.degToRad(50);
@@ -176,6 +210,34 @@ export default class CanvasControls {
     while (delta > Math.PI) delta -= Math.PI * 2;
     while (delta < -Math.PI) delta += Math.PI * 2;
     return this.pivotCenterYaw + THREE.MathUtils.clamp(delta, -this.pivotYawLimit, this.pivotYawLimit);
+  }
+
+  /** Keep the viewer inside the corridor between the two facing planes. */
+  _clampPivotOrigin() {
+    if (!this.pivotAxis || !this.pivotCentre) return;
+    const offset = this.pivotOrigin.clone().sub(this.pivotCentre);
+    const along = offset.dot(this.pivotAxis);
+    const limit = this.pivotSpan * PIVOT_ADVANCE_LIMIT;
+    if (Math.abs(along) > limit) {
+      this.pivotOrigin.addScaledVector(this.pivotAxis, Math.sign(along) * limit - along);
+    }
+  }
+
+  /** Heading of whichever plane the viewer is currently closest to facing. */
+  _nearestHeading() {
+    if (!this.pivotHeadings?.length) return this.pivotCenterYaw;
+    let best = this.pivotHeadings[0];
+    let bestDelta = Infinity;
+    for (const heading of this.pivotHeadings) {
+      let delta = heading - this.pivotHeading;
+      while (delta > Math.PI) delta -= Math.PI * 2;
+      while (delta < -Math.PI) delta += Math.PI * 2;
+      if (Math.abs(delta) < bestDelta) {
+        bestDelta = Math.abs(delta);
+        best = this.pivotHeading + delta;
+      }
+    }
+    return best;
   }
 
   _pivotForward() {
@@ -212,6 +274,23 @@ export default class CanvasControls {
     return { position: target.clone().addScaledVector(direction, this.distance), target, up };
   }
 
+  /**
+   * Drift back toward the resting angle whenever the user is not rotating, so
+   * the good viewing angle is where the camera ends up on its own.
+   */
+  _recenter() {
+    if (this._mode === "tilt" || this._mode === "look") return;
+    if (this.mode === "pivot") {
+      this.pitch += -this.pitch * RECENTER_PIVOT;
+      // Settle onto whichever tree is being looked at rather than between them.
+      const heading = this._nearestHeading();
+      this.pivotHeading += (heading - this.pivotHeading) * RECENTER_PIVOT;
+      return;
+    }
+    this.yaw += -this.yaw * RECENTER_CANVAS;
+    this.pitch += -this.pitch * RECENTER_CANVAS;
+  }
+
   _snap() {
     this._initialised = true;
     const { position, target, up } = this._desired();
@@ -230,6 +309,7 @@ export default class CanvasControls {
 
   update() {
     if (!this._initialised) return;
+    this._recenter();
     const { position, target, up } = this._desired();
     this._smoothedPosition.lerp(position, DAMPING);
     this._smoothedTarget.lerp(target, DAMPING);
@@ -263,12 +343,10 @@ export default class CanvasControls {
     this._last.set(event.clientX, event.clientY);
 
     if (this._mode === "look") {
-      this.pivotHeading = this._clampYaw(this.pivotHeading + dx * LOOK_SPEED);
-      this.pitch = THREE.MathUtils.clamp(
-        this.pitch + dy * LOOK_SPEED,
-        -PIVOT_MAX_PITCH,
-        PIVOT_MAX_PITCH,
+      this.pivotHeading = this._clampYaw(
+        resistedRotation(this.pivotHeading, dx * LOOK_SPEED, this.pivotYawLimit, this._nearestHeading()),
       );
+      this.pitch = resistedRotation(this.pitch, dy * LOOK_SPEED, PIVOT_MAX_PITCH);
       return;
     }
 
@@ -279,12 +357,13 @@ export default class CanvasControls {
       const right = new THREE.Vector3(Math.cos(this.pivotHeading), 0, -Math.sin(this.pivotHeading));
       this.pivotOrigin.addScaledVector(right, -dx * perPixel);
       this.pivotOrigin.y = Math.max(40, this.pivotOrigin.y + dy * perPixel);
+      this._clampPivotOrigin();
       return;
     }
 
     if (this._mode === "tilt") {
-      this.yaw = THREE.MathUtils.clamp(this.yaw - dx * ROTATE_SPEED, -MAX_YAW, MAX_YAW);
-      this.pitch = THREE.MathUtils.clamp(this.pitch + dy * ROTATE_SPEED, -MAX_PITCH, MAX_PITCH);
+      this.yaw = resistedRotation(this.yaw, -dx * ROTATE_SPEED, MAX_YAW);
+      this.pitch = resistedRotation(this.pitch, dy * ROTATE_SPEED, MAX_PITCH);
       return;
     }
 
@@ -322,6 +401,7 @@ export default class CanvasControls {
       );
       this.pivotOrigin.addScaledVector(this._pivotForward(), this.pivotDistance - next);
       this.pivotDistance = next;
+      this._clampPivotOrigin();
       return;
     }
     this.distance = THREE.MathUtils.clamp(
