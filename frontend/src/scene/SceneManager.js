@@ -563,6 +563,26 @@ export default class SceneManager {
 
   // ----------------------------------------------------------- presentation
 
+  /**
+   * Put the camera back where expanding put it.
+   *
+   * Movement is otherwise unconstrained, so the way back has to be a single
+   * action rather than something the user retraces by hand: re-frame the active
+   * plane, or return to the standpoint between two facing trees.
+   */
+  resetView() {
+    if (this.activeCanvas === "overview" || this.planes.size === 0) {
+      this.frameOverview();
+      return;
+    }
+    if (this.planes.size === 2) {
+      this._arrangePlanes();
+      return;
+    }
+    this.controls.resetTilt();
+    this.focusPlane(this.focusedPlane || [...this.planes.keys()][0]);
+  }
+
   /** Undo any dragging and put every graph back to its computed layout. */
   resetLayout() {
     for (const { layer } of this._layers()) {

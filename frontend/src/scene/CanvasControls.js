@@ -11,9 +11,13 @@ import * as THREE from "three";
  * the surface, never enough to get lost behind the graph.
  *
  * **pivot** — used when two process planes are open facing each other. The
- * camera stands between them and turns its head. Yaw is clamped to the arc that
- * spans the two planes plus a margin, so the user can sweep from one tree to
- * the other but never end up staring into empty space behind them.
+ * camera stands between them and turns its head, and is free to walk anywhere
+ * around either tree.
+ *
+ * Movement and rotation are otherwise unconstrained. The single limit anywhere
+ * is that the viewer never drops below the ground plane, because from beneath
+ * it the overview reads mirrored and the whole scene looks inverted. Going over
+ * the top is fine.
  *
  * The gesture mapping is identical in both modes, because switching it under
  * the user when a second plane opens is disorienting: **left-drag moves you**
@@ -286,17 +290,6 @@ export default class CanvasControls {
     return THREE.MathUtils.clamp(distance, this.minDistance, this.maxDistance);
   }
 
-  /** Keep the viewer inside the corridor between the two facing planes. */
-  _clampPivotOrigin() {
-    if (!this.pivotAxis || !this.pivotCentre) return;
-    const offset = this.pivotOrigin.clone().sub(this.pivotCentre);
-    const along = offset.dot(this.pivotAxis);
-    const limit = this.pivotSpan * PIVOT_ADVANCE_LIMIT;
-    if (Math.abs(along) > limit) {
-      this.pivotOrigin.addScaledVector(this.pivotAxis, Math.sign(along) * limit - along);
-    }
-  }
-
   /** Heading of whichever plane the viewer is currently closest to facing. */
   _nearestHeading() {
     if (!this.pivotHeadings?.length) return this.pivotCenterYaw;
@@ -435,7 +428,6 @@ export default class CanvasControls {
       );
       this.pivotOrigin.addScaledVector(right, -dx * perPixel);
       this.pivotOrigin.y = Math.max(MIN_CAMERA_HEIGHT, this.pivotOrigin.y + dy * perPixel);
-      this._clampPivotOrigin();
       return;
     }
 
@@ -503,7 +495,6 @@ export default class CanvasControls {
       this.pivotOrigin.addScaledVector(this._pivotForward(), current - next);
       this.pivotOrigin.y = Math.max(MIN_CAMERA_HEIGHT, this.pivotOrigin.y);
       this.pivotDistance = next;
-      this._clampPivotOrigin();
       return;
     }
     this.distance = THREE.MathUtils.clamp(

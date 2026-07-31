@@ -203,7 +203,7 @@ export default function App() {
           onFocusPlane={(processName) => sceneRef.current?.focusPlane(processName)}
           onClosePlane={(processName) => sceneRef.current?.closeProcess(processName)}
           onFrameOverview={() => sceneRef.current?.frameOverview()}
-          onResetTilt={() => sceneRef.current?.controls.resetTilt()}
+          onResetView={() => sceneRef.current?.resetView()}
           onResetLayout={() => sceneRef.current?.resetLayout()}
           edgeVisibility={edgeVisibility}
           onToggleEdge={(category, visible) => {
