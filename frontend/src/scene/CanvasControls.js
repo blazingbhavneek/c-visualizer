@@ -59,6 +59,8 @@ const MIN_RESISTANCE = 0.22;
  * inverting. Rotation is for going around and over the ground, not under it.
  */
 const MIN_CAMERA_HEIGHT = 80;
+/** How fast look resistance builds once the head turns outside the arc. */
+const PIVOT_LOOK_SCALE = THREE.MathUtils.degToRad(30);
 /** How much of the gap to a plane the viewer may cross when walking. */
 const PIVOT_ADVANCE_LIMIT = 0.78;
 
@@ -111,7 +113,8 @@ export default class CanvasControls {
     this.pivotHeading = 0;
     /** Distance to the plane being faced; sets the scale of pivot gestures. */
     this.pivotDistance = 2000;
-    this.pivotYawLimit = Math.PI;
+    /** Half the angle between the two plane headings; the free-look corridor. */
+    this.pivotArcHalf = Math.PI;
     this.pivotCenterYaw = 0;
 
     this._initialised = false;
@@ -229,11 +232,10 @@ export default class CanvasControls {
       while (delta > Math.PI) delta -= Math.PI * 2;
       while (delta < -Math.PI) delta += Math.PI * 2;
       this.pivotCenterYaw = angles[0] + delta / 2;
-      // Just enough past each plane to see it obliquely, not to get behind it.
-      this.pivotYawLimit = Math.abs(delta) / 2 + THREE.MathUtils.degToRad(8);
+      this.pivotArcHalf = Math.abs(delta) / 2;
     } else {
       this.pivotCenterYaw = angles[0] ?? 0;
-      this.pivotYawLimit = THREE.MathUtils.degToRad(50);
+      this.pivotArcHalf = THREE.MathUtils.degToRad(30);
     }
 
     this.pivotHeading = angles[0] ?? 0;
@@ -244,14 +246,28 @@ export default class CanvasControls {
   /** Swing the head to face one of the pivot headings. */
   lookAlong(direction) {
     if (this.mode !== "pivot") return;
-    this.pivotHeading = this._clampYaw(Math.atan2(direction.x, direction.z));
+    this.pivotHeading = Math.atan2(direction.x, direction.z);
   }
 
-  _clampYaw(angle) {
-    let delta = angle - this.pivotCenterYaw;
-    while (delta > Math.PI) delta -= Math.PI * 2;
-    while (delta < -Math.PI) delta += Math.PI * 2;
-    return this.pivotCenterYaw + THREE.MathUtils.clamp(delta, -this.pivotYawLimit, this.pivotYawLimit);
+  /**
+   * Turning the head between the two trees is free; turning away from both is
+   * weighted, and turning back is assisted.
+   *
+   * This used to be a hard clamp at the arc plus a few degrees, which with two
+   * planes facing each other meant a wall at about 180 degrees of total sweep -
+   * exactly the "cannot rotate freely" the corridor was never meant to cause.
+   * Resistance outside the arc gives the same protection without the wall.
+   */
+  _resistedLook(current, delta) {
+    let offset = current - this.pivotCenterYaw;
+    while (offset > Math.PI) offset -= Math.PI * 2;
+    while (offset < -Math.PI) offset += Math.PI * 2;
+
+    const movingAway = offset === 0 || Math.sign(delta) === Math.sign(offset);
+    const excess = Math.max(0, Math.abs(offset) - this.pivotArcHalf);
+    const ratio = excess / PIVOT_LOOK_SCALE;
+    const factor = movingAway ? Math.max(MIN_RESISTANCE, 1 / (1 + ratio * ratio)) : RETURN_ASSIST;
+    return this.pivotCenterYaw + offset + delta * factor;
   }
 
   /**
@@ -396,11 +412,7 @@ export default class CanvasControls {
     this._last.set(event.clientX, event.clientY);
 
     if (this._mode === "look") {
-      this.pivotHeading = this._clampYaw(
-        resistedRotation(this.pivotHeading, dx * LOOK_SPEED, this.pivotYawLimit, {
-          rest: this._nearestHeading(),
-        }),
-      );
+      this.pivotHeading = this._resistedLook(this.pivotHeading, dx * LOOK_SPEED);
       this.pitch = resistedRotation(this.pitch, dy * LOOK_SPEED, PIVOT_PITCH_SCALE, {
         hardLimit: HARD_PITCH,
       });
@@ -504,7 +516,8 @@ export default class CanvasControls {
   /** Return to looking dead-on at the active canvas. */
   resetTilt() {
     if (this.mode === "pivot") {
-      this.pivotHeading = this.pivotCenterYaw;
+      // Square up on whichever tree is nearest, not the empty midpoint.
+      this.pivotHeading = this._nearestHeading();
       this.pitch = 0;
       return;
     }
