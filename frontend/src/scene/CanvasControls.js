@@ -222,6 +222,22 @@ export default class CanvasControls {
     return this.pivotCenterYaw + THREE.MathUtils.clamp(delta, -this.pivotYawLimit, this.pivotYawLimit);
   }
 
+  /**
+   * Distance from the viewer to the plane it is currently facing.
+   *
+   * Gesture speed has to be calibrated against this, not against the fixed span
+   * set when the pair was arranged. Once the viewer walks up close, a strafe
+   * scaled by the original span sends the content flying - measured at 33x the
+   * drag before this was tracked.
+   */
+  _facingDistance() {
+    if (!this.pivotAxis || !this.pivotCentre) return this.pivotDistance;
+    const along = this.pivotOrigin.clone().sub(this.pivotCentre).dot(this.pivotAxis);
+    const facingPositive = this._pivotForward().dot(this.pivotAxis) > 0;
+    const distance = facingPositive ? this.pivotSpan - along : this.pivotSpan + along;
+    return THREE.MathUtils.clamp(distance, this.minDistance, this.maxDistance);
+  }
+
   /** Keep the viewer inside the corridor between the two facing planes. */
   _clampPivotOrigin() {
     if (!this.pivotAxis || !this.pivotCentre) return;
@@ -349,8 +365,17 @@ export default class CanvasControls {
     if (this._mode === "walk") {
       // Same world-units-per-pixel rule as canvas panning, using the distance to
       // the plane being faced, so a drag covers the same amount of screen.
-      const perPixel = this._perPixel(this.pivotDistance);
-      const right = new THREE.Vector3(Math.cos(this.pivotHeading), 0, -Math.sin(this.pivotHeading));
+      //
+      // The right vector is cross(forward, up). It was previously written as its
+      // negative, so strafing carried the viewer the same way as the mouse and
+      // the content slid against it - the one gesture that did not follow the
+      // pointer.
+      const perPixel = this._perPixel(this._facingDistance());
+      const right = new THREE.Vector3(
+        -Math.cos(this.pivotHeading),
+        0,
+        Math.sin(this.pivotHeading),
+      );
       this.pivotOrigin.addScaledVector(right, -dx * perPixel);
       this.pivotOrigin.y = Math.max(40, this.pivotOrigin.y + dy * perPixel);
       this._clampPivotOrigin();
@@ -359,17 +384,33 @@ export default class CanvasControls {
 
     if (this._mode === "tilt") {
       // No yaw limit at all: keep dragging and the view swings behind the tree.
-      this.yaw = resistedRotation(this.yaw, -dx * ROTATE_SPEED, YAW_SCALE);
+      //
+      // Sign note: an orbit's apparent motion is dominated by the camera's
+      // rotation, not its translation. Swinging the camera left rotates the
+      // scene left too, so the content moved *against* the mouse. Measured on a
+      // tree, a 180px right-drag shifted content -32px before this flip.
+      this.yaw = resistedRotation(this.yaw, dx * ROTATE_SPEED, YAW_SCALE);
       this.pitch = resistedRotation(this.pitch, dy * ROTATE_SPEED, PITCH_SCALE, {
         hardLimit: HARD_PITCH,
       });
       return;
     }
 
-    // Pan so the point under the cursor tracks it.
+    // Pan along the CAMERA's screen axes, not the plane's fixed basis.
+    //
+    // `frame.right` is a property of the plane, so once the view swung past 90
+    // degrees - or right around behind the tree - it no longer pointed at
+    // screen-right and dragging moved the canvas the wrong way. Deriving the
+    // direction from the camera and projecting it back onto the plane keeps the
+    // content following the mouse from every angle.
     const perPixel = this._perPixel(this.distance);
-    this.pan.x -= dx * perPixel;
-    this.pan.y += dy * perPixel;
+    const cameraRight = new THREE.Vector3().setFromMatrixColumn(this.camera.matrixWorld, 0);
+    const cameraUp = new THREE.Vector3().setFromMatrixColumn(this.camera.matrixWorld, 1);
+    const move = cameraRight
+      .multiplyScalar(-dx * perPixel)
+      .addScaledVector(cameraUp, dy * perPixel);
+    this.pan.x += move.dot(this.frame.right);
+    this.pan.y += move.dot(this.frame.up);
   }
 
   /** World units covered by one pixel of drag at a given viewing distance. */
@@ -393,12 +434,9 @@ export default class CanvasControls {
       // Walk along the heading, closing a fraction of the remaining distance so
       // the wheel behaves like the dolly on a flat canvas rather than a fixed
       // step that crawls when far away and overshoots when close.
-      const next = THREE.MathUtils.clamp(
-        this.pivotDistance * factor,
-        this.minDistance,
-        this.maxDistance,
-      );
-      this.pivotOrigin.addScaledVector(this._pivotForward(), this.pivotDistance - next);
+      const current = this._facingDistance();
+      const next = THREE.MathUtils.clamp(current * factor, this.minDistance, this.maxDistance);
+      this.pivotOrigin.addScaledVector(this._pivotForward(), current - next);
       this.pivotDistance = next;
       this._clampPivotOrigin();
       return;
