@@ -1,0 +1,29 @@
+{
+  "scf_tag_open":     { "type": "OPENF",  "launch": "FORK", "indices": [2],    "get_upper": true,  "dependent_functions": [] },
+  "scf_tag_read":     { "type": "READF",  "launch": "FORK", "indices": [2],    "get_upper": true,  "dependent_functions": [] },
+  "scf_tag_write":    { "type": "WRITEF", "launch": "FORK", "indices": [2, 3], "get_upper": true,  "dependent_functions": [] },
+  "scf_tag_close":    { "type": "CLOSEF", "launch": "FORK", "indices": [],     "get_upper": true,  "dependent_functions": [] },
+  "scf_tag_copy":     { "type": "COPYF",  "launch": "FORK", "indices": [1, 2], "get_upper": true,  "dependent_functions": [] },
+  "scf_hist_save":    { "type": "SAVEF",  "launch": "FORK", "indices": [1],    "get_upper": true,  "dependent_functions": [] },
+  "scf_hist_load":    { "type": "LOADF",  "launch": "FORK", "indices": [1],    "get_upper": false, "dependent_functions": [] },
+  "scf_cfg_clear":    { "type": "CLEARF", "launch": "FORK", "indices": [1],    "get_upper": true,  "dependent_functions": [] },
+
+  "scf_alarmq_enq":   { "type": "ENQ",    "launch": "FORK", "indices": [1, 2], "get_upper": true,  "dependent_functions": [] },
+  "scf_alarmq_deq":   { "type": "DEQ",    "launch": "FORK", "indices": [1],    "get_upper": true,  "dependent_functions": [] },
+  "scf_msgq_write":   { "type": "WRITEQ", "launch": "MESSAGE", "indices": [1], "get_upper": true,  "dependent_functions": [] },
+  "scf_msgq_read":    { "type": "READQ",  "launch": "MESSAGE", "indices": [1], "get_upper": true,  "dependent_functions": [] },
+  "scf_cmdq_save":    { "type": "SAVEQ",  "launch": "FORK", "indices": [1],    "get_upper": true,  "dependent_functions": [] },
+  "scf_cmdq_load":    { "type": "LOADQ",  "launch": "FORK", "indices": [1],    "get_upper": true,  "dependent_functions": [] },
+  "scf_cmdq_clear":   { "type": "CLEARQ", "launch": "FORK", "indices": [1],    "get_upper": true,  "dependent_functions": [] },
+
+  "scf_evt_post":     { "type": "EVENT", "launch": "EVENT", "indices": [1], "get_upper": true, "dependent_functions": [] },
+  "scf_var_evt":      { "type": "EVENT", "launch": "EVENT", "indices": [1], "get_upper": true, "dependent_functions": [] },
+  "scf_sem_wait":     { "type": "SEMAPHORE", "launch": "SEMAPHORE", "indices": [1], "get_upper": true, "dependent_functions": [] },
+  "scf_task_kill":    { "type": "KILL", "launch": "SIGNAL", "indices": [1], "get_upper": true, "dependent_functions": [] },
+
+  "scf_evt_register": { "type": "EVENT",  "launch": "EVENT",  "indices": [1], "get_upper": true, "dependent_functions": [] },
+  "scf_timer_start":  { "type": "EVENT",  "launch": "TIMER",  "indices": [1], "get_upper": true, "dependent_functions": [] },
+  "scf_task_fork":    { "type": "FORK",   "launch": "FORK",   "indices": [1], "get_upper": true, "dependent_functions": [] },
+  "scf_signal_hook":  { "type": "SIGNAL", "launch": "SIGNAL", "indices": [1], "get_upper": true, "dependent_functions": [] },
+  "scf_input_bind":   { "type": "INPUT",  "launch": "INPUT",  "indices": [1], "get_upper": true, "dependent_functions": [] }
+}

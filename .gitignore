@@ -1,0 +1,28 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+venv/
+env/
+.env
+.env.*
+
+# Frontend
+node_modules/
+
+# Local code index (per-machine, rebuilt on demand)
+.codegraph/
+
+# Generated analysis output
+results/
+pickle_data/
+*.log
+
+# Local backups of replaced code
+backup/

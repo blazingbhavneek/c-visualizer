@@ -1,0 +1,7 @@
+{
+  "scf_evt_register": { "func_argument": [2] },
+  "scf_timer_start":  { "func_argument": [3] },
+  "scf_task_fork":    { "func_argument": [2] },
+  "scf_signal_hook":  { "func_argument": [2] },
+  "scf_input_bind":   { "func_argument": [2] }
+}

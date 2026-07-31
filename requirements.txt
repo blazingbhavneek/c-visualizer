@@ -1,0 +1,26 @@
+# Python 3.10+ is required by the local tree-sitter binding.
+# The C compiler and `unifdef` are system prerequisites, not pip packages.
+
+# LLM and data validation
+openai
+ollama
+pydantic
+tiktoken
+
+# Static analysis
+libclang
+# Install the repository's grammar with its own compatible tree-sitter core
+# requirement; an arbitrary newest core can crash the native grammar binding.
+-e ./tree-sitter-c[core]
+
+# Tracer CLI and outputs
+pandas
+pick
+Pygments
+rich
+
+# Existing graph exporters
+networkx
+numpy
+plotly
+pyvis
