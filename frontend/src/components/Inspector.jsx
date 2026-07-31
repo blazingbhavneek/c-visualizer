@@ -4,10 +4,10 @@ import { interactionDirection } from "../graph/model.js";
 
 export default function Inspector({ selection, index, runId }) {
   return (
-    <aside className="flex w-[26rem] shrink-0 flex-col border-l border-ink-700 bg-ink-900">
-      <header className="border-b border-ink-700 px-5 py-4">
-        <h1 className="text-sm font-semibold tracking-wide text-slate-200">Inspector</h1>
-        <p className="mt-0.5 text-xs text-slate-500">
+    <aside className="flex w-[26rem] shrink-0 flex-col border-l border-rule bg-panel">
+      <header className="border-b border-rule px-5 py-4">
+        <h1 className="text-sm font-semibold tracking-wide text-ink">Inspector</h1>
+        <p className="mt-0.5 text-xs text-ink-faint">
           Static-analysis evidence for the selected element
         </p>
       </header>
@@ -26,7 +26,7 @@ export default function Inspector({ selection, index, runId }) {
 
 function EmptyState() {
   return (
-    <div className="px-5 py-6 text-sm leading-relaxed text-slate-500">
+    <div className="px-5 py-6 text-sm leading-relaxed text-ink-muted">
       <p>Nothing selected.</p>
       <ul className="mt-3 space-y-1.5 text-xs">
         <li>Click a process on the ground plane to raise its call tree.</li>
@@ -39,10 +39,10 @@ function EmptyState() {
 
 function Section({ title, count, children }) {
   return (
-    <section className="border-b border-ink-700/70 px-5 py-4">
-      <h2 className="mb-2.5 flex items-baseline gap-2 text-[11px] font-semibold uppercase tracking-wider text-slate-500">
+    <section className="border-b border-rule px-5 py-4">
+      <h2 className="mb-2.5 flex items-baseline gap-2 text-[11px] font-semibold uppercase tracking-wider text-ink-faint">
         {title}
-        {count != null && <span className="font-normal normal-case text-slate-600">{count}</span>}
+        {count != null && <span className="font-normal normal-case text-ink-faint">{count}</span>}
       </h2>
       {children}
     </section>
@@ -51,11 +51,11 @@ function Section({ title, count, children }) {
 
 function Badge({ tone = "slate", children }) {
   const tones = {
-    slate: "border-ink-700 bg-ink-800 text-slate-300",
-    amber: "border-amber-700/50 bg-amber-950/50 text-amber-300",
-    green: "border-emerald-700/50 bg-emerald-950/50 text-emerald-300",
-    rose: "border-rose-700/50 bg-rose-950/50 text-rose-300",
-    violet: "border-violet-700/50 bg-violet-950/50 text-violet-300",
+    slate: "border-rule bg-sunken text-ink-muted",
+    amber: "border-amber-300 bg-amber-50 text-amber-800",
+    green: "border-emerald-300 bg-emerald-50 text-emerald-800",
+    rose: "border-rose-300 bg-rose-50 text-rose-800",
+    violet: "border-violet-300 bg-violet-50 text-violet-800",
   };
   return (
     <span className={`rounded border px-1.5 py-0.5 text-[10px] font-medium ${tones[tone]}`}>
@@ -100,8 +100,8 @@ function FunctionPanel({ selection, index, runId }) {
   return (
     <div>
       <Section title="Function">
-        <p className="font-mono text-sm break-all text-slate-100">{fn.name}</p>
-        <p className="mt-1 font-mono text-xs break-all text-slate-500">
+        <p className="font-mono text-sm break-all text-ink">{fn.name}</p>
+        <p className="mt-1 font-mono text-xs break-all text-ink-muted">
           {fn.file_name || "—"}
           {fn.start_line > 0 ? ` [${fn.start_line}:${fn.end_line}]` : ""}
         </p>
@@ -124,18 +124,18 @@ function FunctionPanel({ selection, index, runId }) {
 
       <Section title="AI explanation">
         {fn.summary ? (
-          <p className="text-sm leading-relaxed text-slate-200">{fn.summary}</p>
+          <p className="text-sm leading-relaxed text-ink">{fn.summary}</p>
         ) : (
-          <div className="rounded-md border border-dashed border-ink-700 bg-ink-850/60 p-3">
-            <p className="text-xs leading-relaxed text-slate-500">
+          <div className="rounded-md border border-dashed border-rule-strong bg-sunken p-3">
+            <p className="text-xs leading-relaxed text-ink-muted">
               No model-written summary in this snapshot.{" "}
-              <span className="font-mono text-slate-400">summary_status: {fn.summary_status || "—"}</span>
+              <span className="font-mono text-ink-muted">summary_status: {fn.summary_status || "—"}</span>
               {" — "}
               every function in every current snapshot has <span className="font-mono">summary: null</span>,
               so this panel fills in once the pipeline writes summaries.
             </p>
             {fn.summary_hint && (
-              <p className="mt-2 border-t border-ink-700 pt-2 text-xs text-slate-400">
+              <p className="mt-2 border-t border-rule pt-2 text-xs text-ink-muted">
                 {fn.summary_hint}
               </p>
             )}
@@ -145,17 +145,17 @@ function FunctionPanel({ selection, index, runId }) {
 
       {selection.node.viaCalls?.length > 0 && (
         <Section title="Reached via" count={selection.node.viaCalls.length}>
-          <p className="mb-2 text-[11px] leading-relaxed text-slate-600">
+          <p className="mb-2 text-[11px] leading-relaxed text-ink-faint">
             Call sites on this tree edge. Parallel calls to the same target share one node, so all
             of them are listed here.
           </p>
           <ul className="space-y-1">
             {selection.node.viaCalls.map((call) => (
               <li key={call.id} className="flex items-baseline justify-between gap-2 text-xs">
-                <span className="font-mono text-slate-300">
+                <span className="font-mono text-ink-muted">
                   {index?.functions.get(call.source)?.name || call.source}
                 </span>
-                <span className="shrink-0 font-mono text-[10px] text-slate-600">
+                <span className="shrink-0 font-mono text-[10px] text-ink-faint">
                   {call.kind}
                   {call.line != null && ` :${call.line}`}
                   {call.via && ` via ${index?.functions.get(call.via)?.name || call.via}`}
@@ -168,26 +168,26 @@ function FunctionPanel({ selection, index, runId }) {
 
       <Section title="Daemon interactions" count={interactions.length || null}>
         {interactions.length === 0 ? (
-          <p className="text-xs text-slate-600">No resource interaction attributed to this function.</p>
+          <p className="text-xs text-ink-faint">No resource interaction attributed to this function.</p>
         ) : (
           <ul className="space-y-2">
             {interactions.map((interaction) => {
               const resource = index.resources.get(interaction.resource_id);
               const direction = interactionDirection(interaction);
               return (
-                <li key={interaction.id} className="rounded-md bg-ink-850 p-2.5">
+                <li key={interaction.id} className="rounded-md border border-rule bg-sunken p-2.5">
                   <div className="flex items-center justify-between gap-2">
-                    <span className="font-mono text-xs text-emerald-300">{interaction.target_api}</span>
+                    <span className="font-mono text-xs text-emerald-800">{interaction.target_api}</span>
                     <Badge tone="slate">{interaction.operation}</Badge>
                   </div>
-                  <p className="mt-1.5 font-mono text-[11px] text-slate-400">
+                  <p className="mt-1.5 font-mono text-[11px] text-ink-muted">
                     {direction === "in" ? "←" : direction === "out" ? "→" : "↔"}{" "}
                     {resource ? `${resource.kind} ${resource.name}` : interaction.resource_id}
                     {resource && !resource.resolved && (
-                      <span className="ml-1.5 text-rose-400">unresolved</span>
+                      <span className="ml-1.5 text-rose-700">unresolved</span>
                     )}
                   </p>
-                  <p className="mt-1 text-[11px] text-slate-600">
+                  <p className="mt-1 text-[11px] text-ink-faint">
                     arg #{interaction.argument_binding?.argument_index} ={" "}
                     <span className="font-mono">{String(interaction.argument_binding?.value)}</span>
                     {interaction.launch_via && ` · via ${interaction.launch_via}`}
@@ -209,19 +209,19 @@ function FunctionPanel({ selection, index, runId }) {
 
       <Section title="Traces mentioning this name" count={traces.length || null}>
         {traces.length === 0 ? (
-          <p className="text-xs text-slate-600">No trace path contains this function name.</p>
+          <p className="text-xs text-ink-faint">No trace path contains this function name.</p>
         ) : (
           <ul className="space-y-2">
             {traces.slice(0, 12).map((trace) => (
-              <li key={trace.id} className="rounded-md bg-ink-850 p-2.5">
-                <p className="font-mono text-[11px] text-sky-300">{trace.target_api}</p>
-                <p className="mt-1 font-mono text-[10px] leading-relaxed break-all text-slate-500">
+              <li key={trace.id} className="rounded-md border border-rule bg-sunken p-2.5">
+                <p className="font-mono text-[11px] text-sky-800">{trace.target_api}</p>
+                <p className="mt-1 font-mono text-[10px] leading-relaxed break-all text-ink-muted">
                   {trace.display_path}
                 </p>
               </li>
             ))}
             {traces.length > 12 && (
-              <li className="text-[11px] text-slate-600">+{traces.length - 12} more</li>
+              <li className="text-[11px] text-ink-faint">+{traces.length - 12} more</li>
             )}
           </ul>
         )}
@@ -235,12 +235,12 @@ function FunctionPanel({ selection, index, runId }) {
         <button
           type="button"
           onClick={() => setShowRaw((value) => !value)}
-          className="text-[11px] text-slate-500 underline underline-offset-2 hover:text-slate-300"
+          className="text-[11px] text-ink-muted underline underline-offset-2 hover:text-ink"
         >
           {showRaw ? "Hide" : "Show"} raw snapshot fields
         </button>
         {showRaw && (
-          <pre className="mt-2 overflow-x-auto rounded-md bg-ink-950 p-3 font-mono text-[10px] leading-relaxed text-slate-400">
+          <pre className="mt-2 overflow-x-auto rounded-md border border-rule bg-inset p-3 font-mono text-[10px] leading-relaxed text-ink-muted">
             {JSON.stringify(fn, null, 2)}
           </pre>
         )}
@@ -251,7 +251,7 @@ function FunctionPanel({ selection, index, runId }) {
 
 function CallList({ calls, index, field }) {
   if (calls.length === 0) {
-    return <p className="text-xs text-slate-600">None recorded.</p>;
+    return <p className="text-xs text-ink-faint">None recorded.</p>;
   }
   return (
     <ul className="space-y-1">
@@ -259,8 +259,8 @@ function CallList({ calls, index, field }) {
         const other = index?.functions.get(call[field]);
         return (
           <li key={call.id} className="flex items-baseline justify-between gap-2 text-xs">
-            <span className="truncate font-mono text-slate-300">{other?.name || call[field]}</span>
-            <span className="shrink-0 font-mono text-[10px] text-slate-600">
+            <span className="truncate font-mono text-ink-muted">{other?.name || call[field]}</span>
+            <span className="shrink-0 font-mono text-[10px] text-ink-faint">
               {call.kind}
               {call.line != null && ` :${call.line}`}
             </span>
@@ -274,16 +274,16 @@ function CallList({ calls, index, field }) {
 function SourceBlock({ state, canFetch }) {
   if (!canFetch || state.phase === "unavailable") {
     return (
-      <p className="text-xs text-slate-600">
+      <p className="text-xs text-ink-faint">
         No source evidence — external, synthetic, or no recorded definition range.
       </p>
     );
   }
-  if (state.phase === "loading") return <p className="text-xs text-slate-600">Loading source…</p>;
+  if (state.phase === "loading") return <p className="text-xs text-ink-faint">Loading source…</p>;
   if (state.phase === "error") {
     const status = state.error.status;
     return (
-      <p className="text-xs text-amber-400">
+      <p className="text-xs text-amber-800">
         {status === 403
           ? "Source lies outside this process root (403)."
           : status === 404
@@ -295,8 +295,8 @@ function SourceBlock({ state, canFetch }) {
   if (state.phase !== "ready") return null;
   return (
     <div>
-      <p className="mb-1.5 font-mono text-[10px] break-all text-slate-600">{state.payload.file}</p>
-      <pre className="max-h-96 overflow-auto rounded-md bg-ink-950 p-3 font-mono text-[10px] leading-relaxed text-slate-300">
+      <p className="mb-1.5 font-mono text-[10px] break-all text-ink-faint">{state.payload.file}</p>
+      <pre className="max-h-96 overflow-auto rounded-md border border-rule bg-inset p-3 font-mono text-[10px] leading-relaxed text-ink">
         {state.payload.text}
       </pre>
     </div>
@@ -307,7 +307,7 @@ function ResourcePanel({ resource }) {
   return (
     <div>
       <Section title="Daemon resource">
-        <p className="font-mono text-sm text-slate-100">
+        <p className="font-mono text-sm text-ink">
           {resource.kind} {resource.name}
         </p>
         <div className="mt-2.5 flex flex-wrap gap-1.5">
@@ -322,14 +322,14 @@ function ResourcePanel({ resource }) {
       <Section title="Processes touching it" count={resource.processes.size}>
         <ul className="space-y-1">
           {[...resource.processes].sort().map((name) => (
-            <li key={name} className="font-mono text-xs text-slate-300">
+            <li key={name} className="font-mono text-xs text-ink-muted">
               {name}
             </li>
           ))}
         </ul>
       </Section>
       <Section title="Note">
-        <p className="text-xs leading-relaxed text-slate-500">
+        <p className="text-xs leading-relaxed text-ink-muted">
           Resources are keyed by <span className="font-mono">kind + name</span> across snapshots
           because IDs are per-snapshot hashes. This is analysis evidence from the model-assisted
           results, not a live daemon inventory.
@@ -343,8 +343,8 @@ function ProcessPanel({ process, index }) {
   return (
     <div>
       <Section title="Process">
-        <p className="font-mono text-sm text-slate-100">{process.name}</p>
-        <p className="mt-1 font-mono text-[11px] break-all text-slate-500">
+        <p className="font-mono text-sm text-ink">{process.name}</p>
+        <p className="mt-1 font-mono text-[11px] break-all text-ink-muted">
           {index?.process.root || ""}
         </p>
         <div className="mt-2.5 flex flex-wrap gap-1.5">
@@ -354,14 +354,14 @@ function ProcessPanel({ process, index }) {
         </div>
       </Section>
       <Section title="Entry">
-        <p className="font-mono text-xs text-slate-300">
+        <p className="font-mono text-xs text-ink-muted">
           {index?.entryId
             ? index.functions.get(index.entryId)?.name || index.entryId
             : "no entry function — plane uses graph roots"}
         </p>
       </Section>
       <Section title="Next">
-        <p className="text-xs leading-relaxed text-slate-500">
+        <p className="text-xs leading-relaxed text-ink-muted">
           Its call tree is now raised on a plane anchored to this node. Click any function in that
           tree to inspect it.
         </p>

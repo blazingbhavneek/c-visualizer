@@ -51,28 +51,57 @@ export function buildProcessPlaneLayer({
     maxY: Math.max(treeLayout.bounds.maxY, shelf.bounds.maxY),
   };
 
-  // Backdrop: gives the plane presence head-on and vanishes edge-on, which is
-  // exactly the behaviour the layered design depends on.
+  // Backdrop: the plane reads as a sheet of paper laid in the scene. On white a
+  // tinted fill washes the whole tree, so the sheet stays neutral and the
+  // process colour is carried by a thin border instead.
   const padding = 140;
+  const sheetWidth = bounds.maxX - bounds.minX + padding * 2;
+  const sheetHeight = bounds.maxY - bounds.minY + padding * 2;
+  const sheetCenter = new THREE.Vector3(
+    (bounds.minX + bounds.maxX) / 2,
+    (bounds.minY + bounds.maxY) / 2,
+    -1.5,
+  );
+
   const backdrop = new THREE.Mesh(
-    new THREE.PlaneGeometry(bounds.maxX - bounds.minX + padding * 2, bounds.maxY - bounds.minY + padding * 2),
+    new THREE.PlaneGeometry(sheetWidth, sheetHeight),
     new THREE.MeshBasicMaterial({
-      color: new THREE.Color(processTint),
+      color: new THREE.Color(COLORS.sheet),
       transparent: true,
-      opacity: 0.045,
+      opacity: 0.85,
       side: THREE.DoubleSide,
       depthWrite: false,
       toneMapped: false,
     }),
   );
-  backdrop.position.set(
-    (bounds.minX + bounds.maxX) / 2,
-    (bounds.minY + bounds.maxY) / 2,
-    -1.5,
-  );
+  backdrop.position.copy(sheetCenter);
   backdrop.renderOrder = 0;
-  backdrop.userData.baseOpacity = 0.045;
+  backdrop.userData.baseOpacity = 0.85;
   group.add(backdrop);
+
+  const halfWidth = sheetWidth / 2;
+  const halfHeight = sheetHeight / 2;
+  const frameGeometry = new THREE.BufferGeometry().setFromPoints([
+    new THREE.Vector3(-halfWidth, -halfHeight, 0),
+    new THREE.Vector3(halfWidth, -halfHeight, 0),
+    new THREE.Vector3(halfWidth, halfHeight, 0),
+    new THREE.Vector3(-halfWidth, halfHeight, 0),
+    new THREE.Vector3(-halfWidth, -halfHeight, 0),
+  ]);
+  const frame = new THREE.Line(
+    frameGeometry,
+    new THREE.LineBasicMaterial({
+      color: new THREE.Color(processTint),
+      transparent: true,
+      opacity: 0.55,
+      depthWrite: false,
+      toneMapped: false,
+    }),
+  );
+  frame.position.copy(sheetCenter);
+  frame.renderOrder = 0;
+  frame.userData.baseOpacity = 0.55;
+  group.add(frame);
 
   // --- tree edges ----------------------------------------------------------
   const bowCounters = new Map();
@@ -94,9 +123,9 @@ export function buildProcessPlaneLayer({
     const raw = edgePoints(from, to, { bow });
     const points = trimToRadius(raw, sourceRadius + 3, targetRadius + 5);
     const color = node.recursive ? COLORS.recursive : COLORS.edge;
-    const line = createEdgeLine(points, color, { opacity: node.recursive ? 0.55 : 0.5 });
+    const line = createEdgeLine(points, color, { opacity: node.recursive ? 0.8 : 0.7 });
     group.add(line);
-    group.add(createArrowHead(points, color, { size: 11, opacity: 0.75 }));
+    group.add(createArrowHead(points, color, { size: 11, opacity: 0.9 }));
 
     // One edge can stand for several call sites; show every line number so the
     // merge stays visible rather than looking like a single call.
@@ -112,7 +141,7 @@ export function buildProcessPlaneLayer({
       const edgeLabel = createLabel([shown], {
         worldHeight: 17,
         fontSize: 12,
-        color: "#9aa7b8",
+        color: COLORS.inkMuted,
       });
       edgeLabel.position.set(midpoint.x, midpoint.y, 0.2);
       edgeLabel.userData.detailLabel = true;
@@ -138,7 +167,7 @@ export function buildProcessPlaneLayer({
     pickables.push(disc);
 
     if (node.fn.is_static) {
-      const ring = createRing(radius * 1.3, "#ffffff", { opacity: 0.28 });
+      const ring = createRing(radius * 1.3, COLORS.hairline, { opacity: 0.95 });
       ring.position.copy(disc.position);
       group.add(ring);
     }
@@ -152,7 +181,7 @@ export function buildProcessPlaneLayer({
     const label = createLabel(lines, {
       worldHeight: isEntry ? 26 : 21,
       fontSize: isEntry ? 16 : 14,
-      color: isEntry ? "#ffd9d9" : isPort ? "#b6ffd4" : "#cdd8e8",
+      color: isEntry ? COLORS.entry : isPort ? COLORS.port : COLORS.ink,
       bold: isEntry,
     });
     label.position.set(point.x, point.y - radius - 8 - lines.length * 10, 0.6);
@@ -171,7 +200,7 @@ export function buildProcessPlaneLayer({
   for (const block of shelf.blocks) {
     const header = createLabel(
       [block.file, `${block.count} off-tree · ${block.isolated} with no calls at all`],
-      { worldHeight: 20, fontSize: 13, color: "#7f8ca0" },
+      { worldHeight: 20, fontSize: 13, color: COLORS.inkMuted },
     );
     header.position.set(block.x + block.width / 2, block.y + 16, 0.4);
     header.userData.detailLabel = true;
@@ -207,7 +236,7 @@ export function buildProcessPlaneLayer({
         "NOT REACHABLE FROM main",
         `${coverage.unreached} of ${coverage.internal} internal functions · ${coverage.isolated} have no recorded call at all`,
       ],
-      { worldHeight: 24, fontSize: 14, color: "#6f7c90" },
+      { worldHeight: 24, fontSize: 14, color: COLORS.inkMuted },
     );
     caption.position.set(
       shelf.bounds.minX + (shelf.bounds.maxX - shelf.bounds.minX) / 2,

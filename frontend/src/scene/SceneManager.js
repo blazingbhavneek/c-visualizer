@@ -3,7 +3,7 @@ import CanvasControls from "./CanvasControls.js";
 import { buildOverviewLayer } from "./buildOverview.js";
 import { buildProcessPlaneLayer } from "./buildProcessPlane.js";
 import { disposeObject } from "./primitives.js";
-import { COLORS, processColor } from "./palette.js";
+import { COLORS, SURFACE, processColor } from "./palette.js";
 import { directPlanePairs } from "../graph/model.js";
 
 const UP = new THREE.Vector3(0, 1, 0);
@@ -38,15 +38,17 @@ export default class SceneManager {
     this.onPlanesChanged = onPlanesChanged || (() => {});
 
     this.scene = new THREE.Scene();
-    this.scene.background = new THREE.Color("#07090d");
-    this.scene.fog = new THREE.Fog("#07090d", 4200, 11000);
+    this.scene.background = new THREE.Color(SURFACE);
+    // Fog on a white surface fades distant planes toward the paper rather than
+    // into darkness, which is what keeps the inactive canvas recessive.
+    this.scene.fog = new THREE.Fog(SURFACE, 4200, 13000);
 
     this.camera = new THREE.PerspectiveCamera(52, 1, 1, 40000);
     this.camera.position.set(0, 2600, 2600);
 
     this.renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false });
     this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
-    this.renderer.setClearColor("#07090d", 1);
+    this.renderer.setClearColor(SURFACE, 1);
     container.appendChild(this.renderer.domElement);
 
     this.controls = new CanvasControls(this.camera, this.renderer.domElement);
@@ -470,9 +472,9 @@ export default class SceneManager {
     const radius = object.scale.x * 1.75;
     const geometry = new THREE.RingGeometry(radius * 0.9, radius, 44);
     const material = new THREE.MeshBasicMaterial({
-      color: new THREE.Color("#ffffff"),
+      color: new THREE.Color(COLORS.selection),
       transparent: true,
-      opacity: 0.9,
+      opacity: 0.95,
       side: THREE.DoubleSide,
       depthWrite: false,
       toneMapped: false,

@@ -33,7 +33,7 @@ export function buildOverviewLayer(overview, layout, { expandedProcesses = new S
     const to = positionOf(link.target.id);
     const muted = expandedProcesses.has(link.processName);
     const color = muted ? COLORS.edgeMuted : processColor(processIndex.get(link.processName) ?? 0);
-    const opacity = muted ? 0.08 : 0.42;
+    const opacity = muted ? 0.16 : 0.55;
 
     const forward = link.direction !== "in";
     const raw = edgePoints(forward ? from : to, forward ? to : from, { bow: 18 });
@@ -57,19 +57,19 @@ export function buildOverviewLayer(overview, layout, { expandedProcesses = new S
   for (const resource of overview.resources) {
     const point = positionOf(resource.id);
     const color = resourceColor(resource.kind);
-    const disc = createDisc(RESOURCE_RADIUS, color, { opacity: resource.resolved ? 0.95 : 0.35 });
+    const disc = createDisc(RESOURCE_RADIUS, color, { opacity: resource.resolved ? 1 : 0.3 });
     disc.position.set(point.x, point.y, 0.5);
     disc.userData.pick = { type: "resource", resource };
     group.add(disc);
     pickables.push(disc);
 
     if (!resource.resolved) {
-      const ring = createRing(RESOURCE_RADIUS * 1.25, "#ff5a5a", { opacity: 0.9 });
+      const ring = createRing(RESOURCE_RADIUS * 1.25, "#c2185b", { opacity: 0.95 });
       ring.position.copy(disc.position);
       group.add(ring);
     }
     if (resource.shared) {
-      const ring = createRing(RESOURCE_RADIUS * 1.55, "#ffffff", { opacity: 0.22 });
+      const ring = createRing(RESOURCE_RADIUS * 1.55, COLORS.hairline, { opacity: 0.9 });
       ring.position.copy(disc.position);
       group.add(ring);
     }
@@ -77,7 +77,7 @@ export function buildOverviewLayer(overview, layout, { expandedProcesses = new S
     const label = createLabel([`${resource.kind} ${resource.name}`], {
       worldHeight: 26,
       fontSize: 15,
-      color: resource.resolved ? "#c9d4e4" : "#ff9b9b",
+      color: resource.resolved ? COLORS.ink : "#a3134b",
       bold: false,
     });
     label.position.set(point.x, point.y - RESOURCE_RADIUS - 22, 0.6);
@@ -94,19 +94,19 @@ export function buildOverviewLayer(overview, layout, { expandedProcesses = new S
     const expanded = expandedProcesses.has(process.name);
     const color = processColor(index);
 
-    const disc = createDisc(PROCESS_RADIUS, color, { opacity: expanded ? 0.4 : 1 });
+    const disc = createDisc(PROCESS_RADIUS, color, { opacity: expanded ? 0.3 : 1 });
     disc.position.set(point.x, point.y, 0.8);
     disc.userData.pick = { type: "process", process };
     group.add(disc);
     pickables.push(disc);
 
-    const ring = createRing(PROCESS_RADIUS * 1.18, color, { opacity: expanded ? 1 : 0.35 });
+    const ring = createRing(PROCESS_RADIUS * 1.18, color, { opacity: expanded ? 1 : 0.45 });
     ring.position.copy(disc.position);
     group.add(ring);
 
     const label = createLabel(
       [process.name, `${process.functionCount} fn · ${process.interactionCount} interactions`],
-      { worldHeight: 30, fontSize: 17, color: "#f2f6fb", bold: true },
+      { worldHeight: 30, fontSize: 17, color: COLORS.ink, bold: true },
     );
     label.position.set(point.x, point.y - PROCESS_RADIUS - 40, 0.9);
     group.add(label);

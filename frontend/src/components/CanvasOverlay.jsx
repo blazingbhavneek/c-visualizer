@@ -40,7 +40,7 @@ export default function CanvasOverlay({
             <button
               type="button"
               onClick={onFrameOverview}
-              className="rounded-md border border-ink-700 bg-ink-900/85 px-3 py-1.5 text-xs font-medium text-slate-200 backdrop-blur transition hover:border-slate-500 hover:text-white"
+              className="rounded-md border border-rule bg-panel/90 px-3 py-1.5 text-xs font-medium text-ink shadow-sm backdrop-blur transition hover:border-rule-strong hover:bg-panel"
             >
               Frame overview
             </button>
@@ -48,27 +48,27 @@ export default function CanvasOverlay({
               type="button"
               onClick={onCollapseAll}
               disabled={openPlanes.length === 0}
-              className="rounded-md border border-ink-700 bg-ink-900/85 px-3 py-1.5 text-xs font-medium text-slate-200 backdrop-blur transition hover:border-slate-500 hover:text-white disabled:cursor-not-allowed disabled:opacity-35"
+              className="rounded-md border border-rule bg-panel/90 px-3 py-1.5 text-xs font-medium text-ink shadow-sm backdrop-blur transition hover:border-rule-strong hover:bg-panel disabled:cursor-not-allowed disabled:opacity-40"
             >
               Collapse all trees
             </button>
             <button
               type="button"
               onClick={onResetTilt}
-              className="rounded-md border border-ink-700 bg-ink-900/85 px-3 py-1.5 text-xs font-medium text-slate-200 backdrop-blur transition hover:border-slate-500 hover:text-white"
+              className="rounded-md border border-rule bg-panel/90 px-3 py-1.5 text-xs font-medium text-ink shadow-sm backdrop-blur transition hover:border-rule-strong hover:bg-panel"
             >
               Look straight on
             </button>
             <button
               type="button"
               onClick={() => setShowRuns((value) => !value)}
-              className="rounded-md border border-ink-700 bg-ink-900/85 px-3 py-1.5 text-xs font-medium text-slate-200 backdrop-blur transition hover:border-slate-500 hover:text-white"
+              className="rounded-md border border-rule bg-panel/90 px-3 py-1.5 text-xs font-medium text-ink shadow-sm backdrop-blur transition hover:border-rule-strong hover:bg-panel"
             >
               Runs
             </button>
           </div>
 
-          <p className="rounded-md bg-ink-900/70 px-2 py-1 text-[11px] text-slate-500 backdrop-blur">
+          <p className="rounded-md border border-rule/70 bg-panel/80 px-2 py-1 text-[11px] text-ink-faint backdrop-blur">
             drag to pan · wheel to zoom · right-drag (or shift-drag) to tilt
           </p>
 
@@ -77,13 +77,13 @@ export default function CanvasOverlay({
               {openPlanes.map((processName, position) => (
                 <span
                   key={processName}
-                  className="flex items-center gap-2 rounded-md border border-ink-700 bg-ink-900/85 py-1 pl-2.5 pr-1 text-xs backdrop-blur"
+                  className="flex items-center gap-2 rounded-md border border-rule bg-panel/90 py-1 pl-2.5 pr-1 text-xs shadow-sm backdrop-blur"
                 >
-                  <span className="text-slate-500">{position === 0 ? "plane A" : "plane B"}</span>
+                  <span className="text-ink-faint">{position === 0 ? "plane A" : "plane B"}</span>
                   <button
                     type="button"
                     onClick={() => onFocusPlane(processName)}
-                    className="font-mono text-slate-100 hover:text-white"
+                    className="font-mono text-ink hover:underline"
                   >
                     {processName}
                   </button>
@@ -91,14 +91,14 @@ export default function CanvasOverlay({
                     type="button"
                     onClick={() => onClosePlane(processName)}
                     aria-label={`Close ${processName}`}
-                    className="rounded px-1.5 text-slate-500 hover:bg-ink-700 hover:text-white"
+                    className="rounded px-1.5 text-ink-faint hover:bg-inset hover:text-ink"
                   >
                     ×
                   </button>
                 </span>
               ))}
               {openPlanes.length === 2 && (
-                <span className="rounded-md bg-ink-800/70 px-2 py-1 text-[11px] text-slate-500 backdrop-blur">
+                <span className="rounded-md bg-inset px-2 py-1 text-[11px] text-ink-faint">
                   opening a third collapses plane A
                 </span>
               )}
@@ -106,18 +106,18 @@ export default function CanvasOverlay({
           )}
 
           {showRuns && (
-            <div className="max-h-[60vh] w-80 overflow-y-auto rounded-lg border border-ink-700 bg-ink-900/95 p-3 backdrop-blur">
-              <p className="mb-2 text-[11px] leading-relaxed text-slate-500">
+            <div className="max-h-[60vh] w-80 overflow-y-auto rounded-lg border border-rule bg-panel p-3 shadow-lg">
+              <p className="mb-2 text-[11px] leading-relaxed text-ink-muted">
                 Default is the newest run that carries interaction evidence — the newest run alone is
                 empty for most processes.
               </p>
               {[...runsByProcess.entries()].map(([processName, list]) => (
                 <label key={processName} className="mb-2 block">
-                  <span className="mb-1 block font-mono text-xs text-slate-300">{processName}</span>
+                  <span className="mb-1 block font-mono text-xs text-ink-muted">{processName}</span>
                   <select
                     value={selectedRuns.get(processName) || ""}
                     onChange={(event) => onSelectRun(processName, event.target.value)}
-                    className="w-full rounded border border-ink-700 bg-ink-850 px-2 py-1 text-xs text-slate-200"
+                    className="w-full rounded border border-rule bg-sunken px-2 py-1 text-xs text-ink"
                   >
                     {list.map((run) => (
                       <option key={run.run_id} value={run.run_id}>
@@ -136,10 +136,10 @@ export default function CanvasOverlay({
 
       {status.phase !== "ready" && (
         <div className="absolute inset-0 flex items-center justify-center">
-          <div className="max-w-md rounded-lg border border-ink-700 bg-ink-900/95 px-6 py-5 text-center backdrop-blur">
+          <div className="max-w-md rounded-lg border border-rule bg-panel px-6 py-5 text-center shadow-lg">
             <p
               className={
-                status.phase === "error" ? "text-sm text-rose-300" : "text-sm text-slate-300"
+                status.phase === "error" ? "text-sm text-rose-700" : "text-sm text-ink-muted"
               }
             >
               {status.message}
@@ -149,7 +149,7 @@ export default function CanvasOverlay({
       )}
 
       {unsupported.length > 0 && (
-        <div className="absolute bottom-4 left-4 max-w-md rounded-md border border-amber-700/60 bg-amber-950/70 px-3 py-2 text-xs text-amber-200 backdrop-blur">
+        <div className="absolute bottom-4 left-4 max-w-md rounded-md border border-amber-300 bg-amber-50 px-3 py-2 text-xs text-amber-900 shadow-sm">
           Unsupported schema version, not rendered: {unsupported.join(", ")}
         </div>
       )}
@@ -158,21 +158,21 @@ export default function CanvasOverlay({
 }
 
 const LEGEND = [
-  ["#ff2d2d", "main / root"],
-  ["#f69e05", "internal function"],
-  ["#12dd6a", "daemon API port"],
-  ["#68758a", "library call"],
-  ["#4a5568", "unreached"],
-  ["#38d9ff", "function → resource"],
-  ["#ff5fa2", "plane → plane"],
+  ["#b31414", "main / root"],
+  ["#cf9010", "internal function"],
+  ["#0a6e2a", "daemon API port"],
+  ["#7b8798", "library call"],
+  ["#9aa5b4", "unreached"],
+  ["#0e7fa8", "function → resource"],
+  ["#c2185b", "plane → plane"],
 ];
 
 function Legend() {
   return (
-    <div className="pointer-events-none rounded-lg border border-ink-700 bg-ink-900/80 p-3 backdrop-blur">
+    <div className="pointer-events-none rounded-lg border border-rule bg-panel/90 p-3 shadow-sm backdrop-blur">
       <ul className="space-y-1.5">
         {LEGEND.map(([color, label]) => (
-          <li key={label} className="flex items-center gap-2 text-[11px] text-slate-400">
+          <li key={label} className="flex items-center gap-2 text-[11px] text-ink-muted">
             <span
               className="inline-block size-2.5 shrink-0 rounded-full"
               style={{ backgroundColor: color }}

@@ -180,7 +180,7 @@ export default function App() {
   }, [selection, indexes]);
 
   return (
-    <div className="flex h-full w-full bg-ink-950">
+    <div className="flex h-full w-full bg-paper">
       <div className="relative min-w-0 flex-1">
         <div ref={containerRef} className="absolute inset-0" />
 

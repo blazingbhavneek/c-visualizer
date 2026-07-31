@@ -50,7 +50,7 @@ function renderLabelTexture(lines, { fontSize, color, bold, background }) {
 export function getLabelTexture(lines, options = {}) {
   const settings = {
     fontSize: options.fontSize ?? 15,
-    color: options.color ?? "#dfe6f0",
+    color: options.color ?? "#1c2430",
     bold: options.bold ?? false,
     background: options.background ?? null,
   };

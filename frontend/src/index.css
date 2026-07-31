@@ -1,17 +1,25 @@
 @import "tailwindcss";
 
 @theme {
-  --color-ink-950: #07090d;
-  --color-ink-900: #0d1117;
-  --color-ink-850: #11161f;
-  --color-ink-800: #161c27;
-  --color-ink-700: #222b3a;
-  --color-ink-600: #35415640;
+  /* Paper surfaces, lightest to heaviest. `paper` matches the 3D canvas clear
+     colour exactly so the sidebar reads as a panel on the same sheet. */
+  --color-paper: #fcfcfb;
+  --color-panel: #ffffff;
+  --color-sunken: #f4f6f9;
+  --color-inset: #eef1f5;
+  --color-rule: #dfe4ec;
+  --color-rule-strong: #c3cad4;
 
-  --color-node-entry: #ff0000;
-  --color-node-internal: #f69e05;
-  --color-node-port: #00e05a;
-  --color-node-library: #6b7787;
+  /* Ink */
+  --color-ink: #1c2430;
+  --color-ink-muted: #5c6675;
+  --color-ink-faint: #8c95a3;
+
+  /* Scene marks, mirrored from src/scene/palette.js for the legend */
+  --color-node-entry: #b31414;
+  --color-node-internal: #cf9010;
+  --color-node-port: #0a6e2a;
+  --color-node-library: #7b8798;
 }
 
 html,
@@ -19,14 +27,13 @@ body,
 #root {
   height: 100%;
   margin: 0;
-  background: var(--color-ink-950);
-  color: #dfe6f0;
+  background: var(--color-paper);
+  color: var(--color-ink);
   font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
   overflow: hidden;
 }
 
-/* Scrollbars inside the inspector should not fight the dark canvas. */
 * {
   scrollbar-width: thin;
-  scrollbar-color: #35415a transparent;
+  scrollbar-color: var(--color-rule-strong) transparent;
 }
