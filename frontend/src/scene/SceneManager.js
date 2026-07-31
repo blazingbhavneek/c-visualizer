@@ -181,6 +181,10 @@ export default class SceneManager {
     }
     this.activeCanvas = "overview";
     this.stylingDirty = true;
+    // The bare overview is a flat 2D canvas: no rotation, and any existing tilt
+    // is dropped on the way back down.
+    this.controls.allowRotation = false;
+    this.controls.resetTilt();
     this.controls.setFrame(
       {
         origin: new THREE.Vector3(0, 0, 0),
@@ -360,6 +364,7 @@ export default class SceneManager {
     const centre = worldA.clone().add(worldB).multiplyScalar(0.5);
     centre.y = this._planeEyeHeight(a);
     this.activeCanvas = "facing";
+    this.controls.allowRotation = true;
     this.controls.setPivot(centre, [toA.clone(), toB.clone()], { distance: half });
     this.lookAtPlane(this.focusedPlane || a.processName);
 
@@ -449,6 +454,7 @@ export default class SceneManager {
       .add(plane.layer.group.position);
 
     this.activeCanvas = processName;
+    this.controls.allowRotation = true;
     this.controls.setFrame(
       {
         origin: centre,

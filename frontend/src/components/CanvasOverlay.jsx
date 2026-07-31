@@ -89,8 +89,8 @@ export default function CanvasOverlay({
           </div>
 
           <p className="rounded-md border border-rule/70 bg-panel/80 px-2 py-1 text-[11px] text-ink-faint backdrop-blur">
-            drag a node to move it · drag the background to pan · wheel to zoom ·
-            right-drag to tilt
+            drag a node to move it · drag the background to pan · wheel to zoom
+            {openPlanes.length > 0 ? " · right-drag to rotate" : ""}
           </p>
 
           <div className="w-64 rounded-lg border border-rule bg-panel/90 p-2.5 shadow-sm backdrop-blur">

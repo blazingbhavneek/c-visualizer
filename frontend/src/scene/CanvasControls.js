@@ -53,6 +53,12 @@ const TILT_CARRYOVER = 0.25;
  */
 const RETURN_ASSIST = 1.4;
 const MIN_RESISTANCE = 0.22;
+/**
+ * The viewer never goes under the ground plane. Dipping below it flips the
+ * overview on its back and mirrors everything, which reads as the whole scene
+ * inverting. Rotation is for going around and over the ground, not under it.
+ */
+const MIN_CAMERA_HEIGHT = 80;
 /** How much of the gap to a plane the viewer may cross when walking. */
 const PIVOT_ADVANCE_LIMIT = 0.78;
 
@@ -93,6 +99,12 @@ export default class CanvasControls {
     this.yaw = 0;
     this.pitch = 0;
     this.enabled = true;
+    /**
+     * Rotation is only meaningful once something has been raised off the
+     * ground. With just the overview there is nothing to look around, so the
+     * canvas stays a plain 2D pan/zoom surface.
+     */
+    this.allowRotation = false;
 
     // pivot mode
     this.pivotOrigin = new THREE.Vector3();
@@ -153,6 +165,22 @@ export default class CanvasControls {
     this.pitch *= TILT_CARRYOVER;
 
     if (snap || !this._initialised) this._snap();
+  }
+
+  /**
+   * Lowest pitch that still keeps the camera above the ground plane.
+   *
+   * For a vertical canvas the view direction's height is sin(pitch), so the
+   * camera sits at `target.y + sin(pitch) * distance`. Solving that for the
+   * minimum height gives the floor directly, and it tightens automatically as
+   * the camera moves closer in.
+   */
+  _pitchFloor() {
+    if (this.mode !== "canvas") return -HARD_PITCH;
+    const ratio = (MIN_CAMERA_HEIGHT - this.target.y) / Math.max(this.distance, 1e-6);
+    if (ratio <= -1) return -HARD_PITCH;
+    if (ratio >= 1) return HARD_PITCH;
+    return Math.max(-HARD_PITCH, Math.asin(ratio));
   }
 
   /** Distance at which a `width` x `height` region on the canvas fills the view. */
@@ -318,6 +346,13 @@ export default class CanvasControls {
 
   update() {
     if (!this._initialised) return;
+    // Zooming in raises the floor, so re-apply it every frame rather than only
+    // at the moment of the gesture.
+    if (this.mode === "canvas") {
+      this.pitch = THREE.MathUtils.clamp(this.pitch, this._pitchFloor(), HARD_PITCH);
+    } else {
+      this.pivotOrigin.y = Math.max(MIN_CAMERA_HEIGHT, this.pivotOrigin.y);
+    }
     const { position, target, up } = this._desired();
     this._smoothedPosition.lerp(position, DAMPING);
     this._smoothedTarget.lerp(target, DAMPING);
@@ -331,6 +366,12 @@ export default class CanvasControls {
     if (!this.enabled || this._pointer !== null) return;
     this._pointer = event.pointerId;
     const secondary = event.button === 2 || event.button === 1 || event.shiftKey;
+    // Nothing raised means nothing to look around: ignore the rotate gesture
+    // rather than letting it tip the flat overview.
+    if (secondary && !this.allowRotation) {
+      this._pointer = null;
+      return;
+    }
     // Same mapping in both modes: primary drag moves the viewer, secondary drag
     // rotates. Swapping these when a second plane opens is disorienting.
     this._mode = secondary
@@ -377,7 +418,7 @@ export default class CanvasControls {
         Math.sin(this.pivotHeading),
       );
       this.pivotOrigin.addScaledVector(right, -dx * perPixel);
-      this.pivotOrigin.y = Math.max(40, this.pivotOrigin.y + dy * perPixel);
+      this.pivotOrigin.y = Math.max(MIN_CAMERA_HEIGHT, this.pivotOrigin.y + dy * perPixel);
       this._clampPivotOrigin();
       return;
     }
@@ -392,9 +433,11 @@ export default class CanvasControls {
       // Optimising instead for "content follows the pointer" sends the camera
       // the other way and was wrong.
       this.yaw = resistedRotation(this.yaw, -dx * ROTATE_SPEED, YAW_SCALE);
-      this.pitch = resistedRotation(this.pitch, dy * ROTATE_SPEED, PITCH_SCALE, {
-        hardLimit: HARD_PITCH,
-      });
+      this.pitch = THREE.MathUtils.clamp(
+        resistedRotation(this.pitch, dy * ROTATE_SPEED, PITCH_SCALE, { hardLimit: HARD_PITCH }),
+        this._pitchFloor(),
+        HARD_PITCH,
+      );
       return;
     }
 
@@ -439,6 +482,7 @@ export default class CanvasControls {
       const current = this._facingDistance();
       const next = THREE.MathUtils.clamp(current * factor, this.minDistance, this.maxDistance);
       this.pivotOrigin.addScaledVector(this._pivotForward(), current - next);
+      this.pivotOrigin.y = Math.max(MIN_CAMERA_HEIGHT, this.pivotOrigin.y);
       this.pivotDistance = next;
       this._clampPivotOrigin();
       return;
