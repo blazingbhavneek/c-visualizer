@@ -168,19 +168,23 @@ export default class CanvasControls {
   }
 
   /**
-   * Lowest pitch that still keeps the camera above the ground plane.
+   * Highest pitch that still keeps the camera above the ground plane.
    *
-   * For a vertical canvas the view direction's height is sin(pitch), so the
-   * camera sits at `target.y + sin(pitch) * distance`. Solving that for the
-   * minimum height gives the floor directly, and it tightens automatically as
-   * the camera moves closer in.
+   * Positive pitch lowers the camera: it sits at
+   * `target.y - sin(pitch) * distance`. An earlier version had that sign the
+   * wrong way round and so guarded the side the camera was never going to leave
+   * from, which is why dragging down went straight under the ground and showed
+   * the overview mirrored from below.
+   *
+   * Solving for the minimum height gives the ceiling, and it tightens
+   * automatically as the camera moves closer in.
    */
-  _pitchFloor() {
-    if (this.mode !== "canvas") return -HARD_PITCH;
-    const ratio = (MIN_CAMERA_HEIGHT - this.target.y) / Math.max(this.distance, 1e-6);
-    if (ratio <= -1) return -HARD_PITCH;
+  _pitchCeiling() {
+    if (this.mode !== "canvas") return HARD_PITCH;
+    const ratio = (this.target.y - MIN_CAMERA_HEIGHT) / Math.max(this.distance, 1e-6);
     if (ratio >= 1) return HARD_PITCH;
-    return Math.max(-HARD_PITCH, Math.asin(ratio));
+    if (ratio <= -1) return -HARD_PITCH;
+    return Math.min(HARD_PITCH, Math.asin(ratio));
   }
 
   /** Distance at which a `width` x `height` region on the canvas fills the view. */
@@ -349,7 +353,7 @@ export default class CanvasControls {
     // Zooming in raises the floor, so re-apply it every frame rather than only
     // at the moment of the gesture.
     if (this.mode === "canvas") {
-      this.pitch = THREE.MathUtils.clamp(this.pitch, this._pitchFloor(), HARD_PITCH);
+      this.pitch = THREE.MathUtils.clamp(this.pitch, -HARD_PITCH, this._pitchCeiling());
     } else {
       this.pivotOrigin.y = Math.max(MIN_CAMERA_HEIGHT, this.pivotOrigin.y);
     }
@@ -433,10 +437,13 @@ export default class CanvasControls {
       // Optimising instead for "content follows the pointer" sends the camera
       // the other way and was wrong.
       this.yaw = resistedRotation(this.yaw, -dx * ROTATE_SPEED, YAW_SCALE);
+      // Same rule as yaw: rotation is judged by which face comes into view.
+      // Dragging down lifts the camera so the top of the tree is what you end
+      // up looking at, matching drag-right revealing its left side.
       this.pitch = THREE.MathUtils.clamp(
-        resistedRotation(this.pitch, dy * ROTATE_SPEED, PITCH_SCALE, { hardLimit: HARD_PITCH }),
-        this._pitchFloor(),
-        HARD_PITCH,
+        resistedRotation(this.pitch, -dy * ROTATE_SPEED, PITCH_SCALE, { hardLimit: HARD_PITCH }),
+        -HARD_PITCH,
+        this._pitchCeiling(),
       );
       return;
     }
