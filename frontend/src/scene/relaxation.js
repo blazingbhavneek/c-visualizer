@@ -26,17 +26,21 @@ const MAX_STEP = 60;
 const SETTLED = 0.02;
 
 /**
- * Stiffness of the spring holding each ring to where it sat when the drag
- * began, indexed by hops from the dragged node.
+ * How far each ring may stray from where it sat when the drag began, indexed by
+ * hops from the dragged node.
  *
- * Scaling per-frame velocity is not enough on its own: a slower node still
- * converges to the same equilibrium, it just takes more frames, so the second
- * ring was ending up 137 units away. Anchoring moves the equilibrium itself.
- * Direct neighbours are unanchored and follow properly; beyond that the anchor
- * dominates the edge springs and nodes only shift enough to stay clear.
+ * This is a hard clamp rather than a stiff spring. Stiffness was tried and is
+ * numerically unstable: with explicit integration, an anchor of k=3 overshoots
+ * every frame and the node oscillates, which is what made distant nodes flicker
+ * when an edge was stretched far. A clamp is unconditionally stable and says
+ * exactly what it means - the second ring shifts a little, the rest barely.
  */
-const ANCHOR_BY_HOP = [0, 0, 1.3];
-const ANCHOR_DISTANT = 3;
+const MAX_DRIFT_BY_HOP = [0, Infinity, 45];
+const MAX_DRIFT_DISTANT = 6;
+/** Gentle pull back toward the anchor, well inside the stability limit. */
+const ANCHOR_STIFFNESS = 0.18;
+/** Ceiling on any single edge's pull, so a stretched edge cannot explode. */
+const MAX_LINK_FORCE = 24;
 
 export function createRelaxation(registry) {
   const nodes = [];
@@ -73,7 +77,16 @@ export function createRelaxation(registry) {
     adjacency.get(link.b.id).push(link.a.id);
   }
 
-  return { registry, nodes, index, links, adjacency, energy: Infinity, pinnedId: null };
+  return {
+    registry,
+    nodes,
+    index,
+    links,
+    adjacency,
+    energy: Infinity,
+    maxPenetration: 0,
+    pinnedId: null,
+  };
 }
 
 /**
@@ -87,7 +100,7 @@ export function setPinned(simulation, pinnedId) {
   // Anchors are taken from current positions, not the original layout, so a
   // second drag starts from wherever the user left things.
   for (const entry of simulation.nodes) {
-    entry.anchor = ANCHOR_DISTANT;
+    entry.maxDrift = MAX_DRIFT_DISTANT;
     entry.anchorX = entry.x;
     entry.anchorY = entry.y;
   }
@@ -95,11 +108,11 @@ export function setPinned(simulation, pinnedId) {
 
   const seen = new Set([pinnedId]);
   let frontier = [pinnedId];
-  for (let hop = 0; hop < ANCHOR_BY_HOP.length && frontier.length > 0; hop += 1) {
+  for (let hop = 0; hop < MAX_DRIFT_BY_HOP.length && frontier.length > 0; hop += 1) {
     const next = [];
     for (const id of frontier) {
       const entry = simulation.index.get(id);
-      if (entry) entry.anchor = ANCHOR_BY_HOP[hop];
+      if (entry) entry.maxDrift = MAX_DRIFT_BY_HOP[hop];
       for (const neighbour of simulation.adjacency.get(id) || []) {
         if (seen.has(neighbour)) continue;
         seen.add(neighbour);
@@ -123,14 +136,24 @@ export function releasePin(simulation) {
   for (const entry of simulation.nodes) {
     entry.anchorX = entry.x;
     entry.anchorY = entry.y;
-    if (!entry.anchor) entry.anchor = 0.5;
+    // Everything holds roughly where it was dropped; the remaining frames only
+    // resolve overlap. Rings that were already tightly clamped keep their
+    // clamp, or the settle would hand them a second budget to drift with.
+    entry.maxDrift = Math.min(entry.maxDrift ?? MAX_DRIFT_DISTANT, 40);
   }
   simulation.pinnedId = null;
 }
 
-/** True while the graph is still moving and needs another frame. */
+/**
+ * True while the graph still needs another frame.
+ *
+ * Energy alone is not enough: the settle threshold could be reached while two
+ * marks were still overlapping, leaving the no-overlap guarantee broken. The
+ * simulation is not finished until nothing is penetrating.
+ */
 export function isSettling(simulation) {
-  return simulation && simulation.energy > SETTLED;
+  if (!simulation) return false;
+  return simulation.energy > SETTLED || simulation.maxPenetration > 1;
 }
 
 /**
@@ -151,13 +174,20 @@ export function relaxStep(simulation, pinnedId = null) {
   for (const entry of nodes) {
     entry.fx = 0;
     entry.fy = 0;
+    entry.penetration = 0;
   }
 
   for (const link of links) {
     const dx = link.b.x - link.a.x;
     const dy = link.b.y - link.a.y;
     const distance = Math.hypot(dx, dy) || 1e-6;
-    const force = (SPRING * (distance - link.rest)) / distance;
+    // Capped: a hugely stretched edge would otherwise apply a force large
+    // enough to fling its endpoints past each other and oscillate.
+    const pull = Math.max(
+      -MAX_LINK_FORCE,
+      Math.min(MAX_LINK_FORCE, SPRING * (distance - link.rest)),
+    );
+    const force = pull / distance;
     link.a.fx += dx * force;
     link.a.fy += dy * force;
     link.b.fx -= dx * force;
@@ -165,9 +195,9 @@ export function relaxStep(simulation, pinnedId = null) {
   }
 
   for (const entry of nodes) {
-    if (!entry.anchor) continue;
-    entry.fx += (entry.anchorX - entry.x) * entry.anchor;
-    entry.fy += (entry.anchorY - entry.y) * entry.anchor;
+    if (entry.maxDrift === Infinity || entry.anchorX === undefined) continue;
+    entry.fx += (entry.anchorX - entry.x) * ANCHOR_STIFFNESS;
+    entry.fy += (entry.anchorY - entry.y) * ANCHOR_STIFFNESS;
   }
 
   // Pairwise separation. Quadratic, but at a few hundred nodes that is well
@@ -183,7 +213,10 @@ export function relaxStep(simulation, pinnedId = null) {
       const distanceSquared = dx * dx + dy * dy;
       if (distanceSquared >= minimum * minimum) continue;
       const distance = Math.sqrt(distanceSquared) || 1e-6;
-      const push = (REPULSION * (minimum - distance)) / distance;
+      const overlap = minimum - distance;
+      a.penetration = Math.max(a.penetration, overlap);
+      b.penetration = Math.max(b.penetration, overlap);
+      const push = (REPULSION * overlap) / distance;
       dx *= push;
       dy *= push;
       a.fx -= dx;
@@ -203,10 +236,40 @@ export function relaxStep(simulation, pinnedId = null) {
     entry.vx = Math.max(-MAX_STEP, Math.min(MAX_STEP, entry.vx));
     entry.vy = Math.max(-MAX_STEP, Math.min(MAX_STEP, entry.vy));
 
-    energy += entry.vx * entry.vx + entry.vy * entry.vy;
     if (Math.abs(entry.vx) < 0.01 && Math.abs(entry.vy) < 0.01) continue;
+    const previousX = entry.x;
+    const previousY = entry.y;
     entry.x += entry.vx;
     entry.y += entry.vy;
+
+    // Hard clamp to the ring's allowance. Bleeding off the velocity at the
+    // boundary is what stops a node pressed against its limit from buzzing.
+    // A node may borrow exactly enough extra drift to clear a collision. Without
+    // this a tightly clamped ring cannot escape an overlap the drag created, and
+    // the no-overlap guarantee quietly breaks for distant pairs.
+    const allowance = entry.maxDrift ?? MAX_DRIFT_DISTANT;
+    const limit = Math.max(allowance, entry.penetration * 1.6);
+    if (limit !== Infinity && entry.anchorX !== undefined) {
+      const ox = entry.x - entry.anchorX;
+      const oy = entry.y - entry.anchorY;
+      const drift = Math.hypot(ox, oy);
+      if (drift > limit) {
+        const scale = limit / drift;
+        entry.x = entry.anchorX + ox * scale;
+        entry.y = entry.anchorY + oy * scale;
+        entry.vx *= 0.2;
+        entry.vy *= 0.2;
+      }
+    }
+
+    // Energy is measured from the distance actually travelled, not from
+    // velocity. A node held against its drift clamp keeps a non-zero velocity
+    // forever - anchor pulling in, edge spring pulling out - so a
+    // velocity-based measure never fell below the settle threshold and the
+    // simulation ran every frame for the rest of the session.
+    const movedX = entry.x - previousX;
+    const movedY = entry.y - previousY;
+    energy += movedX * movedX + movedY * movedY;
 
     // Move the meshes directly and collect the edges to rebuild, rather than
     // calling moveNode per node: that would refresh shared edges repeatedly.
@@ -227,6 +290,9 @@ export function relaxStep(simulation, pinnedId = null) {
   for (const edge of dirtyEdges) refreshEdge(registry, edge);
 
   simulation.energy = energy;
+  let maxPenetration = 0;
+  for (const entry of nodes) maxPenetration = Math.max(maxPenetration, entry.penetration || 0);
+  simulation.maxPenetration = maxPenetration;
   return dirtyEdges.size > 0;
 }
 

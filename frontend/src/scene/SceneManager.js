@@ -35,6 +35,13 @@ const LABEL_DISTANCE = 950;
  * a raised tree stays proportionate to the plane it grows from.
  */
 const PLANE_TARGET_WIDTH = 2400;
+/**
+ * Fraction of the remaining distance to the cursor a dragged node covers each
+ * frame. Following the pointer exactly reproduces every tremor in the hand and
+ * makes the node and its edges visibly buzz; easing toward it is what the
+ * spring-based drag in a graph editor is really doing.
+ */
+const DRAG_FOLLOW = 0.22;
 /** Floor for the gap between the two process anchors when both planes are open. */
 const MIN_FACING_SEPARATION = 2200;
 
@@ -732,6 +739,7 @@ export default class SceneManager {
       nodeId,
       dragPlane,
       offset: new THREE.Vector2(node.local.x - local.x, node.local.y - local.y),
+      target: new THREE.Vector2(node.local.x, node.local.y),
       moved: false,
       processName: node.processName,
     };
@@ -747,20 +755,10 @@ export default class SceneManager {
       const point = new THREE.Vector3();
       if (this.raycaster.ray.intersectPlane(this.drag.dragPlane, point)) {
         const local = this.drag.layer.group.worldToLocal(point.clone());
-        moveNode(
-          this.drag.layer.registry,
-          this.drag.nodeId,
-          local.x + this.drag.offset.x,
-          local.y + this.drag.offset.y,
-        );
+        // Only the target moves here; the node eases toward it in the frame
+        // loop, so the motion is smooth regardless of pointer event rate.
+        this.drag.target.set(local.x + this.drag.offset.x, local.y + this.drag.offset.y);
         this.drag.moved = true;
-        // A dragged process node carries its raised plane with it.
-        if (this.drag.processName && this.planes.has(this.drag.processName)) {
-          this.planes
-            .get(this.drag.processName)
-            .layer.group.position.copy(this._processAnchor(this.drag.processName));
-        }
-        this.needsCrossPlaneRebuild = true;
       }
       return;
     }
@@ -876,6 +874,22 @@ export default class SceneManager {
     // Elastic settling: driven while a drag is active and afterwards until the
     // graph runs out of energy, which is what makes the motion read as a graph
     // view rather than a node teleporting on its own.
+    if (this.drag) {
+      const node = this.drag.layer.registry.nodes.get(this.drag.nodeId);
+      if (node) {
+        const nextX = node.local.x + (this.drag.target.x - node.local.x) * DRAG_FOLLOW;
+        const nextY = node.local.y + (this.drag.target.y - node.local.y) * DRAG_FOLLOW;
+        moveNode(this.drag.layer.registry, this.drag.nodeId, nextX, nextY);
+        // A dragged process node carries its raised plane with it.
+        if (this.drag.processName && this.planes.has(this.drag.processName)) {
+          this.planes
+            .get(this.drag.processName)
+            .layer.group.position.copy(this._processAnchor(this.drag.processName));
+        }
+        this.needsCrossPlaneRebuild = true;
+      }
+    }
+
     if (this.simulation) {
       const pinnedId = this.drag?.layer === this.simulation.layer ? this.drag.nodeId : null;
       if (pinnedId) setPinned(this.simulation.sim, pinnedId);

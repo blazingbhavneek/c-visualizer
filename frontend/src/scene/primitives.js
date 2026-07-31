@@ -44,36 +44,87 @@ export function createRing(radius, color, { opacity = 1, renderOrder = 3 } = {})
 }
 
 /**
- * Curved edge between two local-plane points, shaped like the vertical cubic
- * bezier the existing pyvis output uses. `bow` bends sibling edges apart so
- * parallel calls between the same pair stay distinguishable.
+ * Build the curve for an edge, in local plane coordinates.
+ *
+ * `vertical` mirrors the reference artifact's `forceDirection: "vertical"`: the
+ * curve leaves the parent going straight up and arrives at the child going
+ * straight down, so it stays in the corridor between two tiers instead of
+ * cutting across the neighbours' labels.
  */
-export function edgePoints(from, to, { bow = 0, segments = 26, mode = "bowed" } = {}) {
+function edgeCurve(from, to, { bow = 0, mode = "bowed" } = {}) {
   const start = new THREE.Vector3(from.x, from.y, 0);
   const end = new THREE.Vector3(to.x, to.y, 0);
   const delta = end.clone().sub(start);
 
   if (mode === "vertical") {
-    // The reference pyvis artifact routes tree edges as a cubic bezier with
-    // `forceDirection: "vertical"`. The curve leaves the parent going straight
-    // up and arrives at the child going straight down, so it stays inside the
-    // corridor between two tiers instead of cutting diagonally across the
-    // neighbours' labels. The bow separates parallel edges between one pair.
     const reach = Math.abs(delta.y) * 0.55 || 40;
-    const control1 = new THREE.Vector3(start.x + bow * 0.4, start.y + Math.sign(delta.y || 1) * reach, 0);
-    const control2 = new THREE.Vector3(end.x + bow * 0.4, end.y - Math.sign(delta.y || 1) * reach, 0);
-    return new THREE.CubicBezierCurve3(start, control1, control2, end).getPoints(segments);
+    const sign = Math.sign(delta.y) || 1;
+    return new THREE.CubicBezierCurve3(
+      start,
+      new THREE.Vector3(start.x + bow * 0.4, start.y + sign * reach, 0),
+      new THREE.Vector3(end.x + bow * 0.4, end.y - sign * reach, 0),
+      end,
+    );
   }
 
-  // Pull the control point along the perpendicular for the bow, and bias it
-  // vertically so the curve leaves the source going "along the tree".
   const middle = start.clone().add(end).multiplyScalar(0.5);
   const perpendicular = new THREE.Vector3(-delta.y, delta.x, 0).normalize();
   middle.addScaledVector(perpendicular, bow);
-  middle.y = middle.y + delta.y * 0.08;
+  middle.y += delta.y * 0.08;
+  return new THREE.QuadraticBezierCurve3(start, middle, end);
+}
 
-  const curve = new THREE.QuadraticBezierCurve3(start, middle, end);
-  return curve.getPoints(segments);
+/**
+ * Sample an edge as a FIXED number of points, always `segments + 1`.
+ *
+ * The count must never vary. BufferGeometry.setFromPoints only overwrites
+ * min(points, capacity) vertices and never shrinks the buffer, so a refresh
+ * that produced fewer points than the last one left stale vertices behind and
+ * the line drew a segment back to wherever the node used to be - edges looked
+ * jumpy and torn while dragging.
+ *
+ * Clearing the node discs is therefore done by trimming the curve's *parameter*
+ * range rather than dropping points off the ends.
+ */
+export function edgePoints(
+  from,
+  to,
+  { bow = 0, segments = 26, mode = "bowed", startRadius = 0, endRadius = 0 } = {},
+) {
+  const curve = edgeCurve(from, to, { bow, mode });
+  const head = curve.getPoint(0);
+  const tail = curve.getPoint(1);
+
+  const PROBE = 32;
+  const scratch = new THREE.Vector3();
+  let from_t = 0;
+  let to_t = 1;
+  for (let i = 0; i <= PROBE; i += 1) {
+    const t = i / PROBE;
+    if (curve.getPoint(t, scratch).distanceTo(head) >= startRadius) {
+      from_t = t;
+      break;
+    }
+  }
+  for (let i = 0; i <= PROBE; i += 1) {
+    const t = 1 - i / PROBE;
+    if (curve.getPoint(t, scratch).distanceTo(tail) >= endRadius) {
+      to_t = t;
+      break;
+    }
+  }
+  // Endpoints overlapping (nodes dragged on top of each other) would invert the
+  // range; keep a short stub at the midpoint so the count still holds.
+  if (to_t <= from_t) {
+    from_t = 0.48;
+    to_t = 0.52;
+  }
+
+  const points = [];
+  for (let i = 0; i <= segments; i += 1) {
+    points.push(curve.getPoint(from_t + (to_t - from_t) * (i / segments)));
+  }
+  return points;
 }
 
 export function createEdgeLine(points, color, { opacity = 0.6, renderOrder = 1 } = {}) {
@@ -102,21 +153,6 @@ export function createArrowHead(points, color, { size = 13, opacity = 0.85 } = {
   mesh.renderOrder = 3;
   mesh.userData.baseOpacity = opacity;
   return mesh;
-}
-
-/** Trim a curve's endpoints so it starts and stops at the node boundary. */
-export function trimToRadius(points, startRadius, endRadius) {
-  const trimmed = [...points];
-  while (trimmed.length > 2 && trimmed[0].distanceTo(trimmed[trimmed.length - 1]) > 0) {
-    if (trimmed[0].distanceTo(points[0]) < startRadius) trimmed.shift();
-    else break;
-  }
-  while (trimmed.length > 2) {
-    const last = trimmed[trimmed.length - 1];
-    if (last.distanceTo(points[points.length - 1]) < endRadius) trimmed.pop();
-    else break;
-  }
-  return trimmed;
 }
 
 export function disposeObject(root) {

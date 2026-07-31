@@ -1,5 +1,5 @@
 import * as THREE from "three";
-import { createArrowHead, createEdgeLine, edgePoints, trimToRadius } from "./primitives.js";
+import { createArrowHead, createEdgeLine, edgePoints } from "./primitives.js";
 import { createLabel } from "./labels.js";
 
 /**
@@ -135,8 +135,12 @@ export function addEdge(
 }
 
 function edgeGeometryPoints(source, target, edge) {
-  const raw = edgePoints(source.local, target.local, { bow: edge.bow, mode: edge.curveMode });
-  return trimToRadius(raw, source.radius + 3, target.radius + 5);
+  return edgePoints(source.local, target.local, {
+    bow: edge.bow,
+    mode: edge.curveMode,
+    startRadius: source.radius + 3,
+    endRadius: target.radius + 5,
+  });
 }
 
 function positionEdgeLabel(edge, points) {
@@ -152,7 +156,12 @@ export function refreshEdge(registry, edge) {
   if (!source || !target) return;
 
   const points = edgeGeometryPoints(source, target, edge);
-  edge.line.geometry.setFromPoints(points);
+  // Written in place: the count is fixed, so this never leaves stale vertices.
+  const position = edge.line.geometry.getAttribute("position");
+  for (let i = 0; i < points.length && i < position.count; i += 1) {
+    position.setXYZ(i, points[i].x, points[i].y, points[i].z);
+  }
+  position.needsUpdate = true;
   edge.line.geometry.computeBoundingSphere();
 
   const tip = points[points.length - 1];
