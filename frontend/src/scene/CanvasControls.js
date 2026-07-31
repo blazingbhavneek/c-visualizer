@@ -39,25 +39,20 @@ const DAMPING = 0.14;
 /** Fraction of the current tilt kept when the active canvas changes. */
 const TILT_CARRYOVER = 0.25;
 /**
- * Rotation is spring-loaded, not fenced.
+ * Rotation is weighted, not fenced, and never moves on its own.
  *
- * Turning away from the resting angle gets heavier the further out you are,
- * turning back is easier than neutral, and letting go lets the view drift home.
- * The straight-on view of a plane is the one worth being in, so it takes effort
- * to leave and none to return - but it is never forbidden. The resistance is
- * floored so that continued dragging always makes progress; swinging right
- * around to the back of a tree is roughly two full-width drags.
+ * Turning away from the straight-on view gets heavier the further out you are;
+ * turning back is easier than neutral. The resistance is floored so continued
+ * dragging always makes progress - swinging right around behind a tree is
+ * roughly two full-width drags.
+ *
+ * The view does NOT drift home when released. An earlier version eased back to
+ * dead-on automatically, which meant a hard-won angle evaporated the moment the
+ * button came up. Where the user let go is where the camera stays; "Look
+ * straight on" is the way back.
  */
 const RETURN_ASSIST = 1.4;
 const MIN_RESISTANCE = 0.22;
-/** Per-frame fraction of the remaining offset given back while idle. */
-const RECENTER_CANVAS = 0.05;
-const RECENTER_PIVOT = 0.03;
-/**
- * Ceiling on the drift-home speed. Without it a view pushed right around snaps
- * back before it can be looked at; with it the return takes a few seconds.
- */
-const MAX_RECENTER_STEP = THREE.MathUtils.degToRad(0.8);
 /** How much of the gap to a plane the viewer may cross when walking. */
 const PIVOT_ADVANCE_LIMIT = 0.78;
 
@@ -73,14 +68,6 @@ function resistedRotation(current, delta, scale, { rest = 0, hardLimit = Infinit
   let next = offset + delta * factor;
   if (hardLimit !== Infinity) next = THREE.MathUtils.clamp(next, -hardLimit, hardLimit);
   return next + rest;
-}
-
-/** Ease a value toward zero, proportionally but never faster than the cap. */
-function driftToward(value, target, rate) {
-  const offset = value - target;
-  if (Math.abs(offset) < 1e-4) return target;
-  const step = Math.min(Math.abs(offset) * rate, MAX_RECENTER_STEP);
-  return value - Math.sign(offset) * step;
 }
 
 export default class CanvasControls {
@@ -297,22 +284,6 @@ export default class CanvasControls {
     return { position: target.clone().addScaledVector(direction, this.distance), target, up };
   }
 
-  /**
-   * Drift back toward the resting angle whenever the user is not rotating, so
-   * the good viewing angle is where the camera ends up on its own.
-   */
-  _recenter() {
-    if (this._mode === "tilt" || this._mode === "look") return;
-    if (this.mode === "pivot") {
-      this.pitch = driftToward(this.pitch, 0, RECENTER_PIVOT);
-      // Settle onto whichever tree is being looked at rather than between them.
-      this.pivotHeading = driftToward(this.pivotHeading, this._nearestHeading(), RECENTER_PIVOT);
-      return;
-    }
-    this.yaw = driftToward(this.yaw, 0, RECENTER_CANVAS);
-    this.pitch = driftToward(this.pitch, 0, RECENTER_CANVAS);
-  }
-
   _snap() {
     this._initialised = true;
     const { position, target, up } = this._desired();
@@ -331,7 +302,6 @@ export default class CanvasControls {
 
   update() {
     if (!this._initialised) return;
-    this._recenter();
     const { position, target, up } = this._desired();
     this._smoothedPosition.lerp(position, DAMPING);
     this._smoothedTarget.lerp(target, DAMPING);
