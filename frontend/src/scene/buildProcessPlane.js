@@ -15,10 +15,16 @@ function radiusFor(node, isEntry, isPort) {
   return NODE_RADIUS;
 }
 
+/**
+ * Node labels carry the function name and nothing else.
+ *
+ * They used to be two lines, `[file.c]` over `name[start:end]`, which at ~30
+ * characters wide against ~110 units of sibling spacing collided into an
+ * unreadable smear across every tier. The file and line range are still one
+ * click away in the inspector, where there is room for them.
+ */
 function labelLines(fn) {
-  if (fn.is_external || !fn.file_name) return [fn.name];
-  const range = fn.start_line > 0 ? `[${fn.start_line}:${fn.end_line}]` : "";
-  return [`[${fn.file_name}]`, `${fn.name}${range}`];
+  return [fn.name];
 }
 
 /**
