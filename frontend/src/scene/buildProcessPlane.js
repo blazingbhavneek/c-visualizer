@@ -1,8 +1,9 @@
 import * as THREE from "three";
-import { createArrowHead, createDisc, createEdgeLine, createRing, edgePoints, trimToRadius } from "./primitives.js";
+import { createDisc, createRing } from "./primitives.js";
 import { createLabel } from "./labels.js";
 import { COLORS, functionColor } from "./palette.js";
 import { NODE_RADIUS, PORT_RADIUS, ROOT_RADIUS } from "../graph/layout.js";
+import { EDGE_CATEGORIES, addEdge, createRegistry, localPosition, registerNode } from "./graphLayer.js";
 
 const LIBRARY_RADIUS = 8;
 const UNREACHED_RADIUS = 7;
@@ -40,6 +41,7 @@ export function buildProcessPlaneLayer({
   const group = new THREE.Group();
   group.name = `plane:${processName}`;
 
+  const registry = createRegistry();
   const pickables = [];
   const labels = [];
   const nodeAnchors = new Map();
@@ -81,15 +83,14 @@ export function buildProcessPlaneLayer({
 
   const halfWidth = sheetWidth / 2;
   const halfHeight = sheetHeight / 2;
-  const frameGeometry = new THREE.BufferGeometry().setFromPoints([
-    new THREE.Vector3(-halfWidth, -halfHeight, 0),
-    new THREE.Vector3(halfWidth, -halfHeight, 0),
-    new THREE.Vector3(halfWidth, halfHeight, 0),
-    new THREE.Vector3(-halfWidth, halfHeight, 0),
-    new THREE.Vector3(-halfWidth, -halfHeight, 0),
-  ]);
   const frame = new THREE.Line(
-    frameGeometry,
+    new THREE.BufferGeometry().setFromPoints([
+      new THREE.Vector3(-halfWidth, -halfHeight, 0),
+      new THREE.Vector3(halfWidth, -halfHeight, 0),
+      new THREE.Vector3(halfWidth, halfHeight, 0),
+      new THREE.Vector3(-halfWidth, halfHeight, 0),
+      new THREE.Vector3(-halfWidth, -halfHeight, 0),
+    ]),
     new THREE.LineBasicMaterial({
       color: new THREE.Color(processTint),
       transparent: true,
@@ -103,53 +104,6 @@ export function buildProcessPlaneLayer({
   frame.userData.baseOpacity = 0.55;
   group.add(frame);
 
-  // --- tree edges ----------------------------------------------------------
-  const bowCounters = new Map();
-  for (const node of treeNodes) {
-    if (!node.parent) continue;
-    const from = treeLayout.positions.get(node.parent.uid);
-    const to = treeLayout.positions.get(node.uid);
-    if (!from || !to) continue;
-
-    const pairKey = `${node.parent.uid}->${node.fn.id}`;
-    const seen = bowCounters.get(pairKey) || 0;
-    bowCounters.set(pairKey, seen + 1);
-    const bow = seen === 0 ? 0 : (seen % 2 === 1 ? 1 : -1) * Math.ceil(seen / 2) * 26;
-
-    const isPort = portNames.has(node.fn.name);
-    const targetRadius = radiusFor(node, false, isPort);
-    const sourceRadius = radiusFor(node.parent, node.parent.fn.id === entryFunctionId, false);
-
-    const raw = edgePoints(from, to, { bow });
-    const points = trimToRadius(raw, sourceRadius + 3, targetRadius + 5);
-    const color = node.recursive ? COLORS.recursive : COLORS.edge;
-    const line = createEdgeLine(points, color, { opacity: node.recursive ? 0.8 : 0.7 });
-    group.add(line);
-    group.add(createArrowHead(points, color, { size: 11, opacity: 0.9 }));
-
-    // One edge can stand for several call sites; show every line number so the
-    // merge stays visible rather than looking like a single call.
-    const lineNumbers = (node.viaCalls || [])
-      .map((call) => call.line)
-      .filter((value) => value != null);
-    if (lineNumbers.length > 0) {
-      const shown =
-        lineNumbers.length > 3
-          ? `${lineNumbers.slice(0, 3).join(", ")} +${lineNumbers.length - 3}`
-          : lineNumbers.join(", ");
-      const midpoint = points[Math.floor(points.length / 2)];
-      const edgeLabel = createLabel([shown], {
-        worldHeight: 17,
-        fontSize: 12,
-        color: COLORS.inkMuted,
-      });
-      edgeLabel.position.set(midpoint.x, midpoint.y, 0.2);
-      edgeLabel.userData.detailLabel = true;
-      group.add(edgeLabel);
-      labels.push(edgeLabel);
-    }
-  }
-
   // --- tree nodes ----------------------------------------------------------
   for (const node of treeNodes) {
     const point = treeLayout.positions.get(node.uid);
@@ -159,22 +113,27 @@ export function buildProcessPlaneLayer({
     const isPort = portNames.has(node.fn.name);
     const radius = radiusFor(node, isEntry, isPort);
     const color = functionColor(node.fn, { isEntry, isPort, recursive: node.recursive });
+    const parts = [];
 
     const disc = createDisc(radius, color, { opacity: node.fn.is_external && !isPort ? 0.6 : 1 });
     disc.position.set(point.x, point.y, 0.5);
     disc.userData.pick = { type: "function", node, processName };
+    disc.userData.nodeId = node.uid;
     group.add(disc);
     pickables.push(disc);
+    parts.push(disc);
 
     if (node.fn.is_static) {
       const ring = createRing(radius * 1.3, COLORS.hairline, { opacity: 0.95 });
       ring.position.copy(disc.position);
       group.add(ring);
+      parts.push(ring);
     }
     if (node.recursive) {
       const ring = createRing(radius * 1.5, COLORS.recursive, { opacity: 0.8 });
       ring.position.copy(disc.position);
       group.add(ring);
+      parts.push(ring);
     }
 
     const lines = labelLines(node.fn);
@@ -192,8 +151,53 @@ export function buildProcessPlaneLayer({
     label.userData.detailLabel = !isEntry && !isPort;
     group.add(label);
     labels.push(label);
+    parts.push(label);
 
+    registerNode(registry, node.uid, {
+      kind: "function",
+      mesh: disc,
+      parts,
+      local: localPosition(point.x, point.y),
+      radius,
+      data: node,
+      isPort,
+    });
     nodeAnchors.set(node.uid, new THREE.Vector3(point.x, point.y, 0));
+  }
+
+  // --- tree edges ----------------------------------------------------------
+  const bowCounters = new Map();
+  for (const node of treeNodes) {
+    if (!node.parent) continue;
+    if (!registry.nodes.has(node.uid) || !registry.nodes.has(node.parent.uid)) continue;
+
+    const pairKey = `${node.parent.uid}->${node.fn.id}`;
+    const seen = bowCounters.get(pairKey) || 0;
+    bowCounters.set(pairKey, seen + 1);
+    // Alternating CW/CCW fan, as the reference artifact does for parallel calls.
+    const bow = seen === 0 ? 0 : (seen % 2 === 1 ? 1 : -1) * Math.ceil(seen / 2) * 26;
+
+    const lineNumbers = (node.viaCalls || [])
+      .map((call) => call.line)
+      .filter((value) => value != null);
+    const shown =
+      lineNumbers.length > 3
+        ? `${lineNumbers.slice(0, 3).join(", ")} +${lineNumbers.length - 3}`
+        : lineNumbers.join(", ");
+
+    addEdge(registry, group, {
+      id: `edge:${node.parent.uid}->${node.uid}`,
+      sourceId: node.parent.uid,
+      targetId: node.uid,
+      category: EDGE_CATEGORIES.CALL,
+      color: node.recursive ? COLORS.recursive : COLORS.edge,
+      opacity: node.recursive ? 0.8 : 0.7,
+      arrowSize: 11,
+      arrowOpacity: 0.9,
+      bow,
+      labelLines: lineNumbers.length > 0 ? [shown] : null,
+      labelOptions: { worldHeight: 17, fontSize: 12, color: COLORS.inkMuted },
+    });
   }
 
   // --- unreached shelf -----------------------------------------------------
@@ -215,10 +219,11 @@ export function buildProcessPlaneLayer({
       opacity: placement.isolated ? 0.55 : 0.95,
     });
     disc.position.set(placement.x, placement.y, 0.5);
+    const uid = `unreached:${placement.fn.id}`;
     disc.userData.pick = {
       type: "function",
       node: {
-        uid: `unreached:${placement.fn.id}`,
+        uid,
         fn: placement.fn,
         children: [],
         unreached: true,
@@ -226,8 +231,18 @@ export function buildProcessPlaneLayer({
       },
       processName,
     };
+    disc.userData.nodeId = uid;
     group.add(disc);
     pickables.push(disc);
+
+    registerNode(registry, uid, {
+      kind: "unreached",
+      mesh: disc,
+      parts: [disc],
+      local: localPosition(placement.x, placement.y),
+      radius: UNREACHED_RADIUS,
+      data: placement.fn,
+    });
   }
 
   if (shelf.placements.length > 0) {
@@ -247,5 +262,5 @@ export function buildProcessPlaneLayer({
     labels.push(caption);
   }
 
-  return { group, pickables, nodeAnchors, labels, bounds };
+  return { group, pickables, registry, nodeAnchors, labels, bounds };
 }

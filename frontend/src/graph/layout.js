@@ -7,14 +7,7 @@
  */
 
 import { hierarchy, tree as d3tree } from "d3-hierarchy";
-import {
-  forceCollide,
-  forceLink,
-  forceManyBody,
-  forceSimulation,
-  forceX,
-  forceY,
-} from "d3-force";
+import { forceCollide, forceSimulation } from "d3-force";
 
 export const NODE_RADIUS = 11;
 export const PORT_RADIUS = 13;
@@ -118,15 +111,26 @@ export function layoutUnreachedShelf(groups, treeBounds) {
 }
 
 /**
- * Bipartite process/resource overview. Force-directed for the organic pyvis
- * feel, then frozen: this plane is the app's fixed frame of reference, so it
- * must not drift while the user is navigating.
+ * Affinity layout for the process/daemon overview.
+ *
+ * A plain force layout put resources wherever the physics settled, so the plane
+ * read as a hairball. Two rows would be no better: with 24 of 36 resources
+ * shared, a bipartite split just routes every edge across the gap.
+ *
+ * Instead, position carries meaning. Processes sit evenly on a ring. Each
+ * resource is placed at the *angular centroid of the processes that touch it*,
+ * so a resource physically sits between its users; its radius falls as more
+ * processes share it, which pushes exclusive resources outboard next to their
+ * single owner and pulls widely shared ones toward the middle. Edges then run
+ * mostly radially and stay short.
+ *
+ * Only collision relaxation runs afterwards, so the structural placement
+ * survives and the result is deterministic across reloads.
  */
 export function layoutOverview(overview, { radius = 1500 } = {}) {
-  const nodes = [
-    ...overview.processes.map((node) => ({ ...node })),
-    ...overview.resources.map((node) => ({ ...node })),
-  ];
+  const processes = overview.processes.map((node) => ({ ...node }));
+  const resources = overview.resources.map((node) => ({ ...node }));
+  const nodes = [...processes, ...resources];
   const byId = new Map(nodes.map((node) => [node.id, node]));
 
   const links = [];
@@ -137,35 +141,72 @@ export function layoutOverview(overview, { radius = 1500 } = {}) {
     links.push({ ...edge, source, target });
   }
 
-  // Deterministic ring seeding: identical input must produce an identical
-  // layout across reloads, so no Math.random anywhere in this file.
-  nodes.forEach((node, position) => {
-    const angle = (position / nodes.length) * Math.PI * 2;
-    const ring = node.type === "process" ? radius * 0.34 : radius * 0.86;
-    node.x = Math.cos(angle) * ring;
-    node.y = Math.sin(angle) * ring;
+  // --- processes evenly on the inner ring, in a stable order ---------------
+  const ordered = [...processes].sort((a, b) => a.name.localeCompare(b.name));
+  const processRadius = radius * 0.46;
+  const angleOf = new Map();
+  ordered.forEach((process, position) => {
+    const angle = (position / ordered.length) * Math.PI * 2 - Math.PI / 2;
+    angleOf.set(process.name, angle);
+    process.x = Math.cos(angle) * processRadius;
+    process.y = Math.sin(angle) * processRadius;
   });
 
+  // --- resources at the angular centroid of their users --------------------
+  for (const resource of resources) {
+    const users = [...resource.processes].filter((name) => angleOf.has(name));
+    if (users.length === 0) {
+      resource.x = 0;
+      resource.y = 0;
+      continue;
+    }
+
+    // Average the direction vectors rather than the angles, so the wrap at
+    // +/-pi does not throw the mean to the opposite side of the ring.
+    let sumX = 0;
+    let sumY = 0;
+    for (const name of users) {
+      const angle = angleOf.get(name);
+      sumX += Math.cos(angle);
+      sumY += Math.sin(angle);
+    }
+    const spread = Math.hypot(sumX, sumY) / users.length; // 1 = agreed, 0 = opposed
+    const meanAngle = Math.atan2(sumY, sumX);
+
+    // Exclusive resources sit outboard of their owner; the more processes share
+    // a resource, and the more they disagree on direction, the further in it
+    // sits, until a resource used by everyone lands near the centre.
+    const shareFactor = 1 / users.length;
+    const resourceRadius =
+      processRadius * (0.42 + 0.78 * shareFactor) * (0.35 + 0.65 * spread) +
+      processRadius * 0.55 * shareFactor;
+
+    resource.x = Math.cos(meanAngle) * resourceRadius;
+    resource.y = Math.sin(meanAngle) * resourceRadius;
+  }
+
+  // --- collision-only relaxation ------------------------------------------
+  // Nudges overlapping marks apart without letting physics redesign the layout.
   const simulation = forceSimulation(nodes)
     .force(
-      "link",
-      forceLink(links)
-        .id((node) => node.id)
-        .distance((link) => (link.target.shared ? 320 : 220))
-        .strength(0.45),
-    )
-    .force("charge", forceManyBody().strength(-2400))
-    .force(
       "collide",
-      forceCollide().radius((node) => (node.type === "process" ? 130 : 74)),
+      forceCollide()
+        .radius((node) => (node.type === "process" ? 150 : 96))
+        .strength(0.9),
     )
-    .force("x", forceX(0).strength(0.035))
-    .force("y", forceY(0).strength(0.035))
+    .alphaDecay(0.06)
     .stop();
+  for (let tick = 0; tick < 160; tick += 1) simulation.tick();
 
-  for (let tick = 0; tick < 420; tick += 1) simulation.tick();
+  // Processes are the frame of reference; pin them back to the ring in case
+  // collision drift moved them.
+  for (const process of ordered) {
+    const angle = angleOf.get(process.name);
+    process.x = Math.cos(angle) * processRadius;
+    process.y = Math.sin(angle) * processRadius;
+  }
 
   const positions = new Map();
   for (const node of nodes) positions.set(node.id, { x: node.x, y: node.y });
-  return { positions, links };
+  return { positions, links, processAngles: angleOf, processRadius };
 }

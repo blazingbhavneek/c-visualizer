@@ -5,6 +5,13 @@ import { buildProcessPlaneLayer } from "./buildProcessPlane.js";
 import { disposeObject } from "./primitives.js";
 import { COLORS, SURFACE, processColor } from "./palette.js";
 import { directPlanePairs } from "../graph/model.js";
+import {
+  EDGE_CATEGORIES,
+  moveNode,
+  setEdgeOpacity,
+  setNodeOpacity,
+  setPartOpacity,
+} from "./graphLayer.js";
 
 const UP = new THREE.Vector3(0, 1, 0);
 const MAX_OPEN_PLANES = 2;
@@ -14,13 +21,20 @@ const MAX_OPEN_PLANES = 2;
  * the camera moves in.
  */
 const LABEL_DISTANCE = 950;
-const FOREGROUND_OPACITY = 0.3;
 /**
  * Call trees are laid out at their natural size (2000-3900 units wide), which
  * is as large as the entire ground overview. Planes are scaled to this width so
  * a raised tree stays proportionate to the plane it grows from.
  */
 const PLANE_TARGET_WIDTH = 2400;
+/** Floor for the gap between the two process anchors when both planes are open. */
+const MIN_FACING_SEPARATION = 2200;
+
+/** While a process plane is active the ground recedes; edges more than nodes. */
+const GROUND_NODE_FADE = 0.38;
+const GROUND_EDGE_FADE = 0.1;
+/** Everything not connected to the hovered node. */
+const HOVER_DIM = 0.12;
 
 /**
  * Flat drawings arranged in 3D.
@@ -39,8 +53,6 @@ export default class SceneManager {
 
     this.scene = new THREE.Scene();
     this.scene.background = new THREE.Color(SURFACE);
-    // Fog on a white surface fades distant planes toward the paper rather than
-    // into darkness, which is what keeps the inactive canvas recessive.
     this.scene.fog = new THREE.Fog(SURFACE, 4200, 13000);
 
     this.camera = new THREE.PerspectiveCamera(52, 1, 1, 40000);
@@ -64,12 +76,29 @@ export default class SceneManager {
     this.planes = new Map(); // processName -> plane record, insertion order = FIFO
     this.crossPlaneGroup = new THREE.Group();
     this.scene.add(this.crossPlaneGroup);
+    this.crossPlaneEdges = [];
+
+    /**
+     * In process view the tree is the subject, so daemon links start hidden and
+     * the user opts in to seeing which function touches which resource.
+     */
+    this.edgeVisibility = {
+      [EDGE_CATEGORIES.CALL]: true,
+      [EDGE_CATEGORIES.INTERACTION]: false,
+      [EDGE_CATEGORIES.GROUND]: true,
+      [EDGE_CATEGORIES.PLANE_TO_PLANE]: true,
+    };
+    this.hoverHighlightEnabled = true;
 
     this.selected = null;
-    this.hovered = null;
+    this.hoveredNode = null;
+    this.hoveredKey = null;
     this.focusedPlane = null;
+    this.activeCanvas = "overview";
+    this.drag = null;
     this.lastCameraPosition = new THREE.Vector3(Infinity, Infinity, Infinity);
     this.needsCrossPlaneRebuild = false;
+    this.stylingDirty = true;
     this.disposed = false;
 
     this._onResize = this._handleResize.bind(this);
@@ -79,9 +108,11 @@ export default class SceneManager {
 
     window.addEventListener("resize", this._onResize);
     const element = this.renderer.domElement;
+    // Capture phase so a node drag can claim the pointer before the camera
+    // controls interpret the same gesture as a pan.
+    element.addEventListener("pointerdown", this._onPointerDown, true);
     element.addEventListener("pointermove", this._onPointerMove);
-    element.addEventListener("pointerdown", this._onPointerDown);
-    element.addEventListener("pointerup", this._onPointerUp);
+    element.addEventListener("pointerup", this._onPointerUp, true);
 
     this._handleResize();
     this._animate();
@@ -94,10 +125,6 @@ export default class SceneManager {
   // ---------------------------------------------------------------- overview
 
   setOverview(overview, overviewLayout) {
-    if (this.overviewLayer) {
-      this.scene.remove(this.overviewLayer.group);
-      disposeObject(this.overviewLayer.group);
-    }
     this.overview = overview;
     this.overviewLayout = overviewLayout;
     this._rebuildOverview();
@@ -106,15 +133,25 @@ export default class SceneManager {
 
   _rebuildOverview() {
     if (!this.overview) return;
+    // Preserve any positions the user, or the facing arrangement, has moved.
+    const kept = new Map();
     if (this.overviewLayer) {
+      for (const [id, node] of this.overviewLayer.registry.nodes) kept.set(id, node.local.clone());
       this.scene.remove(this.overviewLayer.group);
       disposeObject(this.overviewLayer.group);
     }
+
     this.overviewLayer = buildOverviewLayer(this.overview, this.overviewLayout, {
       expandedProcesses: new Set(this.planes.keys()),
     });
+    for (const [id, local] of kept) {
+      if (this.overviewLayer.registry.nodes.has(id)) {
+        moveNode(this.overviewLayer.registry, id, local.x, local.y);
+      }
+    }
     this.scene.add(this.overviewLayer.group);
     this.overviewLayer.group.updateMatrixWorld(true);
+    this.stylingDirty = true;
   }
 
   /**
@@ -122,12 +159,13 @@ export default class SceneManager {
    * overview, panned and zoomed like any flat graph canvas.
    */
   frameOverview({ snap = false } = {}) {
-    if (!this.overviewLayout) return;
+    if (!this.overviewLayer) return;
     let radius = 600;
-    for (const point of this.overviewLayout.positions.values()) {
-      radius = Math.max(radius, Math.hypot(point.x, point.y));
+    for (const node of this.overviewLayer.registry.nodes.values()) {
+      radius = Math.max(radius, Math.hypot(node.local.x, node.local.y));
     }
     this.activeCanvas = "overview";
+    this.stylingDirty = true;
     this.controls.setFrame(
       {
         origin: new THREE.Vector3(0, 0, 0),
@@ -137,29 +175,27 @@ export default class SceneManager {
         up: new THREE.Vector3(0, 0, -1),
         normal: new THREE.Vector3(0, 1, 0),
       },
-      { distance: this.controls.distanceToFit(radius * 2, radius * 2), snap },
+      { distance: this.controls.distanceToFit(radius * 2.2, radius * 2.2), snap },
     );
   }
 
   // ------------------------------------------------------------------ planes
 
-  /** Ground-plane world position of a process node. */
+  _overviewNodeWorld(id) {
+    const node = this.overviewLayer?.registry.nodes.get(id);
+    if (!node) return null;
+    return node.local.clone().applyMatrix4(this.overviewLayer.group.matrixWorld);
+  }
+
   _processAnchor(processName) {
-    if (!this.overviewLayer) return new THREE.Vector3();
-    const local = this.overviewLayer.anchors.get(`process:${processName}`);
-    if (!local) return new THREE.Vector3();
-    return local.clone().applyMatrix4(this.overviewLayer.group.matrixWorld);
+    return this._overviewNodeWorld(`process:${processName}`) || new THREE.Vector3();
   }
 
   /**
-   * Orientation for a plane about to be raised, taken from how the user is
-   * currently looking rather than from an orbit angle.
-   *
-   * "Screen-down, flattened onto the ground" is the direction the plane should
-   * face. From the opening top-down canvas that is the bottom edge of the
-   * screen, so a raised tree comes up toward the viewer and reads left-to-right
-   * exactly as the overview under it did. From a tilted view it still resolves
-   * to the horizontal direction pointing back at the viewer.
+   * Orientation for a single raised plane, taken from how the user is currently
+   * looking rather than from an orbit angle. "Screen-down, flattened onto the
+   * ground" means a raised tree comes up toward the viewer and reads
+   * left-to-right exactly as the overview under it did.
    */
   _viewOrientation() {
     const normal = this.camera.up.clone().negate();
@@ -171,32 +207,29 @@ export default class SceneManager {
     }
     if (normal.lengthSq() < 1e-6) normal.set(0, 0, 1);
     normal.normalize();
-    const right = new THREE.Vector3().crossVectors(UP, normal).normalize();
-    return { right, normal };
+    return { right: new THREE.Vector3().crossVectors(UP, normal).normalize(), normal };
   }
 
   static _quaternionFor({ right, normal }) {
-    const matrix = new THREE.Matrix4().makeBasis(right, UP, normal);
-    return new THREE.Quaternion().setFromRotationMatrix(matrix);
+    return new THREE.Quaternion().setFromRotationMatrix(
+      new THREE.Matrix4().makeBasis(right, UP, normal),
+    );
   }
 
   openProcess(prepared, processIndexById) {
     if (!prepared) return;
     const { processName } = prepared;
     if (this.planes.has(processName)) {
-      this.focusedPlane = processName;
+      this.focusPlane(processName);
       return;
     }
 
     // FIFO: opening a third collapses the oldest.
     while (this.planes.size >= MAX_OPEN_PLANES) {
-      const oldest = this.planes.keys().next().value;
-      this._removePlane(oldest);
+      this._removePlane(this.planes.keys().next().value);
     }
 
-    const anchor = this._processAnchor(processName);
     const tint = processColor(processIndexById.get(processName) ?? 0);
-
     const layer = buildProcessPlaneLayer({
       treeNodes: prepared.treeNodes,
       treeLayout: prepared.treeLayout,
@@ -208,50 +241,141 @@ export default class SceneManager {
       processName,
     });
 
-    layer.group.position.copy(anchor);
-    const orientation = this._viewOrientation();
-    layer.group.quaternion.copy(SceneManager._quaternionFor(orientation));
-
     const width = Math.max(1, layer.bounds.maxX - layer.bounds.minX);
     layer.group.scale.setScalar(Math.min(1, PLANE_TARGET_WIDTH / width));
+    layer.group.position.copy(this._processAnchor(processName));
+    layer.group.quaternion.copy(SceneManager._quaternionFor(this._viewOrientation()));
 
     this.scene.add(layer.group);
     this.planes.set(processName, {
       processName,
       prepared,
       layer,
-      anchor,
       tint,
       targetQuaternion: layer.group.quaternion.clone(),
       animating: false,
     });
 
     this.focusedPlane = processName;
-    this._realignPlanes();
     this._rebuildOverview();
-    this.needsCrossPlaneRebuild = true;
+    this._arrangePlanes();
     this.onPlanesChanged([...this.planes.keys()]);
-    // Expanding is a navigation act: move to face what was just raised.
-    this.focusPlane(processName);
   }
 
   /**
-   * With two planes open they must end up parallel and facing, so both animate
-   * to one orientation derived from where the camera is now.
+   * With one plane open it simply faces the viewer.
+   *
+   * With two, they become facing walls: the two process nodes are pushed apart
+   * on the ground, each plane's normal points at the other, and the camera
+   * stands between them. The user turns their head to read either tree, instead
+   * of two parallel planes competing for the same pixels.
    */
-  _realignPlanes() {
-    if (this.planes.size < 2) {
-      for (const plane of this.planes.values()) {
-        plane.targetQuaternion = SceneManager._quaternionFor(this._viewOrientation());
-        plane.animating = true;
-      }
+  _arrangePlanes() {
+    const open = [...this.planes.values()];
+
+    if (open.length === 0) {
+      this.frameOverview();
       return;
     }
-    const shared = SceneManager._quaternionFor(this._viewOrientation());
-    for (const plane of this.planes.values()) {
-      plane.targetQuaternion = shared.clone();
+
+    if (open.length === 1) {
+      const plane = open[0];
+      plane.targetQuaternion = SceneManager._quaternionFor(this._viewOrientation());
       plane.animating = true;
+      plane.layer.group.position.copy(this._processAnchor(plane.processName));
+      this.needsCrossPlaneRebuild = true;
+      this.focusPlane(plane.processName);
+      return;
     }
+
+    const [a, b] = open;
+    const registry = this.overviewLayer.registry;
+    const nodeA = registry.nodes.get(`process:${a.processName}`);
+    const nodeB = registry.nodes.get(`process:${b.processName}`);
+    if (!nodeA || !nodeB) return;
+
+    // Push the two anchors apart along the line already between them, keeping
+    // their midpoint, so the rest of the ground layout stays recognisable.
+    const midX = (nodeA.local.x + nodeB.local.x) / 2;
+    const midY = (nodeA.local.y + nodeB.local.y) / 2;
+    let axisX = nodeB.local.x - nodeA.local.x;
+    let axisY = nodeB.local.y - nodeA.local.y;
+    const axisLength = Math.hypot(axisX, axisY);
+    if (axisLength < 1e-3) {
+      axisX = 1;
+      axisY = 0;
+    } else {
+      axisX /= axisLength;
+      axisY /= axisLength;
+    }
+    // The camera stands at the midpoint, so half the gap is its viewing distance
+    // to each plane. Derive it from what it takes to frame the wider tree,
+    // otherwise the trees are cropped the moment they face each other.
+    const separation = Math.max(
+      MIN_FACING_SEPARATION,
+      2 * Math.max(this._planeFitDistance(a), this._planeFitDistance(b)),
+    );
+    const half = separation / 2;
+    moveNode(registry, nodeA.id, midX - axisX * half, midY - axisY * half);
+    moveNode(registry, nodeB.id, midX + axisX * half, midY + axisY * half);
+
+    const worldA = this._overviewNodeWorld(nodeA.id);
+    const worldB = this._overviewNodeWorld(nodeB.id);
+    a.layer.group.position.copy(worldA);
+    b.layer.group.position.copy(worldB);
+
+    // Each normal points at the other plane, so both fronts face the gap.
+    const toB = worldB.clone().sub(worldA);
+    toB.y = 0;
+    toB.normalize();
+    const toA = toB.clone().negate();
+
+    a.targetQuaternion = SceneManager._quaternionFor({
+      right: new THREE.Vector3().crossVectors(UP, toB).normalize(),
+      normal: toB,
+    });
+    b.targetQuaternion = SceneManager._quaternionFor({
+      right: new THREE.Vector3().crossVectors(UP, toA).normalize(),
+      normal: toA,
+    });
+    a.animating = true;
+    b.animating = true;
+
+    // Stand between them at roughly tree height, looking at the focused one.
+    const centre = worldA.clone().add(worldB).multiplyScalar(0.5);
+    centre.y = this._planeEyeHeight(a);
+    this.activeCanvas = "facing";
+    this.controls.setPivot(centre, [toA.clone(), toB.clone()]);
+    this.lookAtPlane(this.focusedPlane || a.processName);
+
+    this.stylingDirty = true;
+    this.needsCrossPlaneRebuild = true;
+  }
+
+  /** Distance at which this plane's tree fills the view. */
+  _planeFitDistance(plane) {
+    const bounds = plane.prepared.treeLayout.bounds;
+    const scale = plane.layer.group.scale.x;
+    return this.controls.distanceToFit(
+      (bounds.maxX - bounds.minX) * scale,
+      (bounds.maxY - bounds.minY) * scale,
+    );
+  }
+
+  _planeEyeHeight(plane) {
+    const bounds = plane.prepared.treeLayout.bounds;
+    return Math.max(120, ((bounds.minY + bounds.maxY) / 2) * plane.layer.group.scale.y);
+  }
+
+  /** Swing the head toward one of the two facing planes. */
+  lookAtPlane(processName) {
+    const plane = this.planes.get(processName);
+    if (!plane || this.controls.mode !== "pivot") return;
+    this.focusedPlane = processName;
+    this.stylingDirty = true;
+    const direction = plane.layer.group.position.clone().sub(this.controls.pivotOrigin);
+    direction.y = 0;
+    if (direction.lengthSq() > 1e-6) this.controls.lookAlong(direction.normalize());
   }
 
   _removePlane(processName) {
@@ -260,26 +384,18 @@ export default class SceneManager {
     this.scene.remove(plane.layer.group);
     disposeObject(plane.layer.group);
     this.planes.delete(processName);
-    this.fadeDirty = true;
+    this.stylingDirty = true;
     if (this.focusedPlane === processName) {
       this.focusedPlane = this.planes.size ? [...this.planes.keys()].pop() : null;
     }
   }
 
   closeProcess(processName) {
-    const wasActive = this.activeCanvas === processName;
     this._removePlane(processName);
-    this._realignPlanes();
     this._rebuildOverview();
     this.needsCrossPlaneRebuild = true;
     this.onPlanesChanged([...this.planes.keys()]);
-    // The active canvas cannot be a plane that no longer exists: fall back to
-    // the remaining plane, or all the way down to the ground.
-    if (wasActive) {
-      const remaining = [...this.planes.keys()].pop();
-      if (remaining) this.focusPlane(remaining);
-      else this.frameOverview();
-    }
+    this._arrangePlanes();
   }
 
   collapseAll() {
@@ -295,7 +411,12 @@ export default class SceneManager {
     const plane = this.planes.get(processName);
     if (!plane) return;
     this.focusedPlane = processName;
-    this.fadeDirty = true;
+    this.stylingDirty = true;
+
+    if (this.controls.mode === "pivot" && this.planes.size === 2) {
+      this.lookAtPlane(processName);
+      return;
+    }
 
     // Frame the tree, not the unreached shelf: the shelf can be wider than the
     // tree and framing both would push the tree off to one side and far away.
@@ -303,7 +424,7 @@ export default class SceneManager {
     const scale = plane.layer.group.scale.x;
     const quaternion = plane.targetQuaternion || plane.layer.group.quaternion;
 
-    const center = new THREE.Vector3(
+    const centre = new THREE.Vector3(
       (bounds.minX + bounds.maxX) / 2,
       (bounds.minY + bounds.maxY) / 2,
       0,
@@ -312,21 +433,20 @@ export default class SceneManager {
       .applyQuaternion(quaternion)
       .add(plane.layer.group.position);
 
-    const width = (bounds.maxX - bounds.minX) * scale;
-    const height = (bounds.maxY - bounds.minY) * scale;
-
-    // Hand the plane to the controls as the new canvas. Its basis is the
-    // plane's own axes, so panning now slides along the tree and the wheel
-    // dollies straight into it.
     this.activeCanvas = processName;
     this.controls.setFrame(
       {
-        origin: center,
+        origin: centre,
         right: new THREE.Vector3(1, 0, 0).applyQuaternion(quaternion),
         up: new THREE.Vector3(0, 1, 0).applyQuaternion(quaternion),
         normal: new THREE.Vector3(0, 0, 1).applyQuaternion(quaternion),
       },
-      { distance: this.controls.distanceToFit(width, height) },
+      {
+        distance: this.controls.distanceToFit(
+          (bounds.maxX - bounds.minX) * scale,
+          (bounds.maxY - bounds.minY) * scale,
+        ),
+      },
     );
   }
 
@@ -336,124 +456,325 @@ export default class SceneManager {
     const nodes = attachment.portNodes.length ? attachment.portNodes : attachment.callerNodes;
     const positions = [];
     for (const node of nodes) {
-      const local = plane.layer.nodeAnchors.get(node.uid);
-      if (!local) continue;
-      positions.push(local.clone().applyMatrix4(plane.layer.group.matrixWorld));
+      const entry = plane.layer.registry.nodes.get(node.uid);
+      if (!entry) continue;
+      positions.push(entry.local.clone().applyMatrix4(plane.layer.group.matrixWorld));
     }
     return positions;
-  }
-
-  _resourceWorldPosition(resourceKey) {
-    if (!this.overviewLayer) return null;
-    const local = this.overviewLayer.anchors.get(`resource:${resourceKey}`);
-    if (!local) return null;
-    return local.clone().applyMatrix4(this.overviewLayer.group.matrixWorld);
   }
 
   _rebuildCrossPlaneEdges() {
     disposeObject(this.crossPlaneGroup);
     this.crossPlaneGroup.clear();
+    this.crossPlaneEdges = [];
     if (this.planes.size === 0) return;
 
-    for (const plane of this.planes.values()) {
-      plane.layer.group.updateMatrixWorld(true);
-    }
-    if (this.overviewLayer) this.overviewLayer.group.updateMatrixWorld(true);
+    for (const plane of this.planes.values()) plane.layer.group.updateMatrixWorld(true);
+    this.overviewLayer?.group.updateMatrixWorld(true);
 
     // Function/port -> daemon resource on the ground plane.
-    for (const plane of this.planes.values()) {
-      for (const attachment of plane.prepared.attachments) {
-        const target = this._resourceWorldPosition(attachment.resourceKey);
-        if (!target) continue;
-        for (const origin of this._portWorldPositions(plane, attachment)) {
-          const forward = attachment.direction !== "in";
-          this.crossPlaneGroup.add(
-            this._curve(forward ? origin : target, forward ? target : origin, COLORS.crossPlane, 0.34),
-          );
+    if (this.edgeVisibility[EDGE_CATEGORIES.INTERACTION] !== false) {
+      for (const plane of this.planes.values()) {
+        for (const attachment of plane.prepared.attachments) {
+          const target = this._overviewNodeWorld(`resource:${attachment.resourceKey}`);
+          if (!target) continue;
+          for (const origin of this._portWorldPositions(plane, attachment)) {
+            const forward = attachment.direction !== "in";
+            this._addCrossPlaneEdge({
+              from: forward ? origin : target,
+              to: forward ? target : origin,
+              color: COLORS.crossPlane,
+              opacity: 0.34,
+              category: EDGE_CATEGORIES.INTERACTION,
+              processName: plane.processName,
+            });
+          }
         }
       }
     }
 
     // Plane-to-plane: producer/consumer pairs that meet on the same resource.
     const open = [...this.planes.values()];
-    if (open.length === 2) {
+    if (open.length === 2 && this.edgeVisibility[EDGE_CATEGORIES.PLANE_TO_PLANE] !== false) {
       const pairs = directPlanePairs(open[0].prepared.attachments, open[1].prepared.attachments);
       for (const pair of pairs) {
-        const producerPlane = open[0].prepared.attachments.includes(pair.producer) ? open[0] : open[1];
+        const producerPlane = open[0].prepared.attachments.includes(pair.producer)
+          ? open[0]
+          : open[1];
         const consumerPlane = producerPlane === open[0] ? open[1] : open[0];
-        const from = this._portWorldPositions(producerPlane, pair.producer);
-        const to = this._portWorldPositions(consumerPlane, pair.consumer);
-        for (const start of from) {
-          for (const end of to) {
-            this.crossPlaneGroup.add(this._curve(start, end, COLORS.planeToPlane, 0.5));
+        for (const start of this._portWorldPositions(producerPlane, pair.producer)) {
+          for (const end of this._portWorldPositions(consumerPlane, pair.consumer)) {
+            this._addCrossPlaneEdge({
+              from: start,
+              to: end,
+              color: COLORS.planeToPlane,
+              opacity: 0.5,
+              category: EDGE_CATEGORIES.PLANE_TO_PLANE,
+            });
           }
         }
       }
     }
+    this.stylingDirty = true;
   }
 
-  _curve(from, to, color, opacity) {
+  _addCrossPlaneEdge({ from, to, color, opacity, category, processName }) {
     const middle = from.clone().add(to).multiplyScalar(0.5);
     // Lift the control point so the line reads as leaving its plane rather than
     // as another in-plane edge.
     middle.y += Math.max(90, from.distanceTo(to) * 0.16);
     const curve = new THREE.QuadraticBezierCurve3(from, middle, to);
-    const geometry = new THREE.BufferGeometry().setFromPoints(curve.getPoints(34));
-    const material = new THREE.LineBasicMaterial({
-      color: new THREE.Color(color),
-      transparent: true,
-      opacity,
-      depthWrite: false,
-      toneMapped: false,
-    });
-    const line = new THREE.Line(geometry, material);
+    const line = new THREE.Line(
+      new THREE.BufferGeometry().setFromPoints(curve.getPoints(34)),
+      new THREE.LineBasicMaterial({
+        color: new THREE.Color(color),
+        transparent: true,
+        opacity,
+        depthWrite: false,
+        toneMapped: false,
+      }),
+    );
     line.renderOrder = 5;
-    return line;
+    line.userData.baseOpacity = opacity;
+    this.crossPlaneGroup.add(line);
+    this.crossPlaneEdges.push({ line, category, processName });
+  }
+
+  // ----------------------------------------------------------- presentation
+
+  setEdgeVisibility(category, visible) {
+    this.edgeVisibility[category] = visible;
+    if (category === EDGE_CATEGORIES.INTERACTION || category === EDGE_CATEGORIES.PLANE_TO_PLANE) {
+      this.needsCrossPlaneRebuild = true;
+    }
+    this.stylingDirty = true;
+  }
+
+  setHoverHighlight(enabled) {
+    this.hoverHighlightEnabled = enabled;
+    if (!enabled) {
+      this.hoveredNode = null;
+      this.hoveredKey = null;
+    }
+    this.stylingDirty = true;
+  }
+
+  _layers() {
+    const layers = [];
+    if (this.overviewLayer) layers.push({ kind: "overview", layer: this.overviewLayer });
+    for (const plane of this.planes.values()) {
+      layers.push({ kind: "plane", layer: plane.layer, plane });
+    }
+    return layers;
+  }
+
+  /**
+   * One pass that decides every mark's opacity.
+   *
+   * Three effects compose here rather than fighting each other: category
+   * visibility, the recede applied to whatever is not the active canvas, and
+   * the hover highlight. Running them together is what keeps the result
+   * predictable — applied separately, each would stomp the last.
+   */
+  _applyStyling() {
+    const inProcessView = this.activeCanvas !== "overview";
+    const hover = this.hoverHighlightEnabled ? this.hoveredNode : null;
+
+    for (const { kind, layer, plane } of this._layers()) {
+      const isGround = kind === "overview";
+      let nodeFactor = 1;
+      let edgeFactor = 1;
+
+      if (isGround && inProcessView) {
+        // Edges fade harder than nodes: the long ground edges are the noise.
+        nodeFactor = GROUND_NODE_FADE;
+        edgeFactor = GROUND_EDGE_FADE;
+      } else if (!isGround && this.planes.size === 2 && plane.processName !== this.focusedPlane) {
+        nodeFactor = 0.5;
+        edgeFactor = 0.3;
+      }
+
+      const hoverHere = hover && hover.layer === layer;
+      const neighbours = hoverHere ? this._neighbourhood(layer, hover.nodeId) : null;
+
+      for (const [id, node] of layer.registry.nodes) {
+        const dimmed = neighbours && !neighbours.nodes.has(id);
+        setNodeOpacity(node, dimmed ? nodeFactor * HOVER_DIM : nodeFactor);
+      }
+
+      for (const edge of layer.registry.edges) {
+        const visible = this.edgeVisibility[edge.category] !== false;
+        const highlighted = neighbours ? neighbours.edges.has(edge) : false;
+        const dimmed = neighbours && !highlighted;
+
+        edge.line.visible = visible;
+        for (const arrow of edge.arrows) arrow.visible = visible;
+        setEdgeOpacity(edge, dimmed ? edgeFactor * HOVER_DIM : edgeFactor);
+
+        // Edge labels are the messiest thing on either plane, so they exist
+        // only while their edge is picked out by hover.
+        if (edge.label) {
+          edge.label.visible = visible && highlighted;
+          setPartOpacity(edge.label, 1);
+        }
+      }
+
+      if (hoverHere) {
+        // The hovered node keeps its own label whatever the distance rule says.
+        const node = layer.registry.nodes.get(hover.nodeId);
+        for (const part of node?.parts || []) if (part.userData.isLabel) part.visible = true;
+      }
+    }
+
+    for (const edge of this.crossPlaneEdges) {
+      const visible = this.edgeVisibility[edge.category] !== false;
+      edge.line.visible = visible;
+      setPartOpacity(edge.line, hover ? 0.25 : 1);
+    }
+  }
+
+  /** The hovered node, the edges touching it, and the nodes at their far ends. */
+  _neighbourhood(layer, nodeId) {
+    const nodes = new Set([nodeId]);
+    const edges = new Set();
+    for (const edge of layer.registry.edgesByNode.get(nodeId) || []) {
+      if (this.edgeVisibility[edge.category] === false) continue;
+      edges.add(edge);
+      nodes.add(edge.sourceId);
+      nodes.add(edge.targetId);
+    }
+    return { nodes, edges };
   }
 
   // ----------------------------------------------------------------- picking
 
-  _pickablesUnderPointer() {
+  _pickTargets() {
     const targets = [];
     if (this.overviewLayer) targets.push(...this.overviewLayer.pickables);
     for (const plane of this.planes.values()) targets.push(...plane.layer.pickables);
-    this.raycaster.setFromCamera(this.pointer, this.camera);
-    return this.raycaster.intersectObjects(targets, false);
+    return targets;
   }
 
-  _handlePointerMove(event) {
+  _intersect() {
+    this.raycaster.setFromCamera(this.pointer, this.camera);
+    return this.raycaster.intersectObjects(this._pickTargets(), false);
+  }
+
+  _updatePointer(event) {
     const rect = this.renderer.domElement.getBoundingClientRect();
     this.pointer.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
     this.pointer.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
+  }
 
-    const hit = this._pickablesUnderPointer()[0];
+  _layerFor(object) {
+    let current = object;
+    while (current) {
+      if (this.overviewLayer && current === this.overviewLayer.group) return this.overviewLayer;
+      for (const plane of this.planes.values()) {
+        if (current === plane.layer.group) return plane.layer;
+      }
+      current = current.parent;
+    }
+    return null;
+  }
+
+  _handlePointerDown(event) {
+    this._updatePointer(event);
+    this.pointerDownAt = { x: event.clientX, y: event.clientY };
+    if (event.button !== 0 || event.shiftKey) return;
+
+    const hit = this._intersect()[0];
+    const nodeId = hit?.object.userData.nodeId;
+    if (!nodeId) return;
+    const layer = this._layerFor(hit.object);
+    const node = layer?.registry.nodes.get(nodeId);
+    if (!node) return;
+
+    // Drag happens in the node's own plane, so a node can never leave the
+    // drawing it belongs to.
+    const normal = new THREE.Vector3(0, 0, 1).applyQuaternion(
+      layer.group.getWorldQuaternion(new THREE.Quaternion()),
+    );
+    const dragPlane = new THREE.Plane().setFromNormalAndCoplanarPoint(normal, hit.point);
+    const point = new THREE.Vector3();
+    this.raycaster.ray.intersectPlane(dragPlane, point);
+    const local = layer.group.worldToLocal(point.clone());
+
+    this.drag = {
+      layer,
+      nodeId,
+      dragPlane,
+      offset: new THREE.Vector2(node.local.x - local.x, node.local.y - local.y),
+      moved: false,
+      processName: node.processName,
+    };
+    // Stop the camera controls from also treating this gesture as a pan.
+    event.stopPropagation();
+  }
+
+  _handlePointerMove(event) {
+    this._updatePointer(event);
+
+    if (this.drag) {
+      this.raycaster.setFromCamera(this.pointer, this.camera);
+      const point = new THREE.Vector3();
+      if (this.raycaster.ray.intersectPlane(this.drag.dragPlane, point)) {
+        const local = this.drag.layer.group.worldToLocal(point.clone());
+        moveNode(
+          this.drag.layer.registry,
+          this.drag.nodeId,
+          local.x + this.drag.offset.x,
+          local.y + this.drag.offset.y,
+        );
+        this.drag.moved = true;
+        // A dragged process node carries its raised plane with it.
+        if (this.drag.processName && this.planes.has(this.drag.processName)) {
+          this.planes
+            .get(this.drag.processName)
+            .layer.group.position.copy(this._processAnchor(this.drag.processName));
+        }
+        this.needsCrossPlaneRebuild = true;
+      }
+      return;
+    }
+
+    const hit = this._intersect()[0];
     const pick = hit?.object.userData.pick || null;
-    const key = pick ? JSON.stringify([pick.type, pick.node?.uid, pick.process?.name, pick.resource?.key]) : null;
+    const nodeId = hit?.object.userData.nodeId || null;
+    const layer = hit ? this._layerFor(hit.object) : null;
+    const key = nodeId && layer ? `${layer.group.name}:${nodeId}` : null;
+
     if (key !== this.hoveredKey) {
       this.hoveredKey = key;
-      this.hovered = hit?.object || null;
+      this.hoveredNode = key ? { layer, nodeId } : null;
+      this.stylingDirty = true;
       this.renderer.domElement.style.cursor = pick ? "pointer" : "grab";
       this.onHover(pick);
     }
   }
 
-  _handlePointerDown(event) {
-    this.pointerDownAt = { x: event.clientX, y: event.clientY };
-  }
-
   _handlePointerUp(event) {
-    if (!this.pointerDownAt) return;
-    const moved =
-      Math.abs(event.clientX - this.pointerDownAt.x) + Math.abs(event.clientY - this.pointerDownAt.y);
+    const downAt = this.pointerDownAt;
     this.pointerDownAt = null;
-    // Ignore the pointerup that ends an orbit/pan drag.
+
+    if (this.drag) {
+      const wasDrag = this.drag.moved;
+      this.drag = null;
+      // A drag that actually moved the node is not also a click.
+      if (wasDrag) {
+        event.stopPropagation();
+        return;
+      }
+    }
+    if (!downAt) return;
+    const moved = Math.abs(event.clientX - downAt.x) + Math.abs(event.clientY - downAt.y);
     if (moved > 6) return;
 
-    const hit = this._pickablesUnderPointer()[0];
+    const hit = this._intersect()[0];
     const pick = hit?.object.userData.pick || null;
     if (pick?.type === "function" && pick.processName) {
       this.focusedPlane = pick.processName;
-      this.fadeDirty = true;
+      this.stylingDirty = true;
     }
     this.setSelected(pick, hit?.object || null);
     this.onSelect(pick);
@@ -470,16 +791,17 @@ export default class SceneManager {
     if (!object) return;
 
     const radius = object.scale.x * 1.75;
-    const geometry = new THREE.RingGeometry(radius * 0.9, radius, 44);
-    const material = new THREE.MeshBasicMaterial({
-      color: new THREE.Color(COLORS.selection),
-      transparent: true,
-      opacity: 0.95,
-      side: THREE.DoubleSide,
-      depthWrite: false,
-      toneMapped: false,
-    });
-    this.selectionRing = new THREE.Mesh(geometry, material);
+    this.selectionRing = new THREE.Mesh(
+      new THREE.RingGeometry(radius * 0.9, radius, 44),
+      new THREE.MeshBasicMaterial({
+        color: new THREE.Color(COLORS.selection),
+        transparent: true,
+        opacity: 0.95,
+        side: THREE.DoubleSide,
+        depthWrite: false,
+        toneMapped: false,
+      }),
+    );
     this.selectionRing.position.copy(object.position);
     this.selectionRing.renderOrder = 6;
     object.parent.add(this.selectionRing);
@@ -487,29 +809,10 @@ export default class SceneManager {
 
   // ------------------------------------------------------------------- frame
 
-  _applyPlaneFade() {
-    if (this.planes.size < 2) {
-      for (const plane of this.planes.values()) setGroupOpacity(plane.layer.group, 1);
-      return;
-    }
-    // Two parallel planes facing the same way overlap heavily on screen. Fading
-    // whichever one is not focused is what keeps the other readable through it;
-    // clicking a plane's chip or any node on it swaps which that is.
-    for (const plane of this.planes.values()) {
-      const focused = plane.processName === this.focusedPlane;
-      setGroupOpacity(plane.layer.group, focused ? 1 : FOREGROUND_OPACITY);
-    }
-  }
-
   _updateLabelVisibility() {
-    const cameraPosition = this.camera.position;
-    const check = (group) => {
-      for (const label of group.userData.labels || []) {
-        label.visible = true;
-      }
-    };
-    if (this.overviewLayer) check(this.overviewLayer.group);
-
+    if (this.overviewLayer) {
+      for (const label of this.overviewLayer.labels) label.visible = true;
+    }
     const worldPosition = new THREE.Vector3();
     for (const plane of this.planes.values()) {
       for (const label of plane.layer.labels) {
@@ -518,7 +821,7 @@ export default class SceneManager {
           continue;
         }
         label.getWorldPosition(worldPosition);
-        label.visible = cameraPosition.distanceTo(worldPosition) < LABEL_DISTANCE;
+        label.visible = this.camera.position.distanceTo(worldPosition) < LABEL_DISTANCE;
       }
     }
   }
@@ -542,20 +845,20 @@ export default class SceneManager {
 
     this.controls.update();
 
-    const cameraMoved = this.camera.position.distanceToSquared(this.lastCameraPosition) > 4;
-    if (cameraMoved) {
+    if (this.camera.position.distanceToSquared(this.lastCameraPosition) > 4) {
       this.lastCameraPosition.copy(this.camera.position);
       this._updateLabelVisibility();
-    }
-    // Focus changes without the camera moving, so fade has its own dirty flag.
-    if (cameraMoved || this.fadeDirty) {
-      this.fadeDirty = false;
-      this._applyPlaneFade();
+      this.stylingDirty = true;
     }
 
     if (animating || this.needsCrossPlaneRebuild) {
       this._rebuildCrossPlaneEdges();
       this.needsCrossPlaneRebuild = animating;
+    }
+
+    if (this.stylingDirty) {
+      this.stylingDirty = false;
+      this._applyStyling();
     }
 
     this.renderer.render(this.scene, this.camera);
@@ -574,26 +877,12 @@ export default class SceneManager {
     cancelAnimationFrame(this.frameHandle);
     window.removeEventListener("resize", this._onResize);
     const element = this.renderer.domElement;
+    element.removeEventListener("pointerdown", this._onPointerDown, true);
     element.removeEventListener("pointermove", this._onPointerMove);
-    element.removeEventListener("pointerdown", this._onPointerDown);
-    element.removeEventListener("pointerup", this._onPointerUp);
+    element.removeEventListener("pointerup", this._onPointerUp, true);
     this.controls.dispose();
     disposeObject(this.scene);
     this.renderer.dispose();
     element.remove();
   }
-}
-
-/**
- * Fade an entire flat drawing. This is the "blur the foreground" behaviour:
- * a real depth-of-field blur needs a post-processing pass, so the readable
- * approximation is a uniform opacity drop on every material in the group.
- */
-function setGroupOpacity(group, factor) {
-  group.traverse((child) => {
-    const material = child.material;
-    if (!material || Array.isArray(material)) return;
-    const base = child.userData.baseOpacity ?? 1;
-    material.opacity = base * factor;
-  });
 }

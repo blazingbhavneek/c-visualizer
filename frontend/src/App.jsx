@@ -40,6 +40,8 @@ export default function App() {
   const [indexes, setIndexes] = useState([]);
   const [openPlanes, setOpenPlanes] = useState([]);
   const [selection, setSelection] = useState(null);
+  const [edgeVisibility, setEdgeVisibility] = useState({});
+  const [hoverHighlight, setHoverHighlight] = useState(true);
   const [unsupported, setUnsupported] = useState([]);
 
   // ---------------------------------------------------------------- data load
@@ -160,6 +162,7 @@ export default function App() {
       onSelect: (pick) => handleSelectRef.current(pick),
       onPlanesChanged: setOpenPlanes,
     });
+    setEdgeVisibility({ ...sceneRef.current.edgeVisibility });
     return () => {
       sceneRef.current?.dispose();
       sceneRef.current = null;
@@ -201,6 +204,16 @@ export default function App() {
           onClosePlane={(processName) => sceneRef.current?.closeProcess(processName)}
           onFrameOverview={() => sceneRef.current?.frameOverview()}
           onResetTilt={() => sceneRef.current?.controls.resetTilt()}
+          edgeVisibility={edgeVisibility}
+          onToggleEdge={(category, visible) => {
+            sceneRef.current?.setEdgeVisibility(category, visible);
+            setEdgeVisibility((previous) => ({ ...previous, [category]: visible }));
+          }}
+          hoverHighlight={hoverHighlight}
+          onToggleHoverHighlight={(enabled) => {
+            sceneRef.current?.setHoverHighlight(enabled);
+            setHoverHighlight(enabled);
+          }}
         />
       </div>
 

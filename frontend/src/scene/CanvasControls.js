@@ -1,27 +1,27 @@
 import * as THREE from "three";
 
 /**
- * A 2D canvas that happens to live in 3D.
+ * Two camera modes, one gesture set.
  *
- * This is not an orbit camera. At any moment exactly one plane is "the canvas",
- * and the camera is locked to it: dragging pans parallel to that plane, the
- * wheel dollies along its normal, and screen-up always matches the plane's up.
- * Looking straight at the active plane is therefore the resting state, and the
- * view of it is identical to the flat pyvis-style drawing it was laid out as.
+ * **canvas** — the default. Exactly one plane is "the canvas" and the camera is
+ * locked to it: dragging pans parallel to that plane, the wheel dollies along
+ * its normal, screen-up is the plane's up. Looking dead-on is the resting
+ * state, so the active plane looks identical to the flat drawing it was laid
+ * out as. Tilt is clamped to a shallow cone — enough to see which edges leave
+ * the surface, never enough to get lost behind the graph.
  *
- * Rotation is deliberately not free. Tilt is clamped to a shallow cone around
- * the plane normal (right-drag, or shift + left-drag), which is just enough to
- * perceive which cross-plane edges leave the canvas and where they land,
- * without ever letting the user get lost behind or under the graph.
- *
- * Switching the active plane keeps the same controls and lets the camera glide
- * to the new frame, so expanding a process reads as the canvas moving onto that
- * plane rather than as a camera flying around a model.
+ * **pivot** — used when two process planes are open facing each other. The
+ * camera stands between them and turns its head: dragging looks around, the
+ * wheel walks forward and back along the current heading. Yaw is clamped to the
+ * arc that spans the two planes plus a margin, so the user can sweep from one
+ * tree to the other but never end up staring into empty space behind them.
  */
 
 const MAX_YAW = THREE.MathUtils.degToRad(24);
 const MAX_PITCH = THREE.MathUtils.degToRad(18);
+const PIVOT_MAX_PITCH = THREE.MathUtils.degToRad(28);
 const ROTATE_SPEED = 0.0042;
+const LOOK_SPEED = 0.0032;
 const ZOOM_SPEED = 0.0012;
 const DAMPING = 0.14;
 /** Fraction of the current tilt kept when the active canvas changes. */
@@ -31,6 +31,8 @@ export default class CanvasControls {
   constructor(camera, domElement) {
     this.camera = camera;
     this.domElement = domElement;
+
+    this.mode = "canvas";
 
     // The active canvas: an origin plus an orthonormal basis. `normal` points
     // at the viewer, `up` is screen-up, `right` is screen-right.
@@ -48,6 +50,12 @@ export default class CanvasControls {
     this.yaw = 0;
     this.pitch = 0;
     this.enabled = true;
+
+    // pivot mode
+    this.pivotOrigin = new THREE.Vector3();
+    this.pivotHeading = 0;
+    this.pivotYawLimit = Math.PI;
+    this.pivotCenterYaw = 0;
 
     this._initialised = false;
     this._pointer = null;
@@ -72,12 +80,15 @@ export default class CanvasControls {
     domElement.addEventListener("contextmenu", this._onContextMenu);
   }
 
-  /**
-   * Make `frame` the active canvas. `snap` places the camera immediately;
-   * otherwise it glides, which is what makes expanding a process read as the
-   * canvas moving rather than as a cut.
-   */
+  /** True while a node drag owns the pointer, so the camera must not react. */
+  get isGesturing() {
+    return this._pointer !== null;
+  }
+
+  // ----------------------------------------------------------- canvas mode
+
   setFrame(frame, { distance, pan = new THREE.Vector2(0, 0), snap = false } = {}) {
+    this.mode = "canvas";
     this.frame = {
       origin: frame.origin.clone(),
       right: frame.right.clone().normalize(),
@@ -85,7 +96,9 @@ export default class CanvasControls {
       normal: frame.normal.clone().normalize(),
     };
     this.pan.copy(pan);
-    if (distance != null) this.distance = THREE.MathUtils.clamp(distance, this.minDistance, this.maxDistance);
+    if (distance != null) {
+      this.distance = THREE.MathUtils.clamp(distance, this.minDistance, this.maxDistance);
+    }
 
     // Land on the new canvas essentially straight-on: a canvas is meant to be
     // read flat, and carrying a full tilt across would drop the user onto a
@@ -94,14 +107,7 @@ export default class CanvasControls {
     this.yaw *= TILT_CARRYOVER;
     this.pitch *= TILT_CARRYOVER;
 
-    if (snap || !this._initialised) {
-      this._initialised = true;
-      const { position, target, up } = this._desired();
-      this._smoothedPosition.copy(position);
-      this._smoothedTarget.copy(target);
-      this._smoothedUp.copy(up);
-      this._apply();
-    }
+    if (snap || !this._initialised) this._snap();
   }
 
   /** Distance at which a `width` x `height` region on the canvas fills the view. */
@@ -119,6 +125,58 @@ export default class CanvasControls {
       .addScaledVector(this.frame.up, this.pan.y);
   }
 
+  // ------------------------------------------------------------ pivot mode
+
+  /**
+   * Stand at `origin` and look toward `headings[0]`. `headings` are world
+   * directions (one per open plane); yaw is limited to the arc they span plus a
+   * margin, so the sweep covers both trees and nothing else.
+   */
+  setPivot(origin, headings, { snap = false } = {}) {
+    this.mode = "pivot";
+    this.pivotOrigin.copy(origin);
+
+    const angles = headings.map((direction) => Math.atan2(direction.x, direction.z));
+    if (angles.length >= 2) {
+      // Shortest arc between the two headings, then widen it a little.
+      let delta = angles[1] - angles[0];
+      while (delta > Math.PI) delta -= Math.PI * 2;
+      while (delta < -Math.PI) delta += Math.PI * 2;
+      this.pivotCenterYaw = angles[0] + delta / 2;
+      this.pivotYawLimit = Math.abs(delta) / 2 + THREE.MathUtils.degToRad(20);
+    } else {
+      this.pivotCenterYaw = angles[0] ?? 0;
+      this.pivotYawLimit = THREE.MathUtils.degToRad(50);
+    }
+
+    this.pivotHeading = angles[0] ?? 0;
+    this.pitch *= TILT_CARRYOVER;
+    if (snap || !this._initialised) this._snap();
+  }
+
+  /** Swing the head to face one of the pivot headings. */
+  lookAlong(direction) {
+    if (this.mode !== "pivot") return;
+    this.pivotHeading = this._clampYaw(Math.atan2(direction.x, direction.z));
+  }
+
+  _clampYaw(angle) {
+    let delta = angle - this.pivotCenterYaw;
+    while (delta > Math.PI) delta -= Math.PI * 2;
+    while (delta < -Math.PI) delta += Math.PI * 2;
+    return this.pivotCenterYaw + THREE.MathUtils.clamp(delta, -this.pivotYawLimit, this.pivotYawLimit);
+  }
+
+  _pivotForward() {
+    return new THREE.Vector3(
+      Math.sin(this.pivotHeading) * Math.cos(this.pitch),
+      Math.sin(this.pitch),
+      Math.cos(this.pivotHeading) * Math.cos(this.pitch),
+    ).normalize();
+  }
+
+  // ---------------------------------------------------------------- shared
+
   _tiltQuaternion() {
     const yaw = new THREE.Quaternion().setFromAxisAngle(this.frame.up, this.yaw);
     const pitchAxis = this.frame.right.clone().applyQuaternion(yaw);
@@ -127,11 +185,29 @@ export default class CanvasControls {
   }
 
   _desired() {
+    if (this.mode === "pivot") {
+      const forward = this._pivotForward();
+      const position = this.pivotOrigin.clone();
+      return {
+        position,
+        target: position.clone().addScaledVector(forward, 1000),
+        up: new THREE.Vector3(0, 1, 0),
+      };
+    }
     const tilt = this._tiltQuaternion();
     const direction = this.frame.normal.clone().applyQuaternion(tilt);
     const up = this.frame.up.clone().applyQuaternion(tilt);
     const target = this.target;
     return { position: target.clone().addScaledVector(direction, this.distance), target, up };
+  }
+
+  _snap() {
+    this._initialised = true;
+    const { position, target, up } = this._desired();
+    this._smoothedPosition.copy(position);
+    this._smoothedTarget.copy(target);
+    this._smoothedUp.copy(up);
+    this._apply();
   }
 
   _apply() {
@@ -155,7 +231,10 @@ export default class CanvasControls {
   _handlePointerDown(event) {
     if (!this.enabled || this._pointer !== null) return;
     this._pointer = event.pointerId;
-    this._mode = event.button === 2 || event.button === 1 || event.shiftKey ? "tilt" : "pan";
+    const secondary = event.button === 2 || event.button === 1 || event.shiftKey;
+    // In pivot mode the primary gesture is looking around, not panning: the
+    // whole point of standing between two planes is to turn your head.
+    this._mode = this.mode === "pivot" ? (secondary ? "walk" : "look") : secondary ? "tilt" : "pan";
     this._last.set(event.clientX, event.clientY);
     this.domElement.setPointerCapture?.(event.pointerId);
   }
@@ -165,6 +244,23 @@ export default class CanvasControls {
     const dx = event.clientX - this._last.x;
     const dy = event.clientY - this._last.y;
     this._last.set(event.clientX, event.clientY);
+
+    if (this._mode === "look") {
+      this.pivotHeading = this._clampYaw(this.pivotHeading + dx * LOOK_SPEED);
+      this.pitch = THREE.MathUtils.clamp(
+        this.pitch + dy * LOOK_SPEED,
+        -PIVOT_MAX_PITCH,
+        PIVOT_MAX_PITCH,
+      );
+      return;
+    }
+
+    if (this._mode === "walk") {
+      const right = new THREE.Vector3(Math.cos(this.pivotHeading), 0, -Math.sin(this.pivotHeading));
+      this.pivotOrigin.addScaledVector(right, -dx * 2.2);
+      this.pivotOrigin.y = Math.max(40, this.pivotOrigin.y + dy * 2.2);
+      return;
+    }
 
     if (this._mode === "tilt") {
       this.yaw = THREE.MathUtils.clamp(this.yaw - dx * ROTATE_SPEED, -MAX_YAW, MAX_YAW);
@@ -190,6 +286,11 @@ export default class CanvasControls {
   _handleWheel(event) {
     if (!this.enabled) return;
     event.preventDefault();
+    if (this.mode === "pivot") {
+      // Walk along the current heading rather than scaling a radius.
+      this.pivotOrigin.addScaledVector(this._pivotForward(), -event.deltaY * 1.1);
+      return;
+    }
     const factor = Math.exp(event.deltaY * ZOOM_SPEED);
     this.distance = THREE.MathUtils.clamp(
       this.distance * factor,
@@ -200,6 +301,11 @@ export default class CanvasControls {
 
   /** Return to looking dead-on at the active canvas. */
   resetTilt() {
+    if (this.mode === "pivot") {
+      this.pivotHeading = this.pivotCenterYaw;
+      this.pitch = 0;
+      return;
+    }
     this.yaw = 0;
     this.pitch = 0;
   }

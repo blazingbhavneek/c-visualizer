@@ -1,4 +1,12 @@
 import { useMemo, useState } from "react";
+import { EDGE_CATEGORIES } from "../scene/graphLayer.js";
+
+const EDGE_TOGGLES = [
+  [EDGE_CATEGORIES.CALL, "function calls", "#b0864a"],
+  [EDGE_CATEGORIES.INTERACTION, "daemon links", "#0e7fa8"],
+  [EDGE_CATEGORIES.GROUND, "process ↔ daemon", "#2563d8"],
+  [EDGE_CATEGORIES.PLANE_TO_PLANE, "plane ↔ plane", "#c2185b"],
+];
 
 /**
  * Floating controls over the canvas. Deliberately an overlay rather than a
@@ -17,6 +25,10 @@ export default function CanvasOverlay({
   onClosePlane,
   onFrameOverview,
   onResetTilt,
+  edgeVisibility,
+  onToggleEdge,
+  hoverHighlight,
+  onToggleHoverHighlight,
 }) {
   const [showRuns, setShowRuns] = useState(false);
 
@@ -69,8 +81,42 @@ export default function CanvasOverlay({
           </div>
 
           <p className="rounded-md border border-rule/70 bg-panel/80 px-2 py-1 text-[11px] text-ink-faint backdrop-blur">
-            drag to pan · wheel to zoom · right-drag (or shift-drag) to tilt
+            drag a node to move it · drag the background to pan · wheel to zoom ·
+            right-drag to tilt
           </p>
+
+          <div className="w-64 rounded-lg border border-rule bg-panel/90 p-2.5 shadow-sm backdrop-blur">
+            <p className="mb-1.5 text-[10px] font-semibold uppercase tracking-wider text-ink-faint">
+              Edges
+            </p>
+            {EDGE_TOGGLES.map(([category, label, colour]) => (
+              <label
+                key={category}
+                className="flex cursor-pointer items-center gap-2 py-0.5 text-[11px] text-ink-muted"
+              >
+                <input
+                  type="checkbox"
+                  checked={edgeVisibility[category] !== false}
+                  onChange={(event) => onToggleEdge(category, event.target.checked)}
+                  className="size-3 accent-slate-700"
+                />
+                <span
+                  className="inline-block h-0.5 w-3.5 shrink-0 rounded"
+                  style={{ backgroundColor: colour }}
+                />
+                {label}
+              </label>
+            ))}
+            <label className="mt-1.5 flex cursor-pointer items-center gap-2 border-t border-rule pt-1.5 text-[11px] text-ink-muted">
+              <input
+                type="checkbox"
+                checked={hoverHighlight}
+                onChange={(event) => onToggleHoverHighlight(event.target.checked)}
+                className="size-3 accent-slate-700"
+              />
+              highlight on hover
+            </label>
+          </div>
 
           {openPlanes.length > 0 && (
             <div className="flex flex-wrap items-center gap-2">
@@ -99,7 +145,7 @@ export default function CanvasOverlay({
               ))}
               {openPlanes.length === 2 && (
                 <span className="rounded-md bg-inset px-2 py-1 text-[11px] text-ink-faint">
-                  opening a third collapses plane A
+                  facing each other — drag to turn your head · a third collapses plane A
                 </span>
               )}
             </div>
