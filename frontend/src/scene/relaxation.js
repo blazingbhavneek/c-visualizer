@@ -8,6 +8,11 @@ import { refreshEdge } from "./graphLayer.js";
  * everything else settles around it: edges act as springs holding the length
  * they were laid out at, and nodes push apart when their footprints collide.
  *
+ * Influence is gated by hop distance from the dragged node. Without that gate,
+ * the collision pass alone shoves the whole graph around - dragging one process
+ * visibly moved every node on the plane. Immediate neighbours follow properly;
+ * anything further only drifts enough to keep out of the way.
+ *
  * There is deliberately no restoring force toward the original layout. A weak
  * spring home would slowly undo a deliberate rearrangement, so instead nodes
  * stay where the user leaves them and "Reset layout" puts them back.
@@ -19,6 +24,19 @@ const DAMPING = 0.76;
 const MAX_STEP = 60;
 /** Below this total kinetic energy the graph is considered settled. */
 const SETTLED = 0.02;
+
+/**
+ * Stiffness of the spring holding each ring to where it sat when the drag
+ * began, indexed by hops from the dragged node.
+ *
+ * Scaling per-frame velocity is not enough on its own: a slower node still
+ * converges to the same equilibrium, it just takes more frames, so the second
+ * ring was ending up 137 units away. Anchoring moves the equilibrium itself.
+ * Direct neighbours are unanchored and follow properly; beyond that the anchor
+ * dominates the edge springs and nodes only shift enough to stay clear.
+ */
+const ANCHOR_BY_HOP = [0, 0, 1.3];
+const ANCHOR_DISTANT = 3;
 
 export function createRelaxation(registry) {
   const nodes = [];
@@ -47,7 +65,67 @@ export function createRelaxation(registry) {
     links.push({ a, b, rest: Math.hypot(a.x - b.x, a.y - b.y) || 1 });
   }
 
-  return { registry, nodes, index, links, energy: Infinity };
+  const adjacency = new Map();
+  for (const link of links) {
+    if (!adjacency.has(link.a.id)) adjacency.set(link.a.id, []);
+    if (!adjacency.has(link.b.id)) adjacency.set(link.b.id, []);
+    adjacency.get(link.a.id).push(link.b.id);
+    adjacency.get(link.b.id).push(link.a.id);
+  }
+
+  return { registry, nodes, index, links, adjacency, energy: Infinity, pinnedId: null };
+}
+
+/**
+ * Assign each node a mobility from its hop distance to the dragged node.
+ * Recomputed only when the drag target changes, not per frame.
+ */
+export function setPinned(simulation, pinnedId) {
+  if (simulation.pinnedId === pinnedId) return;
+  simulation.pinnedId = pinnedId;
+
+  // Anchors are taken from current positions, not the original layout, so a
+  // second drag starts from wherever the user left things.
+  for (const entry of simulation.nodes) {
+    entry.anchor = ANCHOR_DISTANT;
+    entry.anchorX = entry.x;
+    entry.anchorY = entry.y;
+  }
+  if (!pinnedId) return;
+
+  const seen = new Set([pinnedId]);
+  let frontier = [pinnedId];
+  for (let hop = 0; hop < ANCHOR_BY_HOP.length && frontier.length > 0; hop += 1) {
+    const next = [];
+    for (const id of frontier) {
+      const entry = simulation.index.get(id);
+      if (entry) entry.anchor = ANCHOR_BY_HOP[hop];
+      for (const neighbour of simulation.adjacency.get(id) || []) {
+        if (seen.has(neighbour)) continue;
+        seen.add(neighbour);
+        next.push(neighbour);
+      }
+    }
+    frontier = next;
+  }
+}
+
+/**
+ * Hand over on mouse-up: every node keeps the position it now holds.
+ *
+ * Without this the anchored outer rings simply spring the dragged cluster back
+ * to where it started, so the drag had no lasting effect at all. Re-anchoring
+ * on release is what makes a rearrangement stick while still letting the last
+ * few frames resolve any remaining overlap.
+ */
+export function releasePin(simulation) {
+  if (!simulation) return;
+  for (const entry of simulation.nodes) {
+    entry.anchorX = entry.x;
+    entry.anchorY = entry.y;
+    if (!entry.anchor) entry.anchor = 0.5;
+  }
+  simulation.pinnedId = null;
 }
 
 /** True while the graph is still moving and needs another frame. */
@@ -86,6 +164,12 @@ export function relaxStep(simulation, pinnedId = null) {
     link.b.fy -= dy * force;
   }
 
+  for (const entry of nodes) {
+    if (!entry.anchor) continue;
+    entry.fx += (entry.anchorX - entry.x) * entry.anchor;
+    entry.fy += (entry.anchorY - entry.y) * entry.anchor;
+  }
+
   // Pairwise separation. Quadratic, but at a few hundred nodes that is well
   // under a millisecond and it is what stops the spring pass from piling nodes
   // on top of each other.
@@ -118,8 +202,8 @@ export function relaxStep(simulation, pinnedId = null) {
     entry.vy = (entry.vy + entry.fy) * DAMPING;
     entry.vx = Math.max(-MAX_STEP, Math.min(MAX_STEP, entry.vx));
     entry.vy = Math.max(-MAX_STEP, Math.min(MAX_STEP, entry.vy));
-    energy += entry.vx * entry.vx + entry.vy * entry.vy;
 
+    energy += entry.vx * entry.vx + entry.vy * entry.vy;
     if (Math.abs(entry.vx) < 0.01 && Math.abs(entry.vy) < 0.01) continue;
     entry.x += entry.vx;
     entry.y += entry.vy;

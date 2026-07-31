@@ -12,7 +12,14 @@ import {
   setNodeOpacity,
   setPartOpacity,
 } from "./graphLayer.js";
-import { createRelaxation, isSettling, relaxStep, resetToHome } from "./relaxation.js";
+import {
+  createRelaxation,
+  isSettling,
+  relaxStep,
+  releasePin,
+  resetToHome,
+  setPinned,
+} from "./relaxation.js";
 
 const UP = new THREE.Vector3(0, 1, 0);
 const MAX_OPEN_PLANES = 2;
@@ -779,6 +786,9 @@ export default class SceneManager {
 
     if (this.drag) {
       const wasDrag = this.drag.moved;
+      if (wasDrag && this.simulation?.layer === this.drag.layer) {
+        releasePin(this.simulation.sim);
+      }
       this.drag = null;
       // A drag that actually moved the node is not also a click.
       if (wasDrag) {
@@ -868,6 +878,7 @@ export default class SceneManager {
     // view rather than a node teleporting on its own.
     if (this.simulation) {
       const pinnedId = this.drag?.layer === this.simulation.layer ? this.drag.nodeId : null;
+      if (pinnedId) setPinned(this.simulation.sim, pinnedId);
       if (pinnedId || isSettling(this.simulation.sim)) {
         relaxStep(this.simulation.sim, pinnedId);
         this.needsCrossPlaneRebuild = true;
