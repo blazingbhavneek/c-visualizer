@@ -42,6 +42,9 @@ class CallGraphBuilder:
         file_functions: dict[str, dict[str, any]] | None = None,
     ):
         self.project_structure = project_structure
+        self.project_key_by_path = {
+            str(Path(path).resolve()): key for key, path in project_structure.items()
+        }
 
         self.fp_args_map = function_pointer_args if function_pointer_args else {}
 
@@ -140,9 +143,11 @@ class CallGraphBuilder:
                     filename, {}
                 ).items():
                     start_line = function_info.get("start_line", 0)
-                    declaration = "\n".join(
-                        source_text.splitlines()[start_line - 1 : start_line + 4]
+                    end_line = function_info.get("end_line", start_line)
+                    definition = "\n".join(
+                        source_text.splitlines()[start_line - 1 : end_line]
                     )
+                    declaration = definition.split("{", 1)[0]
                     if re.search(r"\bstatic\b", declaration):
                         self.static_funcs[str(filepath)][name] = function_info
                     else:
@@ -173,8 +178,10 @@ class CallGraphBuilder:
         is_static: bool = False,
     ) -> FunctionNode:
         file_path_str = str(caller_file)
-        file_name = Path(caller_file).name
-        def_file_name = file_name
+        definition_file_path = file_path_str
+        def_file_name = self.project_key_by_path.get(
+            str(Path(file_path_str).resolve()), Path(file_path_str).name
+        )
 
         if not is_external:
             if (
@@ -182,32 +189,38 @@ class CallGraphBuilder:
                 and name in self.static_funcs[file_path_str]
             ):
                 is_static = True
-                def_file_name = file_name
+                definition_file_path = file_path_str
+                def_file_name = self.project_key_by_path.get(
+                    str(Path(file_path_str).resolve()), Path(file_path_str).name
+                )
             elif name in self.global_funcs:
                 is_static = False
-                def_file_name = Path(self.global_funcs[name][0]).name
+                definition_file_path = self.global_funcs[name][0]
+                def_file_name = self.project_key_by_path.get(
+                    str(Path(definition_file_path).resolve()),
+                    Path(definition_file_path).name,
+                )
             else:
                 is_external = True
 
         node = FunctionNode(
             name=name,
             file_name=def_file_name,
-            file_path=file_path_str,
+            file_path=definition_file_path,
             is_external=is_external,
             is_static=is_static,
         )
 
         # ✅ FIX: Use def_file_name (where the function is DEFINED),
         #         not file_name (where the function is CALLED FROM)
-        if def_file_name.endswith(".c"):
-            if (
-                def_file_name in self.file_functions
-                and name in self.file_functions[def_file_name]
-            ):
-                node.start_line = self.file_functions[def_file_name][name]["start_line"]
-                node.end_line = self.file_functions[def_file_name][name].get(
-                    "end_line", -1
-                )
+        if (
+            def_file_name in self.file_functions
+            and name in self.file_functions[def_file_name]
+        ):
+            node.start_line = self.file_functions[def_file_name][name]["start_line"]
+            node.end_line = self.file_functions[def_file_name][name].get(
+                "end_line", -1
+            )
 
         if node.unique_id not in self.node_registry:
             self.node_registry[node.unique_id] = node
@@ -617,7 +630,9 @@ def build_call_trees(
 
         return node
 
-    for func_id in graph:
+    # Include isolated definitions as one-node trees.  They cannot appear below
+    # main, but they still belong to the complete source index/unreached shelf.
+    for func_id in registry:
         if func_id not in trees:
             trees[func_id] = _build_recursive(func_id, set(), None)
 
@@ -703,6 +718,43 @@ def find_highest_parent_of_node(
     return highest_parent_keys
 
 
+def ensure_call_graph(
+    project_structure: dict[str, str],
+    trees: dict,
+    function_pointer_args: dict | None = None,
+    file_functions: dict[str, dict[str, Any]] | None = None,
+) -> tuple[
+    dict[str, list[CallSite]],
+    dict[str, FunctionNode],
+    dict[str, CallTreeNode],
+    dict[str, tuple[str, str, str]],
+]:
+    """Build/cache the complete graph independently of any target API path."""
+    state = State()
+    graph = state.get("CALL_GRAPH")
+    registry = state.get("FUNCTION_REGISTRY")
+    tree_objects = state.get("TREE_OBJECTS")
+    macros = state.get("BUILDER_MACROS")
+    if graph is not None and registry is not None and tree_objects is not None:
+        return graph, registry, tree_objects, macros or {}
+
+    builder = CallGraphBuilder(
+        project_structure=project_structure,
+        trees=trees,
+        function_pointer_args=function_pointer_args,
+        file_functions=file_functions,
+    )
+    graph = builder.build()
+    registry = builder.node_registry
+    tree_objects = build_call_trees(graph, registry)
+    macros = builder.macros
+    state.set("CALL_GRAPH", graph)
+    state.set("FUNCTION_REGISTRY", registry)
+    state.set("TREE_OBJECTS", tree_objects)
+    state.set("BUILDER_MACROS", macros)
+    return graph, registry, tree_objects, macros
+
+
 def orchestrate(
     project_strcuture: dict[str, str],
     trees: dict,
@@ -722,29 +774,15 @@ def orchestrate(
 
     # for call_grahp determined data.
     BLOCK_REGEX = r"\[([^\[\]]*)\]"
-    tree_objects = State().get("TREE_OBJECTS", None)
-    macro_data = State().get("BUILDER_MACROS", None)
-    if tree_objects is None:
-        builder = CallGraphBuilder(
-            project_structure=project_strcuture,
-            trees=trees,
-            function_pointer_args=function_pointer_args,
-            file_functions=file_functions,
-        )
-        graph = builder.build()
-        # Keep the lossless graph for optional additive exporters.  Existing
-        # call-tree/path behaviour remains unchanged.
-        State().set("CALL_GRAPH", graph)
-        State().set("FUNCTION_REGISTRY", builder.node_registry)
-        # rprint(graph)
-        # sys.exit()
-        tree_objects = build_call_trees(graph, builder.node_registry)
-        State().set("TREE_OBJECTS", tree_objects)
-        if not builder.macros:
-            print("NO MACROS EXTRACTED>>>>....")
-        State().set("BUILDER_MACROS", builder.macros)
-        macro_data = builder.macros
-        print(len(builder.macros))
+    _, _, tree_objects, macro_data = ensure_call_graph(
+        project_structure=project_strcuture,
+        trees=trees,
+        function_pointer_args=function_pointer_args,
+        file_functions=file_functions,
+    )
+    if not macro_data:
+        print("NO MACROS EXTRACTED>>>>....")
+    print(len(macro_data))
 
     paths_with_data: list[tuple[tuple[list[str], list[CallTreeNode] | None], dict]] = []
     main_key = f"[{main_file_name}]main"

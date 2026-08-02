@@ -8,9 +8,11 @@ frontend can read without scraping those presentation formats.
 from __future__ import annotations
 
 import hashlib
+import csv
 import json
 import os
 import re
+import tempfile
 from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
@@ -70,6 +72,7 @@ class VisualizerCollector:
         project_structure: dict[str, str],
         file_functions: dict[str, dict[str, Any]],
         main_file_name: str | None,
+        library_functions: set[str] | list[str] | None = None,
         run_id: str | None = None,
         results_root: Path | None = None,
     ) -> None:
@@ -78,8 +81,10 @@ class VisualizerCollector:
         self.project_structure = {name: str(path) for name, path in project_structure.items()}
         self.file_functions = file_functions
         self.main_file_name = main_file_name
+        self.library_functions = set(library_functions or [])
         self.run_id = run_id or datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
         self.results_root = results_root or get_visualizer_results_root()
+        self.generated_at = datetime.now(timezone.utc).isoformat()
 
         self.functions: dict[str, dict[str, Any]] = {}
         self.calls: dict[str, dict[str, Any]] = {}
@@ -87,6 +92,59 @@ class VisualizerCollector:
         self.interactions: dict[str, dict[str, Any]] = {}
         self.traces: dict[str, dict[str, Any]] = {}
         self._ids_by_name: dict[str, set[str]] = {}
+        self._run_dir: Path | None = None
+        self._manifest_recorded = False
+        self.source_files = self._capture_source_files()
+
+    def _capture_source_files(self) -> list[dict[str, Any]]:
+        """Embed analyzed inputs so a snapshot remains useful on another PC."""
+        inputs: dict[str, Path] = {
+            str(Path(path).resolve()): Path(path) for path in self.project_structure.values()
+        }
+        makefile = Path(self.process_root) / "Makefile"
+        if makefile.is_file():
+            inputs[str(makefile.resolve())] = makefile
+
+        source_files = []
+        process_root = Path(self.process_root).resolve()
+        for resolved_path, path in sorted(inputs.items()):
+            try:
+                content = path.read_text(encoding="latin-1", errors="replace")
+            except OSError:
+                continue
+            try:
+                relative_path = str(Path(resolved_path).relative_to(process_root))
+            except ValueError:
+                relative_path = None
+            source_files.append(
+                {
+                    "id": _stable_id("source", resolved_path),
+                    "path": resolved_path,
+                    "relative_path": relative_path,
+                    "file_name": path.name,
+                    "language": "make" if path.name.lower() == "makefile" else path.suffix.lstrip("."),
+                    "sha256": hashlib.sha256(content.encode("latin-1", errors="replace")).hexdigest(),
+                    "content": content,
+                }
+            )
+        return source_files
+
+    def _source_for_node(self, node: Any) -> tuple[str | None, str | None]:
+        if getattr(node, "is_external", False):
+            return None, None
+        definition_path = self._definition_path(node)
+        start = int(getattr(node, "start_line", -1) or -1)
+        end = int(getattr(node, "end_line", -1) or -1)
+        source_file = next(
+            (item for item in self.source_files if item["path"] == str(Path(definition_path).resolve())),
+            None,
+        ) if definition_path else None
+        if source_file is None or start < 1 or end < start:
+            return None, None
+        lines = source_file["content"].splitlines()
+        source = "\n".join(lines[start - 1 : min(end, len(lines))])
+        digest = hashlib.sha256(source.encode("latin-1", errors="replace")).hexdigest()
+        return source, digest
 
     def _definition_path(self, node: Any) -> str | None:
         """Prefer the definition file preserved by FunctionNode/file_functions."""
@@ -123,6 +181,8 @@ class VisualizerCollector:
         name = getattr(node, "name", "unknown")
         definition_path = self._definition_path(node)
         is_external = bool(getattr(node, "is_external", False))
+        is_library_api = name in self.library_functions
+        source, source_sha256 = self._source_for_node(node)
         self.functions[function_id] = {
             "id": function_id,
             "kind": "external_function" if is_external else "function",
@@ -132,9 +192,14 @@ class VisualizerCollector:
             "start_line": getattr(node, "start_line", -1),
             "end_line": getattr(node, "end_line", -1),
             "is_external": is_external,
+            "is_library_api": is_library_api,
             "is_static": bool(getattr(node, "is_static", False)),
-            "summary_status": "pending" if not is_external else "library",
+            "summary_status": (
+                "library" if is_external or is_library_api else "pending"
+            ),
             "summary": None,
+            "source": source,
+            "source_sha256": source_sha256,
         }
         self._ids_by_name.setdefault(name, set()).add(function_id)
         return function_id
@@ -163,8 +228,8 @@ class VisualizerCollector:
         *,
         graph: dict[str, list[Any]] | None,
         registry: dict[str, Any] | None,
-        target_function: str,
-        trace_paths: list[list[str]],
+        target_function: str | None = None,
+        trace_paths: list[list[str]] | None = None,
     ) -> None:
         """Capture the raw call graph once, then append target-specific traces."""
         graph = graph or {}
@@ -210,7 +275,9 @@ class VisualizerCollector:
                         via=target,
                     )
 
-        for labels in trace_paths:
+        for labels in trace_paths or []:
+            if not target_function:
+                continue
             trace_id = _stable_id("trace", target_function, "\n".join(labels))
             self.traces[trace_id] = {
                 "id": trace_id,
@@ -297,6 +364,68 @@ class VisualizerCollector:
                 "function_source": combined.get("function_name_src"),
             }
 
+    def rehydrate_interactions(
+        self,
+        csv_path: Path | str,
+        argument_indices_by_api: dict[str, list[int]],
+    ) -> int:
+        """Reload durable tracer rows when resume logic skips completed paths.
+
+        Target tracing keeps its resumable source of record in the per-process
+        CSV.  A new visualizer snapshot has a fresh in-memory collector, so
+        skipped paths must be replayed into it or a resumed run silently loses
+        resources and interactions.
+        """
+        csv_path = Path(csv_path)
+        if not csv_path.is_file():
+            return 0
+
+        initial_count = len(self.interactions)
+        with csv_path.open("r", encoding="utf-8-sig", newline="") as handle:
+            for row in csv.DictReader(handle):
+                process_name = row.get("process_name", "")
+                if process_name and process_name != self.process_name:
+                    continue
+
+                target_api = row.get("function_name", "")
+                if not target_api:
+                    continue
+                argument_indices = list(argument_indices_by_api.get(target_api, []))
+                raw_values = row.get("target_number->ans", "")
+                if len(argument_indices) > 1:
+                    values = raw_values.split(", ", len(argument_indices) - 1)
+                else:
+                    values = [raw_values or "NO TARGET"]
+
+                call_number = row.get("call_number")
+                if call_number in {None, "", "NA", "None", "nan"}:
+                    call_number = None
+
+                self.record_combined(
+                    {
+                        "call_number": call_number,
+                        "target_number": {
+                            "path_str": row.get("target_number->path_str", ""),
+                            "ans": values,
+                        },
+                        "process_name": process_name or self.process_name,
+                        "launch_via": row.get("launch_via") or "NO DATA",
+                        "call_function": row.get("call_function") or "unknown",
+                        "function_name": target_api,
+                        "type": row.get("type") or "NO DATA",
+                        "function_name_src": {
+                            "path": row.get("function_name_src->path", ""),
+                            "line_number": row.get("function_name_src->line_number", ""),
+                        },
+                        "target_name_src": {
+                            "path": row.get("target_name_src->path", ""),
+                            "line_number": row.get("target_name_src->line_number", ""),
+                        },
+                    },
+                    argument_indices,
+                )
+        return len(self.interactions) - initial_count
+
     def _function_summary_fallbacks(self) -> None:
         outgoing = Counter(call["source"] for call in self.calls.values())
         interaction_count = Counter(
@@ -314,7 +443,7 @@ class VisualizerCollector:
                 )
 
     def write(self) -> Path:
-        """Write a new run directory; no existing tracer output is replaced."""
+        """Checkpoint this run; repeated writes update only this run's snapshot."""
         self._function_summary_fallbacks()
         process_id = _stable_id("process", self.process_name, self.process_root)
         main_id = None
@@ -325,7 +454,7 @@ class VisualizerCollector:
 
         snapshot = {
             "schema_version": self.schema_version,
-            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "generated_at": self.generated_at,
             "run_id": self.run_id,
             "process": {
                 "id": process_id,
@@ -336,22 +465,25 @@ class VisualizerCollector:
             },
             "functions": sorted(self.functions.values(), key=lambda item: (item["name"], item["id"])),
             "calls": sorted(self.calls.values(), key=lambda item: item["id"]),
+            "source_files": self.source_files,
             "resources": sorted(self.resources.values(), key=lambda item: (item["kind"], item["name"])),
             "interactions": sorted(self.interactions.values(), key=lambda item: item["id"]),
             "traces": sorted(self.traces.values(), key=lambda item: item["id"]),
         }
 
-        run_dir = self.results_root / "visualizer" / self.process_name / "runs" / self.run_id
-        # A second export in the same second remains non-destructive.
-        suffix = 1
-        while run_dir.exists():
-            suffix += 1
-            run_dir = run_dir.with_name(f"{self.run_id}_{suffix}")
-        run_dir.mkdir(parents=True, exist_ok=False)
+        if self._run_dir is None:
+            run_dir = self.results_root / "visualizer" / self.process_name / "runs" / self.run_id
+            # A different run in the same second remains non-destructive.
+            suffix = 1
+            while run_dir.exists():
+                suffix += 1
+                run_dir = run_dir.with_name(f"{self.run_id}_{suffix}")
+            run_dir.mkdir(parents=True, exist_ok=False)
+            self._run_dir = run_dir
+        run_dir = self._run_dir
         snapshot["run_id"] = run_dir.name
-        (run_dir / "graph.json").write_text(
-            json.dumps(snapshot, ensure_ascii=False, indent=2), encoding="utf-8"
-        )
+        graph_path = run_dir / "graph.json"
+        self._atomic_write_json(graph_path, snapshot)
 
         manifest_path = self.results_root / "visualizer" / "runs.json"
         manifest_path.parent.mkdir(parents=True, exist_ok=True)
@@ -363,13 +495,37 @@ class VisualizerCollector:
                 # Snapshot directories remain intact even if this convenience
                 # index was malformed by a prior interrupted run.
                 manifest = []
-        manifest.append(
-            {
-                "process_name": self.process_name,
-                "run_id": run_dir.name,
-                "graph": str(run_dir / "graph.json"),
-                "generated_at": snapshot["generated_at"],
-            }
+        record = {
+            "process_name": self.process_name,
+            "run_id": run_dir.name,
+            "graph": str(graph_path),
+            "generated_at": snapshot["generated_at"],
+        }
+        existing_index = next(
+            (
+                index
+                for index, item in enumerate(manifest)
+                if item.get("process_name") == self.process_name
+                and item.get("run_id") == run_dir.name
+            ),
+            None,
         )
-        manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
-        return run_dir / "graph.json"
+        if existing_index is None:
+            manifest.append(record)
+        else:
+            manifest[existing_index] = record
+        self._atomic_write_json(manifest_path, manifest)
+        self._manifest_recorded = True
+        return graph_path
+
+    @staticmethod
+    def _atomic_write_json(path: Path, payload: Any) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                json.dump(payload, handle, ensure_ascii=False, indent=2)
+            os.replace(temporary_name, path)
+        finally:
+            if os.path.exists(temporary_name):
+                os.unlink(temporary_name)

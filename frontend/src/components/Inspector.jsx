@@ -130,9 +130,11 @@ function FunctionPanel({ selection, index, runId }) {
             <p className="text-xs leading-relaxed text-ink-muted">
               No model-written summary in this snapshot.{" "}
               <span className="font-mono text-ink-muted">summary_status: {fn.summary_status || "—"}</span>
-              {" — "}
-              every function in every current snapshot has <span className="font-mono">summary: null</span>,
-              so this panel fills in once the pipeline writes summaries.
+              {fn.summary_error
+                ? ` — ${fn.summary_error}`
+                : fn.summary_status === "library" || fn.is_external
+                  ? " — this node is treated as an external/library boundary, not as application code to summarize. Its API context is folded into summaries of repository functions that call it."
+                  : " — enable the bottom-up summary pass when running the analyzer."}
             </p>
             {fn.summary_hint && (
               <p className="mt-2 border-t border-rule pt-2 text-xs text-ink-muted">

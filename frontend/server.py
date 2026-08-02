@@ -11,10 +11,14 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import sys
 from http import HTTPStatus
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from process_groups import load_group_manifest, scan_graph_runs
 
 
 LEGACY_RESULTS_ROOT = Path("/home/seigyo/c_repo/c_repo/results/csv_results")
@@ -42,6 +46,8 @@ def default_results_root() -> Path:
 
 class VisualizerHandler(SimpleHTTPRequestHandler):
     results_root: Path
+    group_members: set[tuple[str, str]] | None = None
+    group_info: dict | None = None
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, directory=str(static_root()), **kwargs)
@@ -81,30 +87,44 @@ class VisualizerHandler(SimpleHTTPRequestHandler):
 
     def _runs(self):
         runs = []
-        visualizer_root = self.results_root / "visualizer"
-        if not visualizer_root.is_dir():
-            return runs
-        for graph_path in visualizer_root.glob("*/runs/*/graph.json"):
-            try:
-                graph = json.loads(graph_path.read_text(encoding="utf-8"))
-                runs.append(
-                    {
-                        "process_name": graph.get("process", {}).get("name", graph_path.parents[2].name),
-                        "run_id": graph.get("run_id", graph_path.parent.name),
-                        "generated_at": graph.get("generated_at"),
-                        "function_count": len(graph.get("functions", [])),
-                        "resource_count": len(graph.get("resources", [])),
-                        "interaction_count": len(graph.get("interactions", [])),
-                    }
-                )
-            except (OSError, json.JSONDecodeError):
+        for run in scan_graph_runs(self.results_root):
+            member = (str(run["process_name"]), str(run["run_id"]))
+            if self.group_members is not None and member not in self.group_members:
                 continue
-        return sorted(runs, key=lambda run: (run["process_name"], run["generated_at"] or ""), reverse=True)
+            runs.append(
+                {
+                    key: run[key]
+                    for key in (
+                        "process_name",
+                        "run_id",
+                        "generated_at",
+                        "function_count",
+                        "resource_count",
+                        "interaction_count",
+                    )
+                }
+            )
+        return runs
 
     def do_GET(self):
         parsed = urlparse(self.path)
         if parsed.path == "/api/runs":
-            self._send_json({"results_root": str(self.results_root), "runs": self._runs()})
+            self._send_json(
+                {
+                    "results_root": str(self.results_root),
+                    "group": self.group_info,
+                    "runs": self._runs(),
+                }
+            )
+            return
+
+        if parsed.path == "/api/groups":
+            groups_path = self.results_root / "visualizer" / "groups.json"
+            try:
+                groups = json.loads(groups_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                groups = []
+            self._send_json({"results_root": str(self.results_root), "groups": groups})
             return
 
         if parsed.path in {"/api/graph", "/api/source"}:
@@ -121,6 +141,23 @@ class VisualizerHandler(SimpleHTTPRequestHandler):
 
             function_id = query.get("function", [""])[0]
             function = next((item for item in graph.get("functions", []) if item.get("id") == function_id), None)
+            if function and isinstance(function.get("source"), str):
+                start = max(1, int(function.get("start_line", 1)))
+                source_lines = function["source"].splitlines()
+                snippet = "\n".join(
+                    f"{number:>5}  {line}"
+                    for number, line in enumerate(source_lines, start=start)
+                )
+                self._send_json(
+                    {
+                        "file": function.get("file"),
+                        "start_line": start,
+                        "end_line": start + max(0, len(source_lines) - 1),
+                        "text": snippet,
+                        "embedded": True,
+                    }
+                )
+                return
             source_path = Path(function.get("file", "")) if function else None
             process_root = Path(graph.get("process", {}).get("root", ""))
             if not function or not source_path or not source_path.is_file():
@@ -147,13 +184,40 @@ class VisualizerHandler(SimpleHTTPRequestHandler):
 def main():
     parser = argparse.ArgumentParser(description="Serve the process visualizer.")
     parser.add_argument("--results-root", type=Path, default=default_results_root())
+    parser.add_argument(
+        "--group",
+        help="Show one saved process group by name, name@run-id, or group.json path.",
+    )
     parser.add_argument("--port", type=int, default=8765)
     args = parser.parse_args()
 
     VisualizerHandler.results_root = args.results_root.resolve()
+    if args.group:
+        try:
+            group_path, manifest = load_group_manifest(
+                VisualizerHandler.results_root, args.group
+            )
+        except ValueError as exc:
+            raise SystemExit(str(exc)) from exc
+        VisualizerHandler.group_members = {
+            (str(process["process_name"]), str(process["run_id"]))
+            for process in manifest["processes"]
+        }
+        VisualizerHandler.group_info = {
+            "name": manifest.get("name"),
+            "run_id": manifest.get("run_id"),
+            "generated_at": manifest.get("generated_at"),
+            "manifest": str(group_path),
+            "totals": manifest.get("totals", {}),
+        }
     server = ThreadingHTTPServer(("127.0.0.1", args.port), VisualizerHandler)
     print(f"Visualizer: http://127.0.0.1:{args.port}")
     print(f"Reading snapshots from: {VisualizerHandler.results_root / 'visualizer'}")
+    if VisualizerHandler.group_info:
+        print(
+            "Process group: "
+            f"{VisualizerHandler.group_info['name']}@{VisualizerHandler.group_info['run_id']}"
+        )
     if static_root() == FRONTEND_ROOT:
         print("No frontend/dist build found - run `npm run build`, or use `npm run dev` on :5173.")
     try:

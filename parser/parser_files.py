@@ -250,6 +250,16 @@ class parseFiles:
                 start_line = second_block_result[0]
                 end_line = second_block_result[1]
 
+                # The last node is the target API itself.  It has a source
+                # range like every other function, but there is no following
+                # call-site node from which to trim a caller context.  Older
+                # call-tree output happened not to expose this case; the full
+                # source registry now resolves the library stub as a terminal
+                # node, so skip it deliberately instead of indexing past the
+                # path boundary.
+                if index + 1 >= len(path):
+                    continue
+
                 next_node_first_block_result = self.process_first_block(
                     first_block=(self.process_whole_string(node_str=path[index + 1]))[0]
                 )

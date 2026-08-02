@@ -1,7 +1,8 @@
 # Process visualizer
 
-React + Vite + Tailwind + three.js. Reads immutable `graph.json` snapshots
-through the read-only API in `server.py` (see `../handoff.md` for the schema).
+React + Vite + Tailwind + three.js. Reads immutable `graph.json` snapshots and
+optional saved process-group manifests through the read-only API in `server.py`
+(see `../handoff.md` for the schema).
 The tracer continues to write its normal CSV, Mermaid, PyVis, stats and log
 outputs; this UI reads only the snapshots:
 
@@ -15,6 +16,9 @@ results/csv_results/visualizer/<process>/runs/<timestamp>/graph.json
 # API + built bundle on one port
 python frontend/server.py --port 8765     # then open http://127.0.0.1:8765
 
+# pin the view to exact snapshots from one saved multi-process analysis
+python frontend/server.py --group production-line --port 8765
+
 # or, for development: vite on :5173, proxying /api to :8765
 cd frontend && npm install && npm run dev
 ```
@@ -26,6 +30,8 @@ prints a note.
 The default results directory is `results/csv_results/` in this repository when
 the former `/home/seigyo/...` directory is unavailable. Override it with
 `--results-root <dir containing visualizer/>` or `VISUALIZER_RESULTS_ROOT`.
+`--group` accepts a group name (latest group run), `name@run-id`, or an explicit
+`group.json` path. `/api/groups` lists the saved manifests.
 
 ## The layout model
 
@@ -89,10 +95,14 @@ back to the remaining plane, or down to the ground.
 - **Cross-process join.** No snapshot contains inter-process data. Resource IDs
   are per-snapshot hashes, so the overview joins on `(kind, name)`. 24 of 36
   distinct resources are touched by more than one process.
-- **AI summaries.** `summary` is `null` for all 4355 functions in every current
-  snapshot (`summary_status` is `pending` or `library`). The inspector's AI
-  panel renders `summary` when present and states the absence honestly
-  otherwise, falling back to `summary_hint`. No LLM dependency in the frontend.
+- **AI summaries.** New analyzer runs can populate bottom-up model summaries
+  (`summary_status: ready`). Runs made without that pass remain `pending` or
+  `library`; the inspector states the absence and falls back to `summary_hint`.
+  The frontend itself has no LLM dependency.
+- **Portable source.** New snapshots embed analyzed source files and exact
+  function slices. `/api/source` prefers that evidence, so copied snapshots do
+  not depend on absolute paths from the analysis PC. Older snapshots still use
+  the filesystem fallback.
 - **Run selection.** The newest run for five of six processes has zero
   resources and zero interactions. The interim default is *the newest run that
   has interaction evidence*; the Runs overlay allows overriding per process.

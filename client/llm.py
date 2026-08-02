@@ -1,4 +1,5 @@
 import json
+import os
 import re
 from pprint import pprint
 
@@ -34,7 +35,9 @@ class OllamaClient:
     PRODUCTION_MODE = False  # will set the output to just logs
 
     def __init__(self, data):  # in the data we'll have the config as well as t
-        self.model = data.get("model", "gemma-4-31B")
+        self.model = data.get("model") or os.environ.get(
+            "TRACER_LLM_MODEL", "gemma-4-31B"
+        )
         self.enc = get_encoding("cl100k_base")
         self.temp = data.get("temp", 0.0)
         self.tool_functions = data.get("tool_functions", None)
@@ -60,16 +63,29 @@ class OllamaClient:
         print(self.output_model)
         if not self.output_model:
             raise ValueError("OUTPUT MODEL NOT PROVIDED TO LLM CLASS.")
-        # vLLM exposes the OpenAI chat-completions API.
-        self.openai_model: bool = True
+        # vLLM exposes the OpenAI chat-completions API.  Keep the current
+        # machine's default, but allow the purchased work-PC setup to select
+        # Ollama without editing this file.
+        provider = str(
+            data.get("provider")
+            or os.environ.get("TRACER_LLM_PROVIDER", "openai")
+        ).lower()
+        self.openai_model = provider in {"openai", "vllm", "azure"}
         self.num_ctx = data.get("num_ctx", 110000)
         if self.openai_model:
             self.client = OpenAI(
-                api_key="EMPTY", base_url="http://175.28.230.22:54062/v1"
+                api_key=data.get("api_key")
+                or os.environ.get("TRACER_LLM_API_KEY", "EMPTY"),
+                base_url=data.get("base_url")
+                or os.environ.get(
+                    "TRACER_LLM_BASE_URL", "http://175.28.230.22:54062/v1"
+                ),
             )
         else:
-            # self.client = Client(host = data.get('host','http://10.160.144.101:51021'))
-            self.client = Client(host=data.get("host", "http://127.0.0.1:11434"))
+            self.client = Client(
+                host=data.get("host")
+                or os.environ.get("TRACER_OLLAMA_HOST", "http://127.0.0.1:11434")
+            )
             # self.c
             # print('')
 

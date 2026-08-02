@@ -1,3 +1,4 @@
+import asyncio
 import gc
 import json
 import multiprocessing
@@ -32,7 +33,7 @@ from rich.tree import Tree
 from tree_sitter import Language, Parser
 from tree_sitter_custom import language
 
-from call_graph.call_graph import orchestrate
+from call_graph.call_graph import ensure_call_graph, orchestrate
 from call_graph.data_classes import CallTreeNode, custom_tree
 from call_graph.gen_graph import make_graph
 from client.llm import OllamaClient
@@ -48,6 +49,7 @@ from helpers.Preprocess.preprocess import (
     extract_includes,
 )
 from helpers.time_it import time_it
+from function_summaries import SummaryConfig, summarize_collector
 from makefile_resolver.makefile_resolver import return_project_mapping
 from models import (
     Combined,
@@ -59,6 +61,12 @@ from models import (
     outputModelForReturn,
 )
 from output_paths import results_root
+from process_groups import (
+    discover_processes,
+    validate_group_name,
+    validate_processes,
+    write_group_manifest,
+)
 from state.load_data import load_files
 from state.state import State
 from tools.tools import (
@@ -1219,19 +1227,60 @@ def make_llm_calls_for_function(
 
 
 @time_it()
-def trace_variable(project_path):
+def trace_variable(
+    project_path: Path | str,
+    summary_config: SummaryConfig | None = None,
+    *,
+    index_only: bool = False,
+):
     STATE = State()
-    pickle_dir = (
-        Path(__file__).resolve().parent / "pickle_data/project_structures_pickle"
+    project_path = Path(project_path).resolve()
+    pickle_dir = Path(
+        os.environ.get(
+            "PROJECT_STRUCTURE_CACHE_ROOT",
+            Path(__file__).resolve().parent / "pickle_data/project_structures_pickle",
+        )
     )
     if not pickle_dir.exists():
         pickle_dir.mkdir(exist_ok=True, parents=True)
 
     project_structure_path = pickle_dir / f"{STATE.get('PROJECT_NAME')}.pkl"
     potential_main_files: list[str] | None = None
-    if not project_structure_path.exists():
+    makefile_path = project_path / "Makefile"
+    makefile_fingerprint = {
+        "path": str(makefile_path.resolve()),
+        "mtime_ns": makefile_path.stat().st_mtime_ns,
+        "size": makefile_path.stat().st_size,
+    }
+
+    def source_mapping_fingerprint(mapping) -> dict[str, tuple[int, int]]:
+        return {
+            str(Path(path).resolve()): (Path(path).stat().st_mtime_ns, Path(path).stat().st_size)
+            for path in mapping.values()
+            if Path(path).exists()
+        }
+
+    cached_project = None
+    if project_structure_path.exists():
+        try:
+            with open(project_structure_path, "rb") as f:
+                candidate = pickle.load(f)
+            if (
+                isinstance(candidate, dict)
+                and candidate.get("version") == 3
+                and candidate.get("project_root") == str(project_path)
+                and candidate.get("makefile") == makefile_fingerprint
+                and all(Path(path).exists() for path in candidate.get("project_structure", {}).values())
+                and candidate.get("source_files")
+                == source_mapping_fingerprint(candidate.get("project_structure", {}))
+            ):
+                cached_project = candidate
+        except (OSError, pickle.PickleError, EOFError):
+            cached_project = None
+
+    if cached_project is None:
         print(
-            "PROJECT STRUCTURE NEEDS TO BE RESOLVED. NO PICKLE FILE. IT WILL TAKE TIME...."
+            "PROJECT STRUCTURE NEEDS TO BE RESOLVED OR REFRESHED. IT WILL TAKE TIME...."
         )
         PROJECT_STRUCTURE, potential_main_files = return_project_mapping(
             show=False, project_path=project_path
@@ -1241,11 +1290,20 @@ def trace_variable(project_path):
         )
         STATE.set("PROJECT_STRUCTURE", PROJECT_STRUCTURE)
         with open(project_structure_path, "wb") as f:
-            pickle.dump((PROJECT_STRUCTURE, potential_main_files), f)
+            pickle.dump(
+                {
+                    "version": 3,
+                    "project_root": str(project_path),
+                    "makefile": makefile_fingerprint,
+                    "project_structure": PROJECT_STRUCTURE,
+                    "potential_main_files": potential_main_files,
+                    "source_files": source_mapping_fingerprint(PROJECT_STRUCTURE),
+                },
+                f,
+            )
     else:
-        with open(project_structure_path, "rb") as f:
-            PROJECT_STRUCTURE, potential_main_files = pickle.load(f)  # already sored.
-
+        PROJECT_STRUCTURE = cached_project["project_structure"]
+        potential_main_files = cached_project["potential_main_files"]
         STATE.set("PROJECT_STRUCTURE", PROJECT_STRUCTURE)
     print("THE MAIN FILES ARE: ", potential_main_files)
     # project_tree_path = pickle_dir/f'{STATE.get('PROJECT_NAME')}_tree.pkl'
@@ -1272,12 +1330,9 @@ def trace_variable(project_path):
     for files in PROJECT_STRUCTURE.keys():
         macros[files] = extract_all_macros(PROJECT_STRUCTURE[files])
         file_includes[files] = extract_includes(PROJECT_STRUCTURE[files])
-        if files.endswith(".h"):
-            continue
-
         file_path = PROJECT_STRUCTURE[files]
         functions = get_local_function_definitions(
-            code_bytes=trees[files][1]
+            code_bytes=trees[files][1], file_name=files
         )  # function_name:dict(info of this function.)
         # if files == 'dio000d.c':
         #     print('This is the files and functions for the dio000d.c',files,functions)
@@ -1306,10 +1361,46 @@ def trace_variable(project_path):
             project_structure=PROJECT_STRUCTURE,
             file_functions=FILE_FUNCTIONS,
             main_file_name=main_file_name,
+            library_functions=set((STATE.get("FUNCTION_MAP", {}) or {}).keys())
+            | set((STATE.get("FUNCTION_TYPES", {}) or {}).keys()),
             run_id=STATE.get("TIME"),
         ),
     )
+    collector = STATE.get("VISUALIZER_COLLECTOR")
+
+    # Build and persist the complete source graph before target-variable
+    # tracing.  A missing/unreachable configured API must never erase the code
+    # index or source evidence for the run.
+    graph, registry, _, _ = ensure_call_graph(
+        project_structure=PROJECT_STRUCTURE,
+        trees=trees,
+        function_pointer_args=FUNCTION_POINTER_ARGS,
+        file_functions=FILE_FUNCTIONS,
+    )
+    collector.capture_call_graph(graph=graph, registry=registry)
+    graph_path = collector.write()
+    STATE.set("VISUALIZER_GRAPH_PATH", graph_path)
+    print(f"Complete source graph checkpoint written to {graph_path}")
+
+    summary_config = summary_config or SummaryConfig.from_env()
+    if summary_config.enabled:
+        try:
+            summary_report = asyncio.run(
+                summarize_collector(collector, summary_config)
+            )
+            print(f"Bottom-up function summaries: {summary_report}")
+        except Exception as exc:
+            # Variable tracing and the already-persisted graph remain usable if
+            # an optional LLM/wiki service is unavailable or misconfigured.
+            print(f"Function summarization unavailable: {exc}")
+            for function in collector.functions.values():
+                if not function.get("is_external") and not function.get("summary"):
+                    function["summary_error"] = str(exc)
+            collector.write()
     # STATE.set('TREES',trees)
+
+    if index_only:
+        return {}
 
     functions_identified = identify_funs_to_trace(
         project_structure=PROJECT_STRUCTURE, trees=trees
@@ -1318,7 +1409,7 @@ def trace_variable(project_path):
         print(
             f"{BOLD}{RED}NO FUNCTIONS IDENTIFIED IN THE PROJECT {project_path.name}.{RESET}"
         )
-        return None
+        return {}
     console.print(
         "-" * 10, "DETECTED FUNCTIONS NEEDS TO BE TRACED AND THEIR ARG. NUMS.", "-" * 10
     )
@@ -1361,6 +1452,15 @@ def trace_variable(project_path):
 
     collector = STATE.get("VISUALIZER_COLLECTOR")
     if collector is not None:
+        restored = collector.rehydrate_interactions(
+            results_root() / f"{STATE.get('PROJECT_NAME')}.csv",
+            {
+                function_name: list(config.get("indices") or [])
+                for function_name, config in functions_identified.items()
+            },
+        )
+        if restored:
+            print(f"Restored {restored} visualizer interactions from trace checkpoints")
         graph_path = collector.write()
         print(f"Visualizer graph written to {graph_path}")
 
@@ -1405,35 +1505,168 @@ if __name__ == "__main__":
     # paths below and lets the included fixture run out of the box.
     import argparse
 
-    argument_parser = argparse.ArgumentParser()
-    argument_parser.add_argument(
+    argument_parser = argparse.ArgumentParser(
+        description="Index one process or a reproducible group of processes."
+    )
+    process_mode = argument_parser.add_mutually_exclusive_group()
+    process_mode.add_argument(
         "--project",
         type=Path,
         help="Process directory to trace (must contain a Makefile).",
     )
-    argument_parser.add_argument(
+    process_mode.add_argument(
+        "--projects",
+        type=Path,
+        nargs="+",
+        help="Explicit process directories to trace sequentially as one group.",
+    )
+    process_mode.add_argument(
+        "--process-folder",
+        type=Path,
+        help="Discover every Makefile process below this folder and trace them sequentially.",
+    )
+    process_mode.add_argument(
+        "--combine-runs",
+        metavar="GROUP_NAME",
+        help="Create a group from process snapshots produced by earlier commands.",
+    )
+    process_mode.add_argument(
         "--all-test-scada",
         action="store_true",
-        help="Trace every included test_scada process.",
+        help="Compatibility alias for --process-folder test_scada/processes.",
+    )
+    argument_parser.add_argument(
+        "--combine-processes",
+        nargs="+",
+        metavar="PROCESS",
+        help="With --combine-runs, limit the group to these process names.",
+    )
+    argument_parser.add_argument(
+        "--run-selection",
+        choices=("latest-with-interactions", "latest"),
+        default="latest-with-interactions",
+        help="Snapshot policy used by --combine-runs (default: latest snapshot containing interactions).",
+    )
+    argument_parser.add_argument(
+        "--group-name",
+        help="Name for a list/folder batch group (defaults to a timestamped batch name).",
+    )
+    argument_parser.add_argument(
+        "--continue-on-error",
+        action="store_true",
+        help="Continue with later processes and record failed members in the group manifest.",
+    )
+    summary_group = argument_parser.add_mutually_exclusive_group()
+    summary_group.add_argument(
+        "--summarize-functions",
+        action="store_true",
+        help="Generate bottom-up summaries for every source function.",
+    )
+    summary_group.add_argument(
+        "--skip-function-summaries",
+        action="store_true",
+        help="Index source/calls without making function-summary LLM calls.",
+    )
+    argument_parser.add_argument("--summary-model")
+    argument_parser.add_argument("--summary-base-url")
+    argument_parser.add_argument(
+        "--wiki-url",
+        help=(
+            "Full llm-wiki ask URL, e.g. "
+            "http://127.0.0.1:8000/llm-wiki/moove/api/ask"
+        ),
+    )
+    argument_parser.add_argument(
+        "--wiki-placeholder",
+        action="store_true",
+        help="Use an explicit no-knowledge wiki placeholder for offline testing.",
+    )
+    argument_parser.add_argument("--summary-concurrency", type=int)
+    argument_parser.add_argument(
+        "--index-only",
+        action="store_true",
+        help="Build the complete code graph (and optional summaries) without target-variable LLM tracing.",
     )
     command_args = argument_parser.parse_args()
     repo_root = Path(__file__).resolve().parent
     test_processes_root = repo_root / "test_scada" / "processes"
 
+    if command_args.combine_processes and not command_args.combine_runs:
+        argument_parser.error("--combine-processes requires --combine-runs")
+    if command_args.group_name:
+        try:
+            validate_group_name(command_args.group_name)
+        except ValueError as exc:
+            argument_parser.error(str(exc))
+    if command_args.combine_runs:
+        try:
+            group_path = write_group_manifest(
+                results_root(),
+                command_args.combine_runs,
+                process_names=command_args.combine_processes,
+                policy=command_args.run_selection,
+            )
+        except ValueError as exc:
+            raise SystemExit(str(exc)) from exc
+        print(f"Combined process group written to {group_path}")
+        print(
+            "Open only this group with: "
+            f"python frontend/server.py --group {command_args.combine_runs}"
+        )
+        sys.exit(0)
+
     if command_args.project:
         projects_to_run = [command_args.project.resolve()]
+        batch_mode = False
+    elif command_args.projects:
+        projects_to_run = command_args.projects
+        batch_mode = True
+    elif command_args.process_folder:
+        try:
+            projects_to_run = discover_processes(command_args.process_folder)
+        except ValueError as exc:
+            raise SystemExit(str(exc)) from exc
+        batch_mode = True
     elif command_args.all_test_scada:
-        projects_to_run = sorted(path for path in test_processes_root.iterdir() if path.is_dir())
+        try:
+            projects_to_run = discover_processes(test_processes_root)
+        except ValueError as exc:
+            raise SystemExit(str(exc)) from exc
+        batch_mode = True
     elif not Path(src_wh).is_dir():
         projects_to_run = [test_processes_root / "proc_waterworks"]
+        batch_mode = False
     else:
         projects_to_run = []
+        batch_mode = False
+
+    if (command_args.process_folder or command_args.all_test_scada) and not projects_to_run:
+        raise SystemExit("No Makefile process directories were found in the selected folder.")
 
     if projects_to_run:
+        try:
+            projects_to_run = validate_processes(projects_to_run)
+        except ValueError as exc:
+            raise SystemExit(str(exc)) from exc
+        summary_config = SummaryConfig.from_env()
+        if command_args.summarize_functions:
+            summary_config.enabled = True
+        elif command_args.skip_function_summaries:
+            summary_config.enabled = False
+        if command_args.summary_model:
+            summary_config.model = command_args.summary_model
+        if command_args.summary_base_url:
+            summary_config.base_url = command_args.summary_base_url
+        if command_args.wiki_url:
+            summary_config.wiki_url = command_args.wiki_url
+        if command_args.wiki_placeholder:
+            summary_config.wiki_placeholder = True
+        if command_args.summary_concurrency:
+            summary_config.concurrency = max(1, command_args.summary_concurrency)
+        graph_paths: list[Path] = []
+        failures: list[dict] = []
+        STATE = State()
         for project_path in projects_to_run:
-            if not (project_path / "Makefile").is_file():
-                raise SystemExit(f"Project needs a Makefile: {project_path}")
-
             json_dir = next(
                 (
                     candidate / "json_data"
@@ -1443,13 +1676,58 @@ if __name__ == "__main__":
                 repo_root / "json_data",
             )
             print(f"RUNNING FOR PROJECT {project_path.name}")
-            set_tool_def()
-            STATE = load_files(json_dir=json_dir)
-            STATE.set("TIME", f"{datetime.now():%Y%m%d_%H%M%S}")
-            STATE.set("PROJECT_NAME", project_path.name)
-            summary = trace_variable(project_path=project_path)
-            console.print(summary)
-            STATE.reset()
+            try:
+                set_tool_def()
+                STATE = load_files(json_dir=json_dir)
+                STATE.set("TIME", f"{datetime.now():%Y%m%d_%H%M%S}")
+                STATE.set("PROJECT_NAME", project_path.name)
+                summary = trace_variable(
+                    project_path=project_path,
+                    summary_config=summary_config,
+                    index_only=command_args.index_only,
+                )
+                console.print(summary)
+                graph_path = STATE.get("VISUALIZER_GRAPH_PATH")
+                if graph_path and Path(graph_path).is_file():
+                    graph_paths.append(Path(graph_path))
+            except (Exception, SystemExit) as exc:
+                graph_path = STATE.get("VISUALIZER_GRAPH_PATH")
+                if graph_path and Path(graph_path).is_file() and Path(graph_path) not in graph_paths:
+                    graph_paths.append(Path(graph_path))
+                failures.append(
+                    {
+                        "process_name": project_path.name,
+                        "project_root": str(project_path),
+                        "error": str(exc),
+                    }
+                )
+                if not command_args.continue_on_error:
+                    raise
+                print(f"PROCESS FAILED; CONTINUING: {project_path.name}: {exc}")
+            finally:
+                STATE.reset()
+
+        if batch_mode or command_args.group_name:
+            if not graph_paths:
+                raise SystemExit("No graph snapshots were produced; group was not written.")
+            batch_stamp = f"{datetime.now():%Y%m%d_%H%M%S}"
+            group_name = command_args.group_name or f"batch-{batch_stamp}"
+            try:
+                group_path = write_group_manifest(
+                    results_root(),
+                    group_name,
+                    graph_paths=graph_paths,
+                    failures=failures,
+                )
+            except ValueError as exc:
+                raise SystemExit(str(exc)) from exc
+            print(f"Combined process group written to {group_path}")
+            print(
+                "Open only this group with: "
+                f"python frontend/server.py --group {group_name}"
+            )
+        if failures:
+            raise SystemExit(f"{len(failures)} process(es) failed; successful snapshots were preserved.")
         sys.exit(0)
 
     to_exclude = {
