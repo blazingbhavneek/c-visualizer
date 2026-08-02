@@ -20,6 +20,16 @@ from urllib.parse import parse_qs, urlparse
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from process_groups import load_group_manifest, scan_graph_runs
 
+# The chat endpoints are strictly additive: without the wiki package (or its
+# model endpoints) every graph route below behaves exactly as it always has.
+try:
+    from wiki.serve import WikiHandlerMixin, WikiService
+except ImportError as exc:  # pragma: no cover - depends on the environment
+    WikiHandlerMixin, WikiService = None, None
+    WIKI_IMPORT_ERROR = str(exc)
+else:
+    WIKI_IMPORT_ERROR = None
+
 
 LEGACY_RESULTS_ROOT = Path("/home/seigyo/c_repo/c_repo/results/csv_results")
 FRONTEND_ROOT = Path(__file__).resolve().parent
@@ -189,6 +199,11 @@ def main():
         help="Show one saved process group by name, name@run-id, or group.json path.",
     )
     parser.add_argument("--port", type=int, default=8765)
+    parser.add_argument(
+        "--no-chat",
+        action="store_true",
+        help="Serve graphs only, without the question-answering endpoints.",
+    )
     args = parser.parse_args()
 
     VisualizerHandler.results_root = args.results_root.resolve()
@@ -210,8 +225,26 @@ def main():
             "manifest": str(group_path),
             "totals": manifest.get("totals", {}),
         }
-    server = ThreadingHTTPServer(("127.0.0.1", args.port), VisualizerHandler)
+    handler = VisualizerHandler
+    if WikiHandlerMixin is not None and not args.no_chat:
+        # The mixin goes first so it can intercept the wiki routes and defer
+        # everything else to the visualizer handler unchanged.
+        handler = type("VisualizerChatHandler", (WikiHandlerMixin, VisualizerHandler), {})
+        handler.wiki_service = WikiService(VisualizerHandler.results_root)
+
+    server = ThreadingHTTPServer(("127.0.0.1", args.port), handler)
     print(f"Visualizer: http://127.0.0.1:{args.port}")
+    if handler is VisualizerHandler:
+        reason = WIKI_IMPORT_ERROR or "disabled with --no-chat"
+        print(f"Chat endpoints off ({reason}). Graph browsing is unaffected.")
+    else:
+        settings = handler.wiki_service.settings
+        print(
+            "Chat: /api/ask/stream  "
+            f"[embed={settings.embed_model or 'off'} "
+            f"rerank={settings.rerank_model or 'off'} "
+            f"llm={settings.llm_model or 'off'}]"
+        )
     print(f"Reading snapshots from: {VisualizerHandler.results_root / 'visualizer'}")
     if VisualizerHandler.group_info:
         print(

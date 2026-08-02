@@ -1,17 +1,41 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import SceneManager from "./scene/SceneManager.js";
-import Inspector from "./components/Inspector.jsx";
-import CanvasOverlay from "./components/CanvasOverlay.jsx";
-import { fetchGraph, fetchRuns } from "./api.js";
-import { SCHEMA_VERSION, deriveOverview, indexSnapshot } from "./graph/model.js";
-import { layoutOverview } from "./graph/layout.js";
-import { prepareProcess } from "./graph/prepare.js";
+import { useCallback, useEffect, useMemo, useState } from "react";
+import { fetchGraph, fetchRuns, wikiStatus } from "./api.js";
+import ChatPanel from "./components/ChatPanel.jsx";
+import GraphView from "./components/GraphView.jsx";
+import TopBar from "./components/TopBar.jsx";
+import { indexSnapshot, SCHEMA_VERSION } from "./graph/model.js";
+import useAsk from "./hooks/useAsk.js";
+import { useT } from "./i18n.jsx";
 
-/**
- * Interim run-selection policy (task #2): prefer the newest run that actually
- * carries interaction evidence, because the newest run for five of six
- * processes has none and would render an overview with no daemon edges at all.
- */
+const STR = {
+  ja: {
+    scanning: "スナップショットを検索中…",
+    loading: "グラフのスナップショットを読込中…",
+    empty: "スナップショットがない。解析パイプラインを実行してから再読込してください。",
+    apiError: "API に接続できない: {error}",
+    loadError: "スナップショットを読み込めなかった。{details}",
+    unsupportedAll: "すべてのスナップショットが未対応のスキーマバージョンを使用している。",
+    askFunction: "`{name}` 関数の役割と呼び出し経路を説明して",
+  },
+  en: {
+    scanning: "Scanning snapshots…",
+    loading: "Loading graph snapshots…",
+    empty: "No snapshots found. Run the analysis pipeline, then reload.",
+    apiError: "Could not reach the API: {error}",
+    loadError: "No snapshot could be loaded. {details}",
+    unsupportedAll: "Every snapshot uses an unsupported schema version.",
+    askFunction: "Explain the role and invocation paths of `{name}`",
+  },
+};
+
+function format(template, values) {
+  return Object.entries(values).reduce(
+    (result, [key, value]) => result.replace(`{${key}}`, value),
+    template,
+  );
+}
+
+/** Prefer the newest run carrying daemon-interaction evidence for each process. */
 function chooseRuns(runs) {
   const byProcess = new Map();
   for (const run of runs) {
@@ -30,21 +54,18 @@ function chooseRuns(runs) {
 }
 
 export default function App() {
-  const containerRef = useRef(null);
-  const sceneRef = useRef(null);
-  const preparedCache = useRef(new Map());
-
-  const [status, setStatus] = useState({ phase: "loading", message: "Scanning snapshots…" });
+  const t = useT(STR);
+  const [view, setView] = useState("chat");
+  const [draft, setDraft] = useState("");
+  const [loadState, setLoadState] = useState({ phase: "loading", code: "scanning" });
   const [runs, setRuns] = useState([]);
   const [selectedRuns, setSelectedRuns] = useState(new Map());
   const [indexes, setIndexes] = useState([]);
-  const [openPlanes, setOpenPlanes] = useState([]);
-  const [selection, setSelection] = useState(null);
-  const [edgeVisibility, setEdgeVisibility] = useState({});
-  const [hoverHighlight, setHoverHighlight] = useState(true);
   const [unsupported, setUnsupported] = useState([]);
-
-  // ---------------------------------------------------------------- data load
+  const [wiki, setWiki] = useState(null);
+  const [wikiError, setWikiError] = useState(null);
+  const [revealTarget, setRevealTarget] = useState(null);
+  const askState = useAsk(selectedRuns);
 
   useEffect(() => {
     let cancelled = false;
@@ -54,17 +75,13 @@ export default function App() {
         const list = payload.runs || [];
         setRuns(list);
         if (list.length === 0) {
-          setStatus({
-            phase: "empty",
-            message: "No snapshots found. Run the analysis pipeline, then reload.",
-          });
+          setLoadState({ phase: "empty", code: "empty" });
           return;
         }
         setSelectedRuns(chooseRuns(list));
       })
       .catch((error) => {
-        if (cancelled) return;
-        setStatus({ phase: "error", message: `Could not reach the API: ${error.message}` });
+        if (!cancelled) setLoadState({ phase: "error", code: "api", detail: error.message });
       });
     return () => {
       cancelled = true;
@@ -72,10 +89,9 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    if (selectedRuns.size === 0) return;
+    if (selectedRuns.size === 0) return undefined;
     let cancelled = false;
-    setStatus({ phase: "loading", message: "Loading graph snapshots…" });
-    preparedCache.current.clear();
+    setLoadState({ phase: "loading", code: "loading" });
 
     Promise.all(
       [...selectedRuns.entries()].map(([processName, runId]) =>
@@ -101,17 +117,16 @@ export default function App() {
       }
       setUnsupported(badVersion);
       if (loaded.length === 0) {
-        setStatus({
+        setLoadState({
           phase: "error",
-          message: failed.length
-            ? `No snapshot could be loaded. ${failed.join("; ")}`
-            : "Every snapshot uses an unsupported schema version.",
+          code: failed.length ? "load" : "unsupported",
+          detail: failed.join("; "),
         });
         return;
       }
       loaded.sort((a, b) => a.process.name.localeCompare(b.process.name));
       setIndexes(loaded);
-      setStatus({ phase: "ready", message: "" });
+      setLoadState({ phase: "ready", code: "ready" });
     });
 
     return () => {
@@ -119,110 +134,92 @@ export default function App() {
     };
   }, [selectedRuns]);
 
-  // ------------------------------------------------------------------- scene
-
-  const overview = useMemo(() => (indexes.length ? deriveOverview(indexes) : null), [indexes]);
-  const overviewLayout = useMemo(() => (overview ? layoutOverview(overview) : null), [overview]);
-  const processIndexById = useMemo(() => {
-    const map = new Map();
-    indexes.forEach((index, position) => map.set(index.process.name, position));
-    return map;
-  }, [indexes]);
-
-  const handleSelect = useCallback(
-    (pick) => {
-      if (!pick) {
-        setSelection(null);
-        return;
-      }
-      if (pick.type === "process") {
-        const index = indexes.find((entry) => entry.process.name === pick.process.name);
-        if (index) {
-          if (!preparedCache.current.has(pick.process.name)) {
-            preparedCache.current.set(pick.process.name, prepareProcess(index));
-          }
-          sceneRef.current?.openProcess(preparedCache.current.get(pick.process.name), processIndexById);
-        }
-      }
-      setSelection(pick);
-    },
-    [indexes, processIndexById],
-  );
-
-  // Keep the scene's callback pointing at the latest closure without tearing
-  // down and rebuilding the WebGL context on every render.
-  const handleSelectRef = useRef(handleSelect);
   useEffect(() => {
-    handleSelectRef.current = handleSelect;
-  }, [handleSelect]);
-
-  useEffect(() => {
-    if (!containerRef.current || sceneRef.current) return;
-    sceneRef.current = new SceneManager(containerRef.current, {
-      onSelect: (pick) => handleSelectRef.current(pick),
-      onPlanesChanged: setOpenPlanes,
-    });
-    setEdgeVisibility({ ...sceneRef.current.edgeVisibility });
+    let cancelled = false;
+    let timer = null;
+    const poll = () => {
+      wikiStatus()
+        .then((payload) => {
+          if (cancelled) return;
+          setWiki(payload);
+          setWikiError(null);
+          if (payload.indexing) timer = window.setTimeout(poll, 2000);
+        })
+        .catch((error) => {
+          if (!cancelled) setWikiError(error.message);
+        });
+    };
+    poll();
     return () => {
-      sceneRef.current?.dispose();
-      sceneRef.current = null;
+      cancelled = true;
+      if (timer) window.clearTimeout(timer);
     };
   }, []);
 
-  useEffect(() => {
-    if (!sceneRef.current || !overview || !overviewLayout) return;
-    sceneRef.current.setOverview(overview, overviewLayout);
-    setOpenPlanes([]);
-    setSelection(null);
-  }, [overview, overviewLayout]);
+  const graphStatus = useMemo(() => {
+    let message = "";
+    if (loadState.code === "scanning") message = t.scanning;
+    if (loadState.code === "loading") message = t.loading;
+    if (loadState.code === "empty") message = t.empty;
+    if (loadState.code === "api") message = format(t.apiError, { error: loadState.detail || "—" });
+    if (loadState.code === "load") {
+      message = format(t.loadError, { details: loadState.detail || "" });
+    }
+    if (loadState.code === "unsupported") message = t.unsupportedAll;
+    return { phase: loadState.phase, message };
+  }, [loadState, t]);
 
-  const selectedIndex = useMemo(() => {
-    if (!selection) return null;
-    const name = selection.processName || selection.process?.name;
-    return indexes.find((entry) => entry.process.name === name) || null;
-  }, [selection, indexes]);
+  const revealFunctions = useCallback((functionIds, edgeKeys = []) => {
+    if (!functionIds?.length) return;
+    setView("graph");
+    setRevealTarget({ functionIds, edgeKeys, nonce: Date.now() + Math.random() });
+  }, []);
+
+  const askFunction = useCallback(
+    (name) => {
+      setDraft(format(t.askFunction, { name }));
+      setView("chat");
+    },
+    [t.askFunction],
+  );
 
   return (
-    <div className="flex h-full w-full bg-paper">
-      <div className="relative min-w-0 flex-1">
-        <div ref={containerRef} className="absolute inset-0" />
-
-        <CanvasOverlay
-          status={status}
+    <div className="flex h-full w-full flex-col bg-paper">
+      <TopBar view={view} onChangeView={setView} />
+      <div className="relative min-h-0 flex-1 overflow-hidden">
+        <div
+          className={`absolute inset-0 flex transition-opacity duration-150 ${
+            view === "chat" ? "z-10 opacity-100" : "pointer-events-none z-0 opacity-0"
+          }`}
+        >
+          <ChatPanel
+            turns={askState.turns}
+            latestCompleted={askState.latestCompleted}
+            draft={draft}
+            onDraftChange={setDraft}
+            onAsk={askState.ask}
+            onStop={askState.stop}
+            isStreaming={askState.isStreaming}
+            wiki={wiki}
+            wikiError={wikiError}
+            onReveal={revealFunctions}
+            onShowGraph={() => setView("graph")}
+          />
+        </div>
+        <GraphView
+          active={view === "graph"}
+          status={graphStatus}
           runs={runs}
           selectedRuns={selectedRuns}
           onSelectRun={(processName, runId) =>
             setSelectedRuns((previous) => new Map(previous).set(processName, runId))
           }
-          openPlanes={openPlanes}
+          indexes={indexes}
           unsupported={unsupported}
-          onCollapseAll={() => {
-            sceneRef.current?.collapseAll();
-            setSelection(null);
-          }}
-          onFocusPlane={(processName) => sceneRef.current?.focusPlane(processName)}
-          onClosePlane={(processName) => sceneRef.current?.closeProcess(processName)}
-          onFrameOverview={() => sceneRef.current?.frameOverview()}
-          onResetView={() => sceneRef.current?.resetView()}
-          onResetLayout={() => sceneRef.current?.resetLayout()}
-          edgeVisibility={edgeVisibility}
-          onToggleEdge={(category, visible) => {
-            sceneRef.current?.setEdgeVisibility(category, visible);
-            setEdgeVisibility((previous) => ({ ...previous, [category]: visible }));
-          }}
-          hoverHighlight={hoverHighlight}
-          onToggleHoverHighlight={(enabled) => {
-            sceneRef.current?.setHoverHighlight(enabled);
-            setHoverHighlight(enabled);
-          }}
+          revealTarget={revealTarget}
+          onAskFunction={askFunction}
         />
       </div>
-
-      <Inspector
-        selection={selection}
-        index={selectedIndex}
-        runId={selectedIndex ? selectedRuns.get(selectedIndex.process.name) : null}
-      />
     </div>
   );
 }

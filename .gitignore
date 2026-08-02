@@ -27,3 +27,6 @@ pickle_data/
 # Local backups of replaced code
 backup/
 c-repo.zip
+
+# Embedding cache for the wiki agent - rebuilt on demand from graph.json
+.wiki_cache/

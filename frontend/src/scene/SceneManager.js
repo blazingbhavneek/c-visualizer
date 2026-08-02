@@ -50,6 +50,7 @@ const GROUND_NODE_FADE = 0.38;
 const GROUND_EDGE_FADE = 0.1;
 /** Everything not connected to the hovered node. */
 const HOVER_DIM = 0.12;
+const CITATION_DIM = 0.35; // CHAT ADDITION
 
 /**
  * Flat drawings arranged in 3D.
@@ -104,6 +105,8 @@ export default class SceneManager {
       [EDGE_CATEGORIES.PLANE_TO_PLANE]: true,
     };
     this.hoverHighlightEnabled = true;
+    this.answerIds = new Set(); // CHAT ADDITION — function ids, not node uids
+    this.answerEdgeKeys = new Set(); // CHAT ADDITION — `${srcFnId}->${dstFnId}`
 
     this.selected = null;
     this.hoveredNode = null;
@@ -408,6 +411,16 @@ export default class SceneManager {
     if (this.focusedPlane === processName) {
       this.focusedPlane = this.planes.size ? [...this.planes.keys()].pop() : null;
     }
+    // Closing the last plane puts us back on the overview. Without this,
+    // `activeCanvas` keeps naming a plane that no longer exists and the ground
+    // layer stays faded as though a process were still open.
+    if (this.planes.size === 0) {
+      this.activeCanvas = "overview";
+      // CHAT ADDITION — a citation highlight belongs to an open plane, so it
+      // must not outlive the last one and dim whatever is opened next.
+      this.answerIds = new Set();
+      this.answerEdgeKeys = new Set();
+    }
   }
 
   closeProcess(processName) {
@@ -421,6 +434,7 @@ export default class SceneManager {
   collapseAll() {
     for (const processName of [...this.planes.keys()]) this._removePlane(processName);
     this.focusedPlane = null;
+    this.activeCanvas = "overview";
     this._rebuildOverview();
     this.needsCrossPlaneRebuild = true;
     this.onPlanesChanged([]);
@@ -614,6 +628,13 @@ export default class SceneManager {
     this.stylingDirty = true;
   }
 
+  setHighlights({ answerIds, answerEdgeKeys } = {}) { // CHAT ADDITION
+    this.answerIds = answerIds instanceof Set ? answerIds : new Set(answerIds || []);
+    this.answerEdgeKeys =
+      answerEdgeKeys instanceof Set ? answerEdgeKeys : new Set(answerEdgeKeys || []);
+    this.stylingDirty = true;
+  }
+
   _layers() {
     const layers = [];
     if (this.overviewLayer) layers.push({ kind: "overview", layer: this.overviewLayer });
@@ -635,7 +656,7 @@ export default class SceneManager {
     const inProcessView = this.activeCanvas !== "overview";
     const hover = this.hoverHighlightEnabled ? this.hoveredNode : null;
 
-    for (const { kind, layer, plane } of this._layers()) {
+    for (const { kind, layer } of this._layers()) {
       const isGround = kind === "overview";
       let nodeFactor = 1;
       let edgeFactor = 1;
@@ -644,17 +665,28 @@ export default class SceneManager {
         // Edges fade harder than nodes: the long ground edges are the noise.
         nodeFactor = GROUND_NODE_FADE;
         edgeFactor = GROUND_EDGE_FADE;
-      } else if (!isGround && this.planes.size === 2 && plane.processName !== this.focusedPlane) {
-        nodeFactor = 0.5;
-        edgeFactor = 0.3;
       }
+      // Both open planes stay at full opacity. Fading the unfocused one made
+      // the two-plane view read as one plane plus a ghost, when comparing the
+      // two side by side is the whole point of opening a second.
 
       const hoverHere = hover && hover.layer === layer;
       const neighbours = hoverHere ? this._neighbourhood(layer, hover.nodeId) : null;
 
       for (const [id, node] of layer.registry.nodes) {
         const dimmed = neighbours && !neighbours.nodes.has(id);
-        setNodeOpacity(node, dimmed ? nodeFactor * HOVER_DIM : nodeFactor);
+        const currentFactor = dimmed ? nodeFactor * HOVER_DIM : nodeFactor;
+        setNodeOpacity(node, currentFactor);
+
+        // CHAT ADDITION — dim the functions that are not part of the answer.
+        // Planes only: the ground layer holds processes and daemon resources,
+        // which have no function id, so applying this there dims every ground
+        // node and leaves the overview permanently shaded once a citation has
+        // been revealed.
+        if (!isGround && this.answerIds.size) {
+          const fnId = node.kind === "unreached" ? node.data?.id : node.data?.fn?.id;
+          if (!this.answerIds.has(fnId)) setNodeOpacity(node, currentFactor * CITATION_DIM);
+        }
       }
 
       for (const edge of layer.registry.edges) {
