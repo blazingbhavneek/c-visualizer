@@ -1,5 +1,4 @@
 import math
-import os
 import re
 import sys
 from collections import defaultdict
@@ -17,17 +16,8 @@ import json
 import numpy as np
 
 from state.state import State
-from output_paths import results_root
 
 BLOCKS = r"\[([^\[\]]*)\]"
-
-
-def graph_output_name(name: str) -> str:
-    """Use the target API, not callback/macro display text, for file paths."""
-    target_name = name.split(" (macro expansion)-> ")[0].split(
-        " (accepts callback)-> "
-    )[0]
-    return re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", target_name).strip() or "graph"
 
 
 def process_first_block(first_block: str) -> tuple[str, int] | int | str:
@@ -213,7 +203,7 @@ def visualize_large_graph(
     }
 
     net.set_options(json.dumps(options))
-    destination = graph_output_name(destination_name)
+    destination = destination_name
 
     # ================================================================
     # Helpers
@@ -352,33 +342,18 @@ def visualize_large_graph(
     # ================================================================
     # Save
     # ================================================================
-    results_path = (
-        results_root()
-        / "graphs"
-        / State().get("PROJECT_NAME", default="DBG")
-        / destination
+    results_path = Path(
+        f"/home/seigyo/c_repo/c_repo/results/csv_results/graphs/"
+        f'{State().get("PROJECT_NAME", default="DBG")}/{destination_name}'
     )
     results_path.mkdir(parents=True, exist_ok=True)
-    # Write the legacy PyVis artifact without stealing focus by opening a
-    # browser tab for every traced target API.
-    net.write_html(
-        str(results_path / f"graph_{destination}.html"),
-        notebook=False,
-        open_browser=False,
-    )
+    net.show(str(results_path / f"graph_{destination_name}.html"), notebook=False)
     # return net
 
 
 def make_graph(
     paths: list[list[str]],
 ) -> None:  # adjacency list for the graph.. #adjacency list for the graph..
-    # The current frontend reads VisualizerCollector JSON snapshots, captured
-    # before this legacy renderer is called. Avoid this redundant renderer in
-    # normal runs; it has no bearing on analysis results and can stall a long
-    # all-process run on an artifact write. Existing artifacts are retained.
-    if os.environ.get("LEGACY_CALL_GRAPH_ARTIFACTS") != "1":
-        return
-
     # block_regex = r'\[([^\[\]]*)\]'
     adjacency_dict: dict[str, set[tuple[str, str, int]]] = defaultdict(
         set
@@ -396,7 +371,7 @@ def make_graph(
             )
             # if function_name==last_function: continue
             if node_number == len(path) - 1:
-                destination_name = graph_output_name(function_name)
+                destination_name = function_name
             first_block_result = process_first_block(first_block=first_block)
             second_block_result = process_second_block(second_block=second_block)
             if isinstance(
@@ -484,27 +459,19 @@ def make_graph(
     # print(mermaid_diag)
     # pprint(adjacency_dict)
     mermaid_diag = graph_to_mermaid(graph=adjacency_dict)
-    results_path = (
-        results_root()
-        / "graphs"
-        / State().get("PROJECT_NAME", default="DBG")
-        / graph_output_name(destination_name)
+    results_path = Path(
+        f"/home/seigyo/c_repo/c_repo/results/csv_results/graphs/{State().get('PROJECT_NAME',default='DBG')}/{destination_name}"
     )
     results_path.mkdir(parents=True, exist_ok=True)
-    output_name = graph_output_name(destination_name)
-    with open(results_path / f"graph_{output_name}.md", "w") as f:
+    with open(results_path / f"graph_{destination_name}.md", "w") as f:
         f.write(f"DIAGRAM FOR {destination_name}\n```mermaid\n{mermaid_diag}\n```")
 
     # print(mermaid_diag)
-    # The frontend consumes the JSON snapshot written by VisualizerCollector.
-    # Keep the small Mermaid artifact for backwards compatibility, but avoid
-    # generating a PyVis page after every API unless it is explicitly wanted.
-    if os.environ.get("LEGACY_PYVIS_GRAPHS") == "1":
-        visualize_large_graph(
-            adjacency_dict,
-            destination_name=destination_name,
-            funcs_to_files=function_to_file,
-        )
+    visualize_large_graph(
+        adjacency_dict,
+        destination_name=destination_name,
+        funcs_to_files=function_to_file,
+    )
     # html_path = results_path/f'graph_{destination_name}.html'
     # net.show(str(html_path),notebook=False)
 

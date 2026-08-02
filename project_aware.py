@@ -33,7 +33,7 @@ from rich.tree import Tree
 from tree_sitter import Language, Parser
 from tree_sitter_custom import language
 
-from call_graph.call_graph import ensure_call_graph, orchestrate
+from call_graph.call_graph import orchestrate
 from call_graph.data_classes import CallTreeNode, custom_tree
 from call_graph.gen_graph import make_graph
 from client.llm import OllamaClient
@@ -63,6 +63,7 @@ from models import (
 from output_paths import results_root
 from process_groups import (
     discover_processes,
+    load_project_state,
     validate_group_name,
     validate_processes,
     write_group_manifest,
@@ -72,7 +73,11 @@ from state.state import State
 from tools.tools import (
     set_tool_def,
 )  # will set the tools and their definition in the state.
-from visualizer_export import VisualizerCollector
+from visualizer_export import (
+    VisualizerCollector,
+    build_complete_call_graph,
+    build_complete_file_functions,
+)
 
 # set_tool_def()
 
@@ -660,9 +665,9 @@ def make_llm_calls_for_function(
             functions_identified[function].get("dependent_functions"),
         )
     )  # filtering out the dependent function based on what are in the project.
-    check_other_functions: bool = bool(
-        dependent_functions and dependent_functions[0] != function
-    )  # no dependent function is the normal case for most target APIs
+    check_other_functions: bool = (
+        True if dependent_functions[0] != function else False
+    )  # assuming that after filtering we are left only with one function
     dependent_function_indices = None
     dependent_function_get_upper = None
     if check_other_functions:
@@ -679,7 +684,9 @@ def make_llm_calls_for_function(
             dependent_function_get_upper,
         )
     # return None
-    stats_json_path = results_root() / "stats" / f"{STATE.get('PROJECT_NAME')}_STATS.json"
+    stats_json_path = Path(
+        f"/home/seigyo/c_repo/c_repo/results/csv_results/stats/{STATE.get('PROJECT_NAME')}_STATS.json"
+    )
     (stats_json_path.parent / "stats").mkdir(parents=True, exist_ok=True)
     # endregion
 
@@ -697,14 +704,6 @@ def make_llm_calls_for_function(
     def write_json_file(data):
         with open(stats_json_path, "w") as f:
             json.dump(data, f, ensure_ascii=False, indent=4)
-
-    def save_combined_record(model, argument_indices):
-        """Keep the legacy CSV and add the same evidence to the visualizer."""
-        model_data = model.model_dump(mode="json")
-        save_dict_csv(data_dict=model_data, save=True)
-        collector = STATE.get("VISUALIZER_COLLECTOR")
-        if collector is not None:
-            collector.record_combined(model_data, argument_indices)
 
     # region INTIALIZING THE FUNCTION_DICT
     FUNCTION_DICT: dict[str, any] = {
@@ -731,23 +730,6 @@ def make_llm_calls_for_function(
         PATH_TO_START_WITH = (
             int(list(FUNCTION_DICT[function]["Each_Path_Tokens"][-1].keys())[0]) + 1
         )
-
-    # A failure after token accounting but before CSV persistence must be
-    # retried. Reconcile the resume marker with the durable per-function rows.
-    csv_path = results_root() / f"{STATE.get('PROJECT_NAME')}.csv"
-    if csv_path.exists():
-        try:
-            persisted_paths = int(
-                (pd.read_csv(csv_path, keep_default_na=False)["function_name"] == function).sum()
-            )
-            recorded_paths = len(FUNCTION_DICT[function]["Each_Path_Tokens"])
-            if persisted_paths < recorded_paths:
-                PATH_TO_START_WITH = persisted_paths + 1
-                print(
-                    f"Retrying incomplete path {PATH_TO_START_WITH} for {function}"
-                )
-        except (KeyError, OSError, pd.errors.EmptyDataError):
-            pass
     print("Need to start with the path", PATH_TO_START_WITH)
     # endregion
 
@@ -776,7 +758,6 @@ def make_llm_calls_for_function(
         path[0][1] for path in possible_paths_data if path[0][1] is not None
     ]  # NONE WHEN NO DEPENDENT FUNCTION OTHER THEN ITSSELF.
     path_strs: list[list[str]] = [path[0][0] for path in possible_paths_data]
-    # print_or_return_possible_paths_trees(paths=path_strs) FOR JUST PRINTING ALL PATH TREES BEFOREHAND FOR OBSERVATION..
     collector = STATE.get("VISUALIZER_COLLECTOR")
     if collector is not None:
         collector.capture_call_graph(
@@ -785,6 +766,7 @@ def make_llm_calls_for_function(
             target_function=function,
             trace_paths=path_strs,
         )
+    # print_or_return_possible_paths_trees(paths=path_strs) FOR JUST PRINTING ALL PATH TREES BEFOREHAND FOR OBSERVATION..
     # endregion
 
     print("TOTAL PATHS FOR THIS FUNCTION: ", len(path_strs))
@@ -898,7 +880,7 @@ def make_llm_calls_for_function(
                         }
                     )
                     combined_model = Combined.model_validate(final_combined_data)
-                    save_combined_record(combined_model, list_indices)
+                    save_dict_csv(data_dict=combined_model.model_dump(), save=True)
                     write_json_file(data=FUNCTION_DICT)
                     answers[function].append(
                         (combined_model, Stats.model_validate(empty_stats))
@@ -978,7 +960,7 @@ def make_llm_calls_for_function(
                     }
                 )
                 write_json_file(data=FUNCTION_DICT)
-                save_combined_record(combined_model, dependent_function_indices)
+                save_dict_csv(data_dict=combined_model.model_dump(), save=True)
                 answers[function].append(
                     (combined_model, Stats.model_validate(empty_stats))
                 )
@@ -1044,7 +1026,7 @@ def make_llm_calls_for_function(
             console.print(final_combined_data)
             combined_model = Combined.model_validate(final_combined_data)
             # function_answer_csv.append(save_dict_csv(data_dict=combined_model.model_dump(),save=False))
-            save_combined_record(combined_model, dependent_function_indices)
+            save_dict_csv(data_dict=combined_model.model_dump(), save=True)
             answers[function].append((combined_model, stats))
             print(f"DONE WITH PATH {index}")
 
@@ -1106,7 +1088,7 @@ def make_llm_calls_for_function(
                         "Total_Input": FUNCTION_INPUT_TOKEN,
                     }
                 )
-                save_combined_record(combined_model, list_indices)
+                save_dict_csv(data_dict=combined_model.model_dump(), save=True)
                 # answers[function].append((combined_model,stats))
                 write_json_file(data=FUNCTION_DICT)
                 console.print(final_combined_data)
@@ -1155,7 +1137,7 @@ def make_llm_calls_for_function(
                     }
                 )
                 write_json_file(data=FUNCTION_DICT)
-                save_combined_record(combined_model, list_indices)
+                save_dict_csv(data_dict=combined_model.model_dump(), save=True)
                 # answers[function].append((combined_model,stats))
                 answers[function].append(
                     (combined_model, Stats.model_validate(empty_stats).model_dump())
@@ -1183,27 +1165,26 @@ def make_llm_calls_for_function(
                 }
             )
 
+            write_json_file(data=FUNCTION_DICT)
             # extracting data from ai_output.
             output_string = validated_model_dict.get("output", "")  # arg_num:value
             # print("The final output_string", output_string)
 
+            values_found: list[int | str | Literal["UNRESOLVED"]] = []
             call_number = validated_model_dict.get("call_number") or -1
-            if not get_upper:
-                # Return-value tracing reports an operation (READF/WRITEF),
-                # not `argument_index:value` pairs.
-                call_graph_data = {**call_graph_data, "type": output_string}
-                values_found: list[int | str | Literal["UNRESOLVED"]] = [
-                    "NO TARGET"
-                ]
-            else:
-                values_found = []
-                for elements in output_string.split(","):
-                    _, value = elements.split(":", maxsplit=1)
-                    value = value.strip('"')
-                    try:
-                        values_found.append(int(value))
-                    except ValueError:
-                        values_found.append(value)
+            splitted = output_string.split(",")
+            for elements in splitted:
+                first_one = elements.split(":")[0]
+                try:
+                    if '"' in elements.split(":")[1]:
+                        # string
+                        values_found.append(elements.split(":")[1].strip('"'))
+                    else:
+                        file_num = int(elements.split(":")[1].strip('"'))
+                        values_found.append(file_num)
+                except Exception as e:
+                    # values_found.append('UNRESOLVED')\
+                    values_found.append(elements.split(":")[1].strip('"'))
             launch = STATE.get("FUNCTION_TYPES").get(function).get("launch")
             final_combined_data = {
                 **call_graph_data,
@@ -1218,8 +1199,7 @@ def make_llm_calls_for_function(
             console.print(final_combined_data)
             combined_model = Combined.model_validate(final_combined_data)
             # function_answer_csv.append(save_dict_csv(data_dict=combined_model.model_dump(),save=False))
-            save_combined_record(combined_model, list_indices)
-            write_json_file(data=FUNCTION_DICT)
+            save_dict_csv(data_dict=combined_model.model_dump(), save=True)
             answers[function].append((combined_model, stats))
             print(f"DONE WITH PATH {index}")
 
@@ -1234,53 +1214,18 @@ def trace_variable(
     index_only: bool = False,
 ):
     STATE = State()
-    project_path = Path(project_path).resolve()
-    pickle_dir = Path(
-        os.environ.get(
-            "PROJECT_STRUCTURE_CACHE_ROOT",
-            Path(__file__).resolve().parent / "pickle_data/project_structures_pickle",
-        )
+    project_path = Path(project_path)
+    pickle_dir = (
+        Path(__file__).resolve().parent / "pickle_data/project_structures_pickle"
     )
     if not pickle_dir.exists():
         pickle_dir.mkdir(exist_ok=True, parents=True)
 
     project_structure_path = pickle_dir / f"{STATE.get('PROJECT_NAME')}.pkl"
     potential_main_files: list[str] | None = None
-    makefile_path = project_path / "Makefile"
-    makefile_fingerprint = {
-        "path": str(makefile_path.resolve()),
-        "mtime_ns": makefile_path.stat().st_mtime_ns,
-        "size": makefile_path.stat().st_size,
-    }
-
-    def source_mapping_fingerprint(mapping) -> dict[str, tuple[int, int]]:
-        return {
-            str(Path(path).resolve()): (Path(path).stat().st_mtime_ns, Path(path).stat().st_size)
-            for path in mapping.values()
-            if Path(path).exists()
-        }
-
-    cached_project = None
-    if project_structure_path.exists():
-        try:
-            with open(project_structure_path, "rb") as f:
-                candidate = pickle.load(f)
-            if (
-                isinstance(candidate, dict)
-                and candidate.get("version") == 3
-                and candidate.get("project_root") == str(project_path)
-                and candidate.get("makefile") == makefile_fingerprint
-                and all(Path(path).exists() for path in candidate.get("project_structure", {}).values())
-                and candidate.get("source_files")
-                == source_mapping_fingerprint(candidate.get("project_structure", {}))
-            ):
-                cached_project = candidate
-        except (OSError, pickle.PickleError, EOFError):
-            cached_project = None
-
-    if cached_project is None:
+    if not project_structure_path.exists():
         print(
-            "PROJECT STRUCTURE NEEDS TO BE RESOLVED OR REFRESHED. IT WILL TAKE TIME...."
+            "PROJECT STRUCTURE NEEDS TO BE RESOLVED. NO PICKLE FILE. IT WILL TAKE TIME...."
         )
         PROJECT_STRUCTURE, potential_main_files = return_project_mapping(
             show=False, project_path=project_path
@@ -1290,20 +1235,11 @@ def trace_variable(
         )
         STATE.set("PROJECT_STRUCTURE", PROJECT_STRUCTURE)
         with open(project_structure_path, "wb") as f:
-            pickle.dump(
-                {
-                    "version": 3,
-                    "project_root": str(project_path),
-                    "makefile": makefile_fingerprint,
-                    "project_structure": PROJECT_STRUCTURE,
-                    "potential_main_files": potential_main_files,
-                    "source_files": source_mapping_fingerprint(PROJECT_STRUCTURE),
-                },
-                f,
-            )
+            pickle.dump((PROJECT_STRUCTURE, potential_main_files), f)
     else:
-        PROJECT_STRUCTURE = cached_project["project_structure"]
-        potential_main_files = cached_project["potential_main_files"]
+        with open(project_structure_path, "rb") as f:
+            PROJECT_STRUCTURE, potential_main_files = pickle.load(f)  # already sored.
+
         STATE.set("PROJECT_STRUCTURE", PROJECT_STRUCTURE)
     print("THE MAIN FILES ARE: ", potential_main_files)
     # project_tree_path = pickle_dir/f'{STATE.get('PROJECT_NAME')}_tree.pkl'
@@ -1330,9 +1266,12 @@ def trace_variable(
     for files in PROJECT_STRUCTURE.keys():
         macros[files] = extract_all_macros(PROJECT_STRUCTURE[files])
         file_includes[files] = extract_includes(PROJECT_STRUCTURE[files])
+        if files.endswith(".h"):
+            continue
+
         file_path = PROJECT_STRUCTURE[files]
         functions = get_local_function_definitions(
-            code_bytes=trees[files][1], file_name=files
+            code_bytes=trees[files][1]
         )  # function_name:dict(info of this function.)
         # if files == 'dio000d.c':
         #     print('This is the files and functions for the dio000d.c',files,functions)
@@ -1351,33 +1290,26 @@ def trace_variable(
 
     STATE.set("FILE_INCLUDES", file_includes)
     STATE.set("MACROS", macros)
-    # This collector is intentionally separate from the legacy outputs.  It
-    # only receives copies of the call graph and Combined rows below.
-    STATE.set(
-        "VISUALIZER_COLLECTOR",
-        VisualizerCollector(
-            process_name=Path(project_path).name,
-            process_root=project_path,
-            project_structure=PROJECT_STRUCTURE,
-            file_functions=FILE_FUNCTIONS,
-            main_file_name=main_file_name,
-            library_functions=set((STATE.get("FUNCTION_MAP", {}) or {}).keys())
-            | set((STATE.get("FUNCTION_TYPES", {}) or {}).keys()),
-            run_id=STATE.get("TIME"),
-        ),
-    )
-    collector = STATE.get("VISUALIZER_COLLECTOR")
+    # STATE.set('TREES',trees)
 
-    # Build and persist the complete source graph before target-variable
-    # tracing.  A missing/unreachable configured API must never erase the code
-    # index or source evidence for the run.
-    graph, registry, _, _ = ensure_call_graph(
+    graph, registry, _, _ = build_complete_call_graph(
         project_structure=PROJECT_STRUCTURE,
         trees=trees,
         function_pointer_args=FUNCTION_POINTER_ARGS,
         file_functions=FILE_FUNCTIONS,
     )
+    collector = VisualizerCollector(
+        process_name=project_path.name,
+        process_root=project_path,
+        project_structure=PROJECT_STRUCTURE,
+        file_functions=build_complete_file_functions(trees, FILE_FUNCTIONS),
+        main_file_name=main_file_name,
+        library_functions=set((STATE.get("FUNCTION_MAP") or {}).keys())
+        | set((STATE.get("FUNCTION_TYPES") or {}).keys()),
+        run_id=STATE.get("TIME"),
+    )
     collector.capture_call_graph(graph=graph, registry=registry)
+    STATE.set("VISUALIZER_COLLECTOR", collector)
     graph_path = collector.write()
     STATE.set("VISUALIZER_GRAPH_PATH", graph_path)
     print(f"Complete source graph checkpoint written to {graph_path}")
@@ -1385,19 +1317,16 @@ def trace_variable(
     summary_config = summary_config or SummaryConfig.from_env()
     if summary_config.enabled:
         try:
-            summary_report = asyncio.run(
-                summarize_collector(collector, summary_config)
-            )
+            summary_report = asyncio.run(summarize_collector(collector, summary_config))
             print(f"Bottom-up function summaries: {summary_report}")
         except Exception as exc:
-            # Variable tracing and the already-persisted graph remain usable if
-            # an optional LLM/wiki service is unavailable or misconfigured.
             print(f"Function summarization unavailable: {exc}")
-            for function in collector.functions.values():
-                if not function.get("is_external") and not function.get("summary"):
-                    function["summary_error"] = str(exc)
+            for function_data in collector.functions.values():
+                if not function_data.get("is_external") and not function_data.get(
+                    "summary"
+                ):
+                    function_data["summary_error"] = str(exc)
             collector.write()
-    # STATE.set('TREES',trees)
 
     if index_only:
         return {}
@@ -1409,7 +1338,7 @@ def trace_variable(
         print(
             f"{BOLD}{RED}NO FUNCTIONS IDENTIFIED IN THE PROJECT {project_path.name}.{RESET}"
         )
-        return {}
+        return None
     console.print(
         "-" * 10, "DETECTED FUNCTIONS NEEDS TO BE TRACED AND THEIR ARG. NUMS.", "-" * 10
     )
@@ -1452,16 +1381,15 @@ def trace_variable(
 
     collector = STATE.get("VISUALIZER_COLLECTOR")
     if collector is not None:
-        restored = collector.rehydrate_interactions(
+        collector.rehydrate_interactions(
             results_root() / f"{STATE.get('PROJECT_NAME')}.csv",
             {
                 function_name: list(config.get("indices") or [])
                 for function_name, config in functions_identified.items()
             },
         )
-        if restored:
-            print(f"Restored {restored} visualizer interactions from trace checkpoints")
         graph_path = collector.write()
+        STATE.set("VISUALIZER_GRAPH_PATH", graph_path)
         print(f"Visualizer graph written to {graph_path}")
 
     return answers  # full answer plus+ stats
@@ -1570,6 +1498,15 @@ if __name__ == "__main__":
     argument_parser.add_argument("--summary-model")
     argument_parser.add_argument("--summary-base-url")
     argument_parser.add_argument(
+        "--llm-model",
+        help="Model name exposed by the OpenAI-compatible vLLM server.",
+    )
+    argument_parser.add_argument(
+        "--llm-base-url",
+        help="OpenAI-compatible vLLM base URL, including /v1.",
+    )
+    argument_parser.add_argument("--llm-api-key")
+    argument_parser.add_argument(
         "--wiki-url",
         help=(
             "Full llm-wiki ask URL, e.g. "
@@ -1588,6 +1525,12 @@ if __name__ == "__main__":
         help="Build the complete code graph (and optional summaries) without target-variable LLM tracing.",
     )
     command_args = argument_parser.parse_args()
+    if command_args.llm_model:
+        os.environ["TRACER_LLM_MODEL"] = command_args.llm_model
+    if command_args.llm_base_url:
+        os.environ["TRACER_LLM_BASE_URL"] = command_args.llm_base_url
+    if command_args.llm_api_key:
+        os.environ["TRACER_LLM_API_KEY"] = command_args.llm_api_key
     repo_root = Path(__file__).resolve().parent
     test_processes_root = repo_root / "test_scada" / "processes"
 
@@ -1678,7 +1621,7 @@ if __name__ == "__main__":
             print(f"RUNNING FOR PROJECT {project_path.name}")
             try:
                 set_tool_def()
-                STATE = load_files(json_dir=json_dir)
+                STATE = load_project_state(json_dir)
                 STATE.set("TIME", f"{datetime.now():%Y%m%d_%H%M%S}")
                 STATE.set("PROJECT_NAME", project_path.name)
                 summary = trace_variable(

@@ -3,12 +3,76 @@ import csv
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from call_graph.data_classes import CallSite, FunctionNode
-from visualizer_export import VisualizerCollector
+from state.state import State
+from visualizer_export import VisualizerCollector, build_complete_call_graph
 
 
 class VisualizerCollectorTests(unittest.TestCase):
+    def test_adapter_caches_the_original_builder_outputs_without_filtering(self):
+        main = FunctionNode("main", "main.c", "/project/main.c")
+        isolated = FunctionNode("isolated", "main.c", "/project/main.c")
+        registry = {node.unique_id: node for node in (main, isolated)}
+        graph = {main.unique_id: []}
+
+        class OriginalBuilder:
+            node_registry = registry
+            macros = {"CALL": ("target()", "/project/main.h", "CALL")}
+
+            def build(self):
+                return graph
+
+        state = State()
+        state.reset()
+        with patch(
+            "call_graph.call_graph.CallGraphBuilder", return_value=OriginalBuilder()
+        ), patch(
+            "call_graph.call_graph.build_call_trees", return_value={main.unique_id: object()}
+        ):
+            actual_graph, actual_registry, tree_objects, macros = build_complete_call_graph(
+                {"main.c": "/project/main.c"},
+                {},
+            )
+
+        self.assertIs(actual_graph, graph)
+        self.assertIs(actual_registry, registry)
+        self.assertIn(isolated.unique_id, actual_registry)
+        self.assertIn(main.unique_id, tree_objects)
+        self.assertIn("CALL", macros)
+        self.assertIs(state.get("CALL_GRAPH"), graph)
+        state.reset()
+
+    def test_uses_definition_index_when_original_node_has_no_source_range(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            header = root / "inline.h"
+            header.write_text(
+                "static inline int inline_value(void) { return 5; }\n",
+                encoding="latin-1",
+            )
+            node = FunctionNode("inline_value", "inline.h", str(header), is_static=True)
+            collector = VisualizerCollector(
+                process_name="process",
+                process_root=root,
+                project_structure={"inline.h": str(header)},
+                file_functions={
+                    "inline.h": {
+                        "inline_value": {"start_line": 1, "end_line": 1}
+                    }
+                },
+                main_file_name=None,
+                results_root=root / "results",
+            )
+
+            collector.capture_call_graph(graph={}, registry={node.unique_id: node})
+            exported = next(iter(collector.functions.values()))
+
+            self.assertEqual(exported["start_line"], 1)
+            self.assertEqual(exported["end_line"], 1)
+            self.assertIn("inline_value", exported["source"])
+
     def test_persists_isolated_functions_sources_and_idempotent_checkpoints(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir) / "process"

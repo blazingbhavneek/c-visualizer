@@ -69,63 +69,42 @@ class parseFiles:
     def extract_function_parts(
         self, source_code: str | bytes
     ) -> tuple[str, str, str] | None:
+        parser = Parser(Language(language()))
         if not isinstance(source_code, bytes):
+            # source_code = self.clean_if_else_if_determined(source_code=source_code.encode('utf-8')).encode('utf-8')
             source_code = source_code.encode("latin-1")
-        source = source_code.decode("latin-1", errors="replace")
-        opening_brace = -1
-        closing_brace = -1
-        depth = 0
-        quote = None
-        escaped = False
-        line_comment = False
-        block_comment = False
+            # source_code = source_code.encode('utf-8')
+        tree = parser.parse(source_code)
+        root = tree.root_node
 
-        # Each caller supplies exactly one function slice. Find its outer body
-        # without creating another native Tree-sitter parser in a worker.
-        for index, char in enumerate(source):
-            next_char = source[index + 1] if index + 1 < len(source) else ""
-            if line_comment:
-                if char == "\n":
-                    line_comment = False
-                continue
-            if block_comment:
-                if char == "*" and next_char == "/":
-                    block_comment = False
-                continue
-            if quote:
-                if escaped:
-                    escaped = False
-                elif char == "\\":
-                    escaped = True
-                elif char == quote:
-                    quote = None
-                continue
-            if char == "/" and next_char == "/":
-                line_comment = True
-                continue
-            if char == "/" and next_char == "*":
-                block_comment = True
-                continue
-            if char in ('"', "'"):
-                quote = char
-            elif char == "{":
-                if opening_brace == -1:
-                    opening_brace = index
-                depth += 1
-            elif char == "}" and opening_brace != -1:
-                depth -= 1
-                if depth == 0:
-                    closing_brace = index
-                    break
-
-        if opening_brace == -1 or closing_brace == -1:
+        def extract(node):
+            if node.type == "function_definition":
+                body_node = node.child_by_field_name("body")
+                header = (
+                    source_code[node.start_byte : body_node.start_byte]
+                    .decode("latin-1")
+                    .strip()
+                    + " {"
+                )
+                body = (
+                    source_code[body_node.start_byte + 1 : body_node.end_byte - 1]
+                    .decode("latin-1")
+                    .strip()
+                )
+                closing = "}"
+                return header, body, closing
+            for child in node.children:
+                result = extract(child)
+                if result:
+                    return result
             return None
 
-        header = self._format_code(source[:opening_brace].strip() + " {")
-        body = self._format_code(source[opening_brace + 1 : closing_brace].strip())
+        result = extract(node=root)
+        header = self._format_code(result[0])
+        body = self._format_code(result[1])
         # Re-indent body by one level (since it's inside the function)
         body = textwrap.indent(body, "    ")
-        return header, body, "}"
+        return header, body, result[2]
 
     # region processing the string..
     def process_first_block(self, first_block: str) -> tuple[str, int] | int | str:
@@ -249,16 +228,6 @@ class parseFiles:
             if second_block_result and file_name:
                 start_line = second_block_result[0]
                 end_line = second_block_result[1]
-
-                # The last node is the target API itself.  It has a source
-                # range like every other function, but there is no following
-                # call-site node from which to trim a caller context.  Older
-                # call-tree output happened not to expose this case; the full
-                # source registry now resolves the library stub as a terminal
-                # node, so skip it deliberately instead of indexing past the
-                # path boundary.
-                if index + 1 >= len(path):
-                    continue
 
                 next_node_first_block_result = self.process_first_block(
                     first_block=(self.process_whole_string(node_str=path[index + 1]))[0]

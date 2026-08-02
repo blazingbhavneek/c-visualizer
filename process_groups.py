@@ -31,6 +31,36 @@ _IGNORED_DISCOVERY_DIRS = {
 }
 
 
+def load_project_state(json_dir: Path):
+    """Load one process family's configuration without changing legacy loaders."""
+    import pickle
+
+    from state.state import State
+
+    json_dir = json_dir.expanduser().resolve()
+    state = State()
+    state.set(
+        "FUNCTION_TYPES",
+        json.loads((json_dir / "mpf_data.json").read_text(encoding="utf-8")),
+    )
+    state.set(
+        "FUNCTION_POINTER_ARGS",
+        json.loads(
+            (json_dir / "function_callback_info.json").read_text(encoding="utf-8")
+        ),
+    )
+    function_map_pickle = json_dir.parent / "pickle_data" / "function_map.pkl"
+    if function_map_pickle.is_file():
+        with function_map_pickle.open("rb") as handle:
+            function_map = pickle.load(handle)
+    else:
+        function_map = json.loads(
+            (json_dir / "combined_data.json").read_text(encoding="utf-8")
+        )
+    state.set("FUNCTION_MAP", function_map)
+    return state
+
+
 def discover_processes(folder: Path) -> list[Path]:
     """Return every process directory below *folder* in stable path order.
 

@@ -12,6 +12,8 @@ from ollama import Client
 from rich import print as rprint
 from rich.console import Console
 from rich.tree import Tree
+from tree_sitter import Language, Parser
+from tree_sitter_custom import language
 
 from call_graph.ai_fallback import fallbackAi
 from call_graph.data_classes import CallSite, CallTreeNode, FunctionNode
@@ -42,11 +44,15 @@ class CallGraphBuilder:
         file_functions: dict[str, dict[str, any]] | None = None,
     ):
         self.project_structure = project_structure
-        self.project_key_by_path = {
-            str(Path(path).resolve()): key for key, path in project_structure.items()
-        }
 
         self.fp_args_map = function_pointer_args if function_pointer_args else {}
+
+        try:
+            self.C_LANGUAGE = Language(language())
+        except Exception as e:
+            raise RuntimeError(f"Failed to load Tree-sitter C grammar: {e}")
+
+        self.parser = Parser(self.C_LANGUAGE)
 
         self.global_funcs: Dict[str, Tuple[str, Any]] = (
             {}
@@ -70,24 +76,36 @@ class CallGraphBuilder:
     def _get_expanded_macro_name(self, macro_name: str) -> Optional[str]:
         if macro_name not in self.macros:
             return None
+        #
+        # replacement= self.macros[macro_name]
         visited = set()
 
         current_name = macro_name
         while current_name in self.macros and current_name not in visited:
             visited.add(current_name)
             replacement = self.macros[current_name][0]
-            # Macro replacement text is not always valid standalone C. Parsing
-            # it with the native Tree-sitter binding can corrupt its state, so
-            # extract the first called identifier directly instead.
-            call_match = re.search(r"\b([A-Za-z_]\w*)\s*\(", replacement)
-            if call_match:
-                return call_match.group(1)
 
-            identifier_match = re.fullmatch(r"\s*([A-Za-z_]\w*)\s*", replacement)
-            if identifier_match:
-                current_name = identifier_match.group(1)
-                continue
-            break
+            try:
+                tree = self.parser.parse(replacement.encode("latin-1"))
+                root = tree.root_node
+
+                if root.type == "identifier":
+                    current_name = root.text.decode("latin-1")
+                    continue
+
+                stack = [root]
+                while stack:
+                    node = stack.pop()
+                    if node.type == "call_expression":
+                        func = node.child_by_field_name("function")
+                        if func and func.type == "identifier":
+                            return func.text.decode("latin-1")
+                    for child in reversed(node.children):
+                        stack.append(child)
+                break
+
+            except Exception:
+                break
 
         return None
 
@@ -130,42 +148,70 @@ class CallGraphBuilder:
                 continue
 
             try:
+                # source = filepath.read_bytes()
+                # tree = self.parser.parse(source)
+                # self.file_trees[filepath_str] = tree
                 if not filename in self.file_trees:
                     print("FILE NAME NOT IN FILE TREES..")
+                tree = self.file_trees[filename][0]
                 source = self.file_trees[filename][1]
-                source_text = source.decode("latin-1", errors="replace")
+                stack = [tree.root_node]
 
-                # libclang already supplies the exact definition ranges used by
-                # the source call walker. Do not create/traverse a second native
-                # Tree-sitter tree here: the local custom binding can crash while
-                # it is repeatedly initialized for every target API.
-                for name, function_info in (self.file_functions or {}).get(
-                    filename, {}
-                ).items():
-                    start_line = function_info.get("start_line", 0)
-                    end_line = function_info.get("end_line", start_line)
-                    definition = "\n".join(
-                        source_text.splitlines()[start_line - 1 : end_line]
-                    )
-                    declaration = definition.split("{", 1)[0]
-                    if re.search(r"\bstatic\b", declaration):
-                        self.static_funcs[str(filepath)][name] = function_info
-                    else:
-                        self.global_funcs[name] = (str(filepath), function_info)
+                while stack:
+                    node = stack.pop()
+                    if node.type == "function_definition":
+                        name = self._extract_function_name(node)
+                        if name:
+                            is_static = self._is_static_function(node)
+                            if is_static:
+                                self.static_funcs[str(filepath)][name] = node
+                            else:
+                                self.global_funcs[name] = (str(filepath), node)
 
-                if filepath.suffix == ".h":
-                    macro_pattern = re.compile(
-                        r"^\s*#\s*define\s+([A-Za-z_]\w*)(\s*\([^\n]*?\))?([^\n]*(?:\\\\\n[^\n]*)*)",
-                        re.MULTILINE,
-                    )
-                    for match in macro_pattern.finditer(source_text):
-                        macro_name, parameters, macro_value = match.groups()
-                        macro_signature = macro_name + (parameters or "")
-                        self.macros[macro_name] = (
-                            macro_value.replace("\\\n", "").strip(),
-                            str(filepath),
-                            macro_signature,
-                        )
+                    if filepath.suffix == ".h":
+                        # Check for macro definitions
+                        if node.type in ("preproc_def", "preproc_function_def"):
+                            name_node = node.child_by_field_name("name")
+                            value_node = node.child_by_field_name("value")
+
+                            if name_node:
+                                # 1. Determine the "to be expanded" string (the macro signature)
+                                if node.type == "preproc_function_def":
+                                    # For #define FUNC(a, b) ...
+                                    # We want the text from the start of 'name' to the end of 'parameters'
+                                    params_node = node.child_by_field_name("parameters")
+                                    start_byte = name_node.start_byte
+                                    end_byte = (
+                                        params_node.end_byte
+                                        if params_node
+                                        else name_node.end_byte
+                                    )
+                                    macro_signature = source[
+                                        start_byte:end_byte
+                                    ].decode("latin-1")
+                                else:
+                                    # Simple object-like macro
+                                    macro_signature = name_node.text.decode("latin-1")
+
+                                # 2. Extract the expansion value
+                                macro_value = (
+                                    value_node.text.decode("latin-1")
+                                    if value_node
+                                    else ""
+                                )
+
+                                # 3. Store in your dictionary
+                                # Format: { macro_name: (expansion, file_path, full_signature) }
+                                # Note: You might want the name as the key and the signature as the 3rd tuple element
+                                macro_name = name_node.text.decode("latin-1")
+                                self.macros[macro_name] = (
+                                    macro_value,
+                                    str(filepath),
+                                    macro_signature,
+                                )
+
+                    for child in reversed(node.children):
+                        stack.append(child)
 
             except Exception as e:
                 print(f"Warning: Failed to process {filepath}: {e}", file=sys.stderr)
@@ -178,10 +224,8 @@ class CallGraphBuilder:
         is_static: bool = False,
     ) -> FunctionNode:
         file_path_str = str(caller_file)
-        definition_file_path = file_path_str
-        def_file_name = self.project_key_by_path.get(
-            str(Path(file_path_str).resolve()), Path(file_path_str).name
-        )
+        file_name = Path(caller_file).name
+        def_file_name = file_name
 
         if not is_external:
             if (
@@ -189,38 +233,32 @@ class CallGraphBuilder:
                 and name in self.static_funcs[file_path_str]
             ):
                 is_static = True
-                definition_file_path = file_path_str
-                def_file_name = self.project_key_by_path.get(
-                    str(Path(file_path_str).resolve()), Path(file_path_str).name
-                )
+                def_file_name = file_name
             elif name in self.global_funcs:
                 is_static = False
-                definition_file_path = self.global_funcs[name][0]
-                def_file_name = self.project_key_by_path.get(
-                    str(Path(definition_file_path).resolve()),
-                    Path(definition_file_path).name,
-                )
+                def_file_name = Path(self.global_funcs[name][0]).name
             else:
                 is_external = True
 
         node = FunctionNode(
             name=name,
             file_name=def_file_name,
-            file_path=definition_file_path,
+            file_path=file_path_str,
             is_external=is_external,
             is_static=is_static,
         )
 
         # ✅ FIX: Use def_file_name (where the function is DEFINED),
         #         not file_name (where the function is CALLED FROM)
-        if (
-            def_file_name in self.file_functions
-            and name in self.file_functions[def_file_name]
-        ):
-            node.start_line = self.file_functions[def_file_name][name]["start_line"]
-            node.end_line = self.file_functions[def_file_name][name].get(
-                "end_line", -1
-            )
+        if def_file_name.endswith(".c"):
+            if (
+                def_file_name in self.file_functions
+                and name in self.file_functions[def_file_name]
+            ):
+                node.start_line = self.file_functions[def_file_name][name]["start_line"]
+                node.end_line = self.file_functions[def_file_name][name].get(
+                    "end_line", -1
+                )
 
         if node.unique_id not in self.node_registry:
             self.node_registry[node.unique_id] = node
@@ -370,147 +408,6 @@ class CallGraphBuilder:
             for child in reversed(node.children):
                 stack.append(child)
 
-    @staticmethod
-    def _call_arguments(source: str, opening_paren: int) -> str | None:
-        """Return the text inside a call's matching parentheses."""
-        depth = 0
-        quote = None
-        escaped = False
-        for index in range(opening_paren, len(source)):
-            char = source[index]
-            if quote:
-                if escaped:
-                    escaped = False
-                elif char == "\\":
-                    escaped = True
-                elif char == quote:
-                    quote = None
-                continue
-            if char in ('"', "'"):
-                quote = char
-            elif char == "(":
-                depth += 1
-            elif char == ")":
-                depth -= 1
-                if depth == 0:
-                    return source[opening_paren + 1 : index]
-        return None
-
-    @staticmethod
-    def _split_arguments(argument_text: str) -> list[str]:
-        """Split C call arguments while preserving nested expressions."""
-        arguments, start, depth = [], 0, 0
-        quote = None
-        escaped = False
-        for index, char in enumerate(argument_text):
-            if quote:
-                if escaped:
-                    escaped = False
-                elif char == "\\":
-                    escaped = True
-                elif char == quote:
-                    quote = None
-                continue
-            if char in ('"', "'"):
-                quote = char
-            elif char in "([{":
-                depth += 1
-            elif char in ")]}":
-                depth -= 1
-            elif char == "," and depth == 0:
-                arguments.append(argument_text[start:index].strip())
-                start = index + 1
-        arguments.append(argument_text[start:].strip())
-        return arguments
-
-    def _process_function_source(
-        self,
-        source_bytes: bytes,
-        caller_name: str,
-        caller_file: str,
-        is_static: bool,
-    ) -> None:
-        """Build call sites from a libclang-bounded function source slice.
-
-        The Tree-sitter binding is retained for preprocessing/definition
-        collection, but its node walker is avoided here: on some local builds
-        it segfaults while traversing a call expression.
-        """
-        caller_node = self._get_or_create_node(
-            caller_name, caller_file, is_static=is_static
-        )
-        file_name = Path(caller_file).name
-        function_info = (self.file_functions or {}).get(file_name, {}).get(caller_name)
-        if not function_info:
-            return
-
-        start_line = function_info.get("start_line")
-        end_line = function_info.get("end_line")
-        if not start_line or not end_line:
-            return
-
-        lines = source_bytes.decode("latin-1", errors="replace").splitlines(
-            keepends=True
-        )
-        function_source = "".join(lines[start_line - 1 : end_line])
-        opening_brace = function_source.find("{")
-        if opening_brace == -1:
-            return
-        body_source = function_source[opening_brace + 1 :]
-        body_start_line = start_line + function_source[: opening_brace + 1].count("\n")
-
-        # Preserve line positions while preventing call-like text in strings
-        # from being interpreted as a real call.
-        searchable_source = re.sub(
-            r'"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'',
-            lambda match: re.sub(r"[^\n]", " ", match.group(0)),
-            body_source,
-        )
-        call_pattern = re.compile(r"\b([A-Za-z_]\w*)\s*\(")
-        c_keywords = {"if", "for", "while", "switch", "return", "sizeof"}
-
-        for match in call_pattern.finditer(searchable_source):
-            callee_name = match.group(1)
-            if callee_name in c_keywords:
-                continue
-            line_number = body_start_line + body_source[: match.start()].count("\n")
-            prefix = searchable_source[max(0, match.start() - 2) : match.start()]
-            if prefix in {"->", "."}:
-                callee_node = FunctionNode(
-                    name="indirect_call", file_name="", is_external=True
-                )
-            else:
-                callee_node = self._resolve_callee(callee_name, caller_file)
-
-            call_site = CallSite(callee=callee_node, line_number=line_number)
-            self.graph[caller_node.unique_id].append(call_site)
-
-            callback_config = self.fp_args_map.get(callee_name, {})
-            callback_indices = callback_config.get("func_argument", [])
-            argument_text = self._call_arguments(body_source, match.end() - 1)
-            if not callback_indices or argument_text is None:
-                continue
-            arguments = self._split_arguments(argument_text)
-            for argument_index in callback_indices:
-                if argument_index > len(arguments):
-                    continue
-                argument = arguments[argument_index - 1].strip()
-                # The legacy walker intentionally did not follow &callback.
-                if argument.startswith("&"):
-                    continue
-                identifiers = re.findall(r"\b([A-Za-z_]\w*)\b", argument)
-                if not identifiers:
-                    continue
-                callback_name = identifiers[-1]
-                if callback_name in {"NULL", "void"}:
-                    continue
-                # Preserve the legacy duplicate branch for a bare callback.
-                callback_count = 2 if re.fullmatch(r"[A-Za-z_]\w*", argument) else 1
-                for _ in range(callback_count):
-                    call_site.callbacks.append(
-                        self._resolve_callee(callback_name, caller_file)
-                    )
-
     def build(self) -> Dict[str, List[CallSite]]:
         console.print("[bold yellow]BUILDING CALL_GRAPH[/bold yellow]")
         console.print(f"[yellow]PHASE 1:[/yellow] COLLECTING FUNCTION DEFINITIONS")
@@ -537,15 +434,15 @@ class CallGraphBuilder:
 
         console.print(f"[yellow]PHASE 2:[/yellow] RESOLVING CALL SITES")
         # print("Phase 2: Resolving call sites...", file=sys.stderr)
-        for filename, (tree, source_bytes) in self.file_trees.items():
+        for filename, (tree, bytes) in self.file_trees.items():
             filepath = str(self.project_structure[filename])
             if filepath in self.static_funcs:
                 for name, node in self.static_funcs[filepath].items():
-                    self._process_function_source(source_bytes, name, filepath, True)
+                    self._process_function_body(node, name, filepath, True)
 
             for name, (def_file, node) in self.global_funcs.items():
                 if def_file == filepath:
-                    self._process_function_source(source_bytes, name, def_file, False)
+                    self._process_function_body(node, name, def_file, False)
         console.print(f"[bold green]CALL GRAPH BUILT[/bold green]\n")
         return self.graph
 
@@ -630,9 +527,7 @@ def build_call_trees(
 
         return node
 
-    # Include isolated definitions as one-node trees.  They cannot appear below
-    # main, but they still belong to the complete source index/unreached shelf.
-    for func_id in registry:
+    for func_id in graph:
         if func_id not in trees:
             trees[func_id] = _build_recursive(func_id, set(), None)
 
@@ -718,43 +613,6 @@ def find_highest_parent_of_node(
     return highest_parent_keys
 
 
-def ensure_call_graph(
-    project_structure: dict[str, str],
-    trees: dict,
-    function_pointer_args: dict | None = None,
-    file_functions: dict[str, dict[str, Any]] | None = None,
-) -> tuple[
-    dict[str, list[CallSite]],
-    dict[str, FunctionNode],
-    dict[str, CallTreeNode],
-    dict[str, tuple[str, str, str]],
-]:
-    """Build/cache the complete graph independently of any target API path."""
-    state = State()
-    graph = state.get("CALL_GRAPH")
-    registry = state.get("FUNCTION_REGISTRY")
-    tree_objects = state.get("TREE_OBJECTS")
-    macros = state.get("BUILDER_MACROS")
-    if graph is not None and registry is not None and tree_objects is not None:
-        return graph, registry, tree_objects, macros or {}
-
-    builder = CallGraphBuilder(
-        project_structure=project_structure,
-        trees=trees,
-        function_pointer_args=function_pointer_args,
-        file_functions=file_functions,
-    )
-    graph = builder.build()
-    registry = builder.node_registry
-    tree_objects = build_call_trees(graph, registry)
-    macros = builder.macros
-    state.set("CALL_GRAPH", graph)
-    state.set("FUNCTION_REGISTRY", registry)
-    state.set("TREE_OBJECTS", tree_objects)
-    state.set("BUILDER_MACROS", macros)
-    return graph, registry, tree_objects, macros
-
-
 def orchestrate(
     project_strcuture: dict[str, str],
     trees: dict,
@@ -774,15 +632,25 @@ def orchestrate(
 
     # for call_grahp determined data.
     BLOCK_REGEX = r"\[([^\[\]]*)\]"
-    _, _, tree_objects, macro_data = ensure_call_graph(
-        project_structure=project_strcuture,
-        trees=trees,
-        function_pointer_args=function_pointer_args,
-        file_functions=file_functions,
-    )
-    if not macro_data:
-        print("NO MACROS EXTRACTED>>>>....")
-    print(len(macro_data))
+    tree_objects = State().get("TREE_OBJECTS", None)
+    macro_data = State().get("BUILDER_MACROS", None)
+    if tree_objects is None:
+        builder = CallGraphBuilder(
+            project_structure=project_strcuture,
+            trees=trees,
+            function_pointer_args=function_pointer_args,
+            file_functions=file_functions,
+        )
+        graph = builder.build()
+        # rprint(graph)
+        # sys.exit()
+        tree_objects = build_call_trees(graph, builder.node_registry)
+        State().set("TREE_OBJECTS", tree_objects)
+        if not builder.macros:
+            print("NO MACROS EXTRACTED>>>>....")
+        State().set("BUILDER_MACROS", builder.macros)
+        macro_data = builder.macros
+        print(len(builder.macros))
 
     paths_with_data: list[tuple[tuple[list[str], list[CallTreeNode] | None], dict]] = []
     main_key = f"[{main_file_name}]main"

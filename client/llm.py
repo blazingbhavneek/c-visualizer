@@ -27,6 +27,7 @@ RESET = "\033[0m"
 
 # error codes 0 for non-llm errors, -1 for llm errors.
 
+
 class OllamaClient:
 
     # later save to .env file
@@ -63,16 +64,23 @@ class OllamaClient:
         print(self.output_model)
         if not self.output_model:
             raise ValueError("OUTPUT MODEL NOT PROVIDED TO LLM CLASS.")
-        # vLLM exposes the OpenAI chat-completions API.  Keep the current
-        # machine's default, but allow the purchased work-PC setup to select
-        # Ollama without editing this file.
-        provider = str(
-            data.get("provider")
-            or os.environ.get("TRACER_LLM_PROVIDER", "openai")
-        ).lower()
-        self.openai_model = provider in {"openai", "vllm", "azure"}
+        # self.openai_model: bool = data.get('openai_model', None)
+
+        self.openai_model: bool = True
         self.num_ctx = data.get("num_ctx", 110000)
         if self.openai_model:
+            # self.client = (
+            #     AzureOpenAI(
+            #     api_key= 'sk-sXRoS3fmlU7bW797ulQysg',
+            #     api_version = "2025-04-01-preview",
+            #     azure_endpoint = "https://mesw-openai-api.azurewebsites.net/"
+            #     )
+            #         if not self.async_Openai else
+            #             AsyncOpenAI(
+            #             api_key='asdf',
+            #             base_url='http://10.160.152.38:8000/v1'
+            #             )
+            # )
             self.client = OpenAI(
                 api_key=data.get("api_key")
                 or os.environ.get("TRACER_LLM_API_KEY", "EMPTY"),
@@ -82,10 +90,8 @@ class OllamaClient:
                 ),
             )
         else:
-            self.client = Client(
-                host=data.get("host")
-                or os.environ.get("TRACER_OLLAMA_HOST", "http://127.0.0.1:11434")
-            )
+            # self.client = Client(host = data.get('host','http://10.160.144.101:51021'))
+            self.client = Client(host=data.get("host", "http://127.0.0.1:11434"))
             # self.c
             # print('')
 

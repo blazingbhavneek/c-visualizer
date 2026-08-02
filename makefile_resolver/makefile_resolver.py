@@ -48,6 +48,9 @@ class MakefileContext:
         # 1. Expand macro (e.g., $(HOME)/include -> /abs/path/include)
         # print('tag',tag,'raw_token ',raw_token)
         expanded = self.resolve_string(raw_token).replace("'", "").strip()
+        if is_lib:
+            expanded = str(Path(expanded).parent) + f"/{Path(expanded).stem}"
+            expanded = expanded.strip(".")
 
         if not expanded:
             return None
@@ -59,15 +62,9 @@ class MakefileContext:
         # 2. If it's absolute, Path handles it. If relative, join to root_dir.
         final_path = p if p.is_absolute() else (self.root_dir / p)
         resolved_path = final_path.resolve()
-        # 3. LIBS may contain a source file or a built library. Keep C/H files
-        # exact; for an archive/object scan its containing source directory.
-        if is_lib and resolved_path.suffix in [".a", ".so", ".lib", ".sl", ".o"]:
-            if resolved_path.exists():
-                resolved_path = resolved_path.parent
-            else:
-                legacy_source_dir = resolved_path.parent / resolved_path.stem
-                if legacy_source_dir.exists():
-                    resolved_path = legacy_source_dir
+        # 3. For LIBS: If it's a file (libapl.a), return the directory containing it
+        if is_lib and resolved_path.suffix in [".a", ".so", ".lib", ".sl", ".o", "."]:
+            resolved_path = resolved_path.parent
         if tag == "SRCS" and resolved_path.suffix != ".c":
             resolved_path = resolved_path.parent / f"{resolved_path.stem}.c"
 
@@ -140,7 +137,10 @@ class MakefileContext:
             return list(dict.fromkeys(results))  # Deduplicate
 
         return {
-            "HOME": None,
+            # "HOME": self._process_path("HOME", self.vars.get("HOME", "")),
+            "HOME": self._process_path(
+                self.vars.get("HOME", ""), "../.."
+            ),  # this is because in some makefiles the HOME is set to according to some other env that we don't have.
             "SRCS": resolve_tag_list(["SRCS"]),
             "INCLUDES": resolve_tag_list(["INCLUDE"], prefix_to_strip="-I"),
             "LIB_DIRS": resolve_tag_list(["LIBS"], is_lib=True),
@@ -152,6 +152,8 @@ class MakefileContext:
 def return_project_mapping(
     show: bool = False, project_path: Path | None = None
 ) -> tuple[dict[str, Path], list[str]]:  # mapping and potential main files names
+    os.environ["VERSION_MNG"] = "/home/seigyo/c_repo/c_repo/src"
+    os.environ["PROJECT"] = "/home/seigyo/c_repo/c_repo/src"
     print(project_path)
     # os.environ['HOMELIB'] = '/home/seigyo/c_repo/c_repo/src/src_analysis'
 
@@ -191,14 +193,13 @@ def return_project_mapping(
     #     os.environ['MODERNLIB']
     makefile_input = folder_path / "Makefile"
     # os.environ['ORDERLIB']
+    os.environ["HOME"] = "../.."
+    os.environ["MODERNLIB"] = str(makefile_input.parent.parent)  # /src
+    os.environ["HOMELIB"] = str(makefile_input.parent.parent)
+    os.environ["MODERN"] = str(makefile_input.parent.parent)
+    os.environ["ORDERLIB"] = str(makefile_input.parent.parent)
+
     ctx = MakefileContext(makefile_input)
-    # Supply legacy build-variable fallbacks only to this parser.  Mutating the
-    # process environment (especially HOME) made later runs machine-dependent.
-    legacy_source_root = "/home/seigyo/c_repo/c_repo/src"
-    ctx.vars.setdefault("VERSION_MNG", legacy_source_root)
-    ctx.vars.setdefault("PROJECT", legacy_source_root)
-    for name in ("MODERNLIB", "HOMELIB", "MODERN", "ORDERLIB"):
-        ctx.vars.setdefault(name, str(makefile_input.parent.parent))
 
     ctx.parse_file(makefile_input)
 

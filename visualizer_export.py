@@ -59,6 +59,65 @@ def _resource_kind(operation: str) -> str:
     return "daemon_resource"
 
 
+def build_complete_call_graph(
+    project_structure: dict[str, str],
+    trees: dict[str, Any],
+    function_pointer_args: dict[str, Any] | None = None,
+    file_functions: dict[str, dict[str, Any]] | None = None,
+) -> tuple[dict, dict, dict, dict]:
+    """Build the original analyzer graph once, before target-path filtering.
+
+    This adapter deliberately lives outside ``call_graph/call_graph.py`` so the
+    production call-graph implementation remains byte-for-byte identical to the
+    work baseline.  The original target tracer reuses the cached tree objects
+    and macros, while the visualizer receives the complete raw registry and all
+    call sites.
+    """
+    from call_graph.call_graph import CallGraphBuilder, build_call_trees
+    from state.state import State
+
+    state = State()
+    graph = state.get("CALL_GRAPH")
+    registry = state.get("FUNCTION_REGISTRY")
+    tree_objects = state.get("TREE_OBJECTS")
+    macros = state.get("BUILDER_MACROS")
+    if graph is not None and registry is not None and tree_objects is not None:
+        return graph, registry, tree_objects, macros or {}
+
+    builder = CallGraphBuilder(
+        project_structure=project_structure,
+        trees=trees,
+        function_pointer_args=function_pointer_args,
+        file_functions=file_functions,
+    )
+    graph = builder.build()
+    registry = builder.node_registry
+    tree_objects = build_call_trees(graph, registry)
+    macros = builder.macros
+    state.set("CALL_GRAPH", graph)
+    state.set("FUNCTION_REGISTRY", registry)
+    state.set("TREE_OBJECTS", tree_objects)
+    state.set("BUILDER_MACROS", macros)
+    return graph, registry, tree_objects, macros
+
+
+def build_complete_file_functions(
+    trees: dict[str, Any],
+    file_functions: dict[str, dict[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    """Add definition ranges for headers without altering legacy analyzer state."""
+    from helpers.extract_functions_from_c import get_local_function_definitions
+
+    complete = {name: dict(definitions) for name, definitions in file_functions.items()}
+    for file_name, (_, source_bytes) in trees.items():
+        if file_name not in complete:
+            complete[file_name] = get_local_function_definitions(
+                code_bytes=source_bytes,
+                file_name=file_name,
+            )
+    return complete
+
+
 class VisualizerCollector:
     """Collect one tracer run in memory and write one non-destructive snapshot."""
 
@@ -133,8 +192,7 @@ class VisualizerCollector:
         if getattr(node, "is_external", False):
             return None, None
         definition_path = self._definition_path(node)
-        start = int(getattr(node, "start_line", -1) or -1)
-        end = int(getattr(node, "end_line", -1) or -1)
+        start, end = self._definition_range(node)
         source_file = next(
             (item for item in self.source_files if item["path"] == str(Path(definition_path).resolve())),
             None,
@@ -145,6 +203,19 @@ class VisualizerCollector:
         source = "\n".join(lines[start - 1 : min(end, len(lines))])
         digest = hashlib.sha256(source.encode("latin-1", errors="replace")).hexdigest()
         return source, digest
+
+    def _definition_range(self, node: Any) -> tuple[int, int]:
+        start = int(getattr(node, "start_line", -1) or -1)
+        end = int(getattr(node, "end_line", -1) or -1)
+        if start >= 1 and end >= start:
+            return start, end
+        definition = self.file_functions.get(
+            getattr(node, "file_name", ""), {}
+        ).get(getattr(node, "name", ""), {})
+        return (
+            int(definition.get("start_line", -1) or -1),
+            int(definition.get("end_line", -1) or -1),
+        )
 
     def _definition_path(self, node: Any) -> str | None:
         """Prefer the definition file preserved by FunctionNode/file_functions."""
@@ -165,12 +236,13 @@ class VisualizerCollector:
             return _stable_id("external", name)
 
         definition_path = self._definition_path(node) or "unknown-source"
+        start, end = self._definition_range(node)
         return _stable_id(
             "function",
             definition_path,
             name,
-            getattr(node, "start_line", -1),
-            getattr(node, "end_line", -1),
+            start,
+            end,
         )
 
     def _add_function(self, node: Any) -> str:
@@ -182,6 +254,7 @@ class VisualizerCollector:
         definition_path = self._definition_path(node)
         is_external = bool(getattr(node, "is_external", False))
         is_library_api = name in self.library_functions
+        start, end = self._definition_range(node)
         source, source_sha256 = self._source_for_node(node)
         self.functions[function_id] = {
             "id": function_id,
@@ -189,8 +262,8 @@ class VisualizerCollector:
             "name": name,
             "file": definition_path,
             "file_name": getattr(node, "file_name", None),
-            "start_line": getattr(node, "start_line", -1),
-            "end_line": getattr(node, "end_line", -1),
+            "start_line": start,
+            "end_line": end,
             "is_external": is_external,
             "is_library_api": is_library_api,
             "is_static": bool(getattr(node, "is_static", False)),

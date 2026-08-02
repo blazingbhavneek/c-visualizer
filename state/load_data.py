@@ -22,14 +22,14 @@ def read_file(file_path: Path) -> any:
 
 
 def save_file(data: any, save_location: Path) -> None:
-    save_location.parent.mkdir(parents=True, exist_ok=True)
+    save_location.mkdir(parents=True, exist_ok=True)
 
     if save_location.suffix == ".json":
         with open(save_location, "w") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
     elif save_location.suffix == ".pkl":
         with open(save_location, "wb") as f:
-            pickle.dump(data, f)
+            pickle.dump(f)
     else:
         raise (f"Function not implement for extension {save_location.suffix}")
 
@@ -59,12 +59,12 @@ def load_pickle_files(json_dir: Path, pickle_dir: Path, state: State) -> None:
         state.set(name="FUNCTION_MAP", value=data)
 
 
-def load_files(json_dir: Path | None = None) -> State:
+def load_files() -> State:
     """
     Loads all the json and pickle files necessary and then set them in the state.
     """
-    json_dir = json_dir or Path(__file__).resolve().parent.parent / "json_data"
-    pickle_dir = json_dir.parent / "pickle_data"
+    json_dir = Path(__file__).resolve().parent.parent / "json_data"
+    pickle_dir = Path(__file__).resolve().parent.parent / "pickle_data"
     GLOBAL_STATE = State()
     load_json_files(json_dir=json_dir, state=GLOBAL_STATE)
     load_pickle_files(json_dir, pickle_dir=pickle_dir, state=GLOBAL_STATE)

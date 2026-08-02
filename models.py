@@ -98,7 +98,6 @@ class Combined(aiDetermined):
         "SEMAPHORE",
         "KILL",
         "FORKP",
-        "SIGNAL",
         "MESSAGE",
         "ENQFORK",
         "ENQSEM",
