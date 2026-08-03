@@ -1,5 +1,6 @@
 import * as THREE from "three";
 import { createDisc, createRing } from "./primitives.js";
+import { createResourceMark } from "./icons.js";
 import { createLabel } from "./labels.js";
 import { COLORS, SURFACE, processColor, resourceColor } from "./palette.js";
 import { EDGE_CATEGORIES, addEdge, createRegistry, localPosition, registerNode } from "./graphLayer.js";
@@ -34,7 +35,9 @@ export function buildOverviewLayer(overview, layout, { expandedProcesses = new S
     const color = resourceColor(resource.kind);
     const parts = [];
 
-    const disc = createDisc(RESOURCE_RADIUS, color, { opacity: resource.resolved ? 1 : 0.3 });
+    const disc = createResourceMark(resource.kind, RESOURCE_RADIUS, color, {
+      opacity: resource.resolved ? 1 : 0.3,
+    });
     disc.position.set(point.x, point.y, 0.5);
     disc.userData.pick = { type: "resource", resource };
     disc.userData.nodeId = resource.id;
@@ -123,7 +126,7 @@ export function buildOverviewLayer(overview, layout, { expandedProcesses = new S
   const bowCounters = new Map();
   for (const link of layout.links) {
     const processId = `process:${link.processName}`;
-    const resourceId = `resource:${link.resourceKey}`;
+    const resourceId = link.targetId || `resource:${link.resourceKey}`;
     const forward = link.direction !== "in";
 
     const pairKey = `${processId}|${resourceId}`;

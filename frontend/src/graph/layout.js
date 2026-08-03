@@ -98,6 +98,119 @@ export function layoutProcessTree(root, { entryFunctionId = null, portNames = nu
 }
 
 /**
+ * Layered layout for the DAG view.
+ *
+ * Every function is on the tier given by its longest path from the root, so all
+ * edges point one way. Within a tier the order is decided by the average
+ * position of a node's neighbours (a barycentre sweep, down then up, repeated):
+ * that is what pulls a heavily reused function underneath the callers that
+ * share it instead of leaving it wherever it was first met, and it is the
+ * difference between readable and a wall of crossing lines.
+ *
+ * Spacing uses the same measured footprints as the tree, so labels cannot
+ * collide here either, and no physics runs afterwards - reloading the same
+ * snapshot always gives the same drawing.
+ */
+export function layoutProcessDag(nodes, edges, { entryFunctionId = null, portNames = null } = {}) {
+  const widths = new Map();
+  for (const node of nodes) {
+    widths.set(node.uid, footprintWidth(node, { entryFunctionId, portNames }));
+  }
+
+  const tiers = [];
+  for (const node of nodes) {
+    if (!tiers[node.depth]) tiers[node.depth] = [];
+    tiers[node.depth].push(node);
+  }
+  for (let depth = 0; depth < tiers.length; depth += 1) {
+    if (!tiers[depth]) tiers[depth] = [];
+  }
+
+  const parents = new Map();
+  const children = new Map();
+  for (const edge of edges) {
+    // A back edge would drag its target down to its own tier; it is drawn, not
+    // used for placement.
+    if (edge.recursive) continue;
+    if (!children.has(edge.sourceUid)) children.set(edge.sourceUid, []);
+    children.get(edge.sourceUid).push(edge.targetUid);
+    if (!parents.has(edge.targetUid)) parents.set(edge.targetUid, []);
+    parents.get(edge.targetUid).push(edge.sourceUid);
+  }
+
+  const x = new Map();
+  const pack = (tier) => {
+    if (tier.length === 0) return;
+    const wanted = tier.map((node) => x.get(node.uid) ?? 0);
+    let cursor = 0;
+    tier.forEach((node, position) => {
+      if (position > 0) {
+        cursor +=
+          widths.get(tier[position - 1].uid) / 2 +
+          SIBLING_GAP +
+          widths.get(node.uid) / 2;
+      }
+      x.set(node.uid, cursor);
+    });
+    // Packing starts at zero, so slide the whole tier back to where its members
+    // wanted to be; otherwise every tier is left-aligned and the edges skew.
+    const wantedMean = wanted.reduce((sum, value) => sum + value, 0) / tier.length;
+    const packedMean =
+      tier.reduce((sum, node) => sum + x.get(node.uid), 0) / tier.length;
+    const shift = wantedMean - packedMean;
+    for (const node of tier) x.set(node.uid, x.get(node.uid) + shift);
+  };
+
+  const barycentre = (uid, neighbours) => {
+    const list = neighbours.get(uid) || [];
+    const known = list.map((other) => x.get(other)).filter((value) => value != null);
+    if (known.length === 0) return null;
+    return known.reduce((sum, value) => sum + value, 0) / known.length;
+  };
+
+  const orderTier = (tier, neighbours) => {
+    const keys = new Map();
+    tier.forEach((node, position) => {
+      keys.set(node.uid, barycentre(node.uid, neighbours) ?? x.get(node.uid) ?? position);
+    });
+    tier.sort((a, b) => keys.get(a.uid) - keys.get(b.uid));
+    for (const node of tier) x.set(node.uid, keys.get(node.uid));
+    pack(tier);
+  };
+
+  pack(tiers[0] || []);
+  for (let round = 0; round < 3; round += 1) {
+    for (let depth = 1; depth < tiers.length; depth += 1) orderTier(tiers[depth], parents);
+    for (let depth = tiers.length - 2; depth >= 0; depth -= 1) {
+      orderTier(tiers[depth], children);
+    }
+  }
+
+  // The plane is anchored at the root, exactly as in the tree layout.
+  const rootShift = tiers[0]?.[0] ? x.get(tiers[0][0].uid) : 0;
+  const positions = new Map();
+  let minX = Infinity;
+  let maxX = -Infinity;
+  for (const node of nodes) {
+    const px = (x.get(node.uid) ?? 0) - rootShift;
+    positions.set(node.uid, { x: px, y: node.depth * LEVEL_SEPARATION });
+    minX = Math.min(minX, px - widths.get(node.uid) / 2);
+    maxX = Math.max(maxX, px + widths.get(node.uid) / 2);
+  }
+
+  return {
+    positions,
+    widths,
+    bounds: {
+      minX: Number.isFinite(minX) ? minX : 0,
+      maxX: Number.isFinite(maxX) ? maxX : 0,
+      minY: 0,
+      maxY: Math.max(0, tiers.length - 1) * LEVEL_SEPARATION,
+    },
+  };
+}
+
+/**
  * Unreached functions: a quiet grid to the right of the tree, blocked by source
  * file. They have no edges, so this is about accounting for every function on
  * the plane without letting them compete with the tree.
@@ -176,7 +289,9 @@ export function layoutOverview(overview, { radius = 1500 } = {}) {
   const links = [];
   for (const edge of overview.edges) {
     const source = byId.get(`process:${edge.processName}`);
-    const target = byId.get(`resource:${edge.resourceKey}`);
+    // `targetId` is usually the resource, but an event addressed to another
+    // process points straight at that process node.
+    const target = byId.get(edge.targetId || `resource:${edge.resourceKey}`);
     if (!source || !target) continue;
     links.push({ ...edge, source, target });
   }

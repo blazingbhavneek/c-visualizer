@@ -12,6 +12,78 @@ from makefile_resolver.extract_includes import resolve
 
 console = Console()
 
+# Folders that hold headers for a whole package rather than for one process.
+_HEADER_DIR_NAMES = {
+    "include",
+    "includes",
+    "inc",
+    "header",
+    "headers",
+    "common",
+    "public",
+    "api",
+}
+_SKIP_DIR_NAMES = {
+    ".git",
+    ".hg",
+    ".svn",
+    ".venv",
+    "__pycache__",
+    "build",
+    "dist",
+    "node_modules",
+    "results",
+    "logs",
+    "pickle_data",
+}
+
+
+def discover_include_dirs(project_path: Path, levels: int = 2) -> list[Path]:
+    """Header folders beside or above a process that its Makefile never names.
+
+    A delivered package usually looks like ``pkg/{include,common}`` next to
+    ``pkg/g-svm/src``: the headers with all the answers are one or two levels
+    up, and the process Makefile either does not mention them or names them
+    through a variable that only exists on the build machine.  Those folders
+    are added to the ``#include`` *search path* only - never to the file list -
+    so a header still enters the project exactly when something includes it.
+    """
+
+    project_path = Path(project_path).expanduser().resolve()
+    found: list[Path] = []
+    base = project_path
+    for _ in range(max(0, levels)):
+        parent = base.parent
+        if parent == base:
+            break
+        try:
+            children = sorted(parent.iterdir())
+        except OSError:
+            break
+        for child in children:
+            if child == project_path or child.name.startswith("."):
+                continue
+            if child.name in _SKIP_DIR_NAMES:
+                continue
+            try:
+                if not child.is_dir():
+                    continue
+                if child.name.lower() in _HEADER_DIR_NAMES:
+                    found.append(child.resolve())
+                elif not (child / "Makefile").is_file() and next(
+                    child.glob("*.h"), None
+                ):
+                    # Loose headers in a sibling folder count, but a sibling
+                    # that builds something of its own is another process, not
+                    # a header pool.
+                    found.append(child.resolve())
+            except OSError:
+                # Unreadable neighbours (permissions, dead mounts) are simply
+                # not part of the search path.
+                continue
+        base = parent
+    return list(dict.fromkeys(found))
+
 
 class MakefileContext:
     def __init__(self, project_root_makefile: Union[str, Path]):
@@ -150,7 +222,10 @@ class MakefileContext:
 
 @time_it(message="")
 def return_project_mapping(
-    show: bool = False, project_path: Path | None = None
+    show: bool = False,
+    project_path: Path | None = None,
+    include_levels: int = 2,
+    extra_include_dirs: list[Path] | None = None,
 ) -> tuple[dict[str, Path], list[str]]:  # mapping and potential main files names
     os.environ["VERSION_MNG"] = "/home/seigyo/c_repo/c_repo/src"
     os.environ["PROJECT"] = "/home/seigyo/c_repo/c_repo/src"
@@ -235,8 +310,18 @@ def return_project_mapping(
                 elif p.is_file() and p != makefile_input.parent:
                     files[p.name] = p
     # console.print(files)
+    # Makefile -I dirs first, then whatever discovery found: a header named by
+    # the Makefile still wins when two folders hold the same file name.
+    search_dirs = [
+        *info.get("INCLUDES", []),
+        *(Path(p).expanduser().resolve() for p in (extra_include_dirs or [])),
+        *discover_include_dirs(folder_path, include_levels),
+    ]
+    search_dirs = list(dict.fromkeys(search_dirs))
+    if show:
+        console.print("INCLUDE SEARCH PATH", search_dirs)
     combined_dependency, file_wise_dependency = resolve(
-        files=files, include_dirs=info.get("INCLUDES", [])
+        files=files, include_dirs=search_dirs
     )
     if show:
         console.print(file_wise_dependency)

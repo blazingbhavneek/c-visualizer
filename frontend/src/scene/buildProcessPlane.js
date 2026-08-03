@@ -36,6 +36,7 @@ function labelLines(fn) {
  */
 export function buildProcessPlaneLayer({
   treeNodes,
+  edges,
   treeLayout,
   shelf,
   portNames,
@@ -173,18 +174,19 @@ export function buildProcessPlaneLayer({
   }
 
   // --- tree edges ----------------------------------------------------------
+  // One entry per drawn edge, so the tree (one parent per node) and the DAG
+  // (many callers per node) are built by the same loop.
   const bowCounters = new Map();
-  for (const node of treeNodes) {
-    if (!node.parent) continue;
-    if (!registry.nodes.has(node.uid) || !registry.nodes.has(node.parent.uid)) continue;
+  for (const edge of edges) {
+    if (!registry.nodes.has(edge.sourceUid) || !registry.nodes.has(edge.targetUid)) continue;
 
-    const pairKey = `${node.parent.uid}->${node.fn.id}`;
+    const pairKey = `${edge.sourceUid}->${edge.targetUid}`;
     const seen = bowCounters.get(pairKey) || 0;
     bowCounters.set(pairKey, seen + 1);
     // Alternating CW/CCW fan, as the reference artifact does for parallel calls.
     const bow = seen === 0 ? 0 : (seen % 2 === 1 ? 1 : -1) * Math.ceil(seen / 2) * 26;
 
-    const lineNumbers = (node.viaCalls || [])
+    const lineNumbers = (edge.viaCalls || [])
       .map((call) => call.line)
       .filter((value) => value != null);
     const shown =
@@ -193,13 +195,13 @@ export function buildProcessPlaneLayer({
         : lineNumbers.join(", ");
 
     addEdge(registry, group, {
-      id: `edge:${node.parent.uid}->${node.uid}`,
-      sourceId: node.parent.uid,
-      targetId: node.uid,
+      id: edge.id,
+      sourceId: edge.sourceUid,
+      targetId: edge.targetUid,
       category: EDGE_CATEGORIES.CALL,
       curveMode: "vertical",
-      color: node.recursive ? COLORS.recursive : COLORS.edge,
-      opacity: node.recursive ? 0.8 : 0.7,
+      color: edge.recursive ? COLORS.recursive : COLORS.edge,
+      opacity: edge.recursive ? 0.8 : 0.7,
       arrowSize: 11,
       arrowOpacity: 0.9,
       bow,
@@ -257,7 +259,8 @@ export function buildProcessPlaneLayer({
     const caption = createLabel(
       [
         "NOT REACHABLE FROM main",
-        `${coverage.unreached} of ${coverage.internal} internal functions · ${coverage.isolated} have no recorded call at all`,
+        `${coverage.unreached} of ${coverage.internal} internal functions · ${coverage.isolated} have no recorded call at all` +
+          (coverage.hidden > 0 ? ` · ${coverage.hidden} never-called hidden` : ""),
       ],
       { worldHeight: 24, fontSize: 14, color: COLORS.inkMuted, halo: COLORS.sheet },
     );

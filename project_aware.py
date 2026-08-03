@@ -1,5 +1,6 @@
 import asyncio
 import gc
+import hashlib
 import json
 import multiprocessing
 import os
@@ -60,7 +61,7 @@ from models import (
     outputModel,
     outputModelForReturn,
 )
-from output_paths import results_root
+from output_paths import logs_root, pickle_root, results_root, set_output_root
 from process_groups import (
     discover_processes,
     load_project_state,
@@ -627,7 +628,38 @@ def run_with_retry(func, args=(), timeout=180, retries=2):
     return None
 
 
-def make_llm_calls_for_function(
+def trace_concurrency() -> int:
+    """How many target paths may have an LLM call in flight at once."""
+    try:
+        return max(1, int(os.environ.get("TRACER_CONCURRENCY", "4")))
+    except ValueError:
+        return 4
+
+
+async def gather_paths(runner, contexts, completed_paths) -> None:
+    """Trace the outstanding paths of one function, N LLM calls in flight.
+
+    Only the LLM call itself awaits (it blocks inside a worker thread), so the
+    result writes that follow it - the stats JSON, the CSV row, the in-memory
+    answers - run to completion before another path can resume.  That is what
+    keeps those writes consistent without a lock.
+    """
+    semaphore = asyncio.Semaphore(trace_concurrency())
+
+    async def bounded(index, path, context):
+        async with semaphore:
+            return await runner(index, path, context)
+
+    await asyncio.gather(
+        *(
+            bounded(index, path, context)
+            for index, (path, context) in enumerate(contexts, start=1)
+            if index not in completed_paths
+        )
+    )
+
+
+async def make_llm_calls_for_function(
     function,
     trees: dict,
     functions_identified: dict[str, dict[str, any]],
@@ -665,8 +697,8 @@ def make_llm_calls_for_function(
             functions_identified[function].get("dependent_functions"),
         )
     )  # filtering out the dependent function based on what are in the project.
-    check_other_functions: bool = (
-        True if dependent_functions[0] != function else False
+    check_other_functions: bool = bool(dependent_functions) and (
+        dependent_functions[0] != function
     )  # assuming that after filtering we are left only with one function
     dependent_function_indices = None
     dependent_function_get_upper = None
@@ -684,10 +716,8 @@ def make_llm_calls_for_function(
             dependent_function_get_upper,
         )
     # return None
-    stats_json_path = Path(
-        f"/home/seigyo/c_repo/c_repo/results/csv_results/stats/{STATE.get('PROJECT_NAME')}_STATS.json"
-    )
-    (stats_json_path.parent / "stats").mkdir(parents=True, exist_ok=True)
+    stats_json_path = results_root() / "stats" / f"{STATE.get('PROJECT_NAME')}_STATS.json"
+    stats_json_path.parent.mkdir(parents=True, exist_ok=True)
     # endregion
 
     # region INTIALIZING EMPTY TOKEN VARIABLES
@@ -724,13 +754,15 @@ def make_llm_calls_for_function(
     # endregion
 
     # region FINDING OUT FROM WHICH PART WE NEED TO RESUME
-    if FUNCTION_DICT[function]["Each_Path_Tokens"] == []:
-        PATH_TO_START_WITH = 1
-    else:
-        PATH_TO_START_WITH = (
-            int(list(FUNCTION_DICT[function]["Each_Path_Tokens"][-1].keys())[0]) + 1
-        )
-    print("Need to start with the path", PATH_TO_START_WITH)
+    # A set, not a high-water mark: paths finish out of order once they are
+    # traced concurrently, so "everything below the last entry is done" is no
+    # longer true.  Old stats files, written in order, resume identically.
+    completed_paths = {
+        int(path_number)
+        for entry in FUNCTION_DICT[function]["Each_Path_Tokens"]
+        for path_number in entry
+    }
+    print("Already completed paths for this function:", len(completed_paths))
     # endregion
 
     # region MAKING CALL_GRAPH AND GETTING DATA
@@ -812,9 +844,8 @@ def make_llm_calls_for_function(
         )
         # endregion
 
-        for index, (path, context) in enumerate(contexts, start=1):
-            if index < PATH_TO_START_WITH:
-                continue
+        async def trace_one_path(index, path, context):
+            nonlocal FUNCTION_INPUT_TOKEN, FUNCTION_OUTPUT_TOKEN
             call_graph_data = call_graph_determined_datas[
                 index - 1
             ]  # data received for this path from call_graph
@@ -843,9 +874,10 @@ def make_llm_calls_for_function(
                 }
                 print(" STEP - 1 DETERMINING THE CALL_TYPE")
 
-                ans = run_with_retry(
+                ans = await asyncio.to_thread(
+                    run_with_retry,
                     llm_calls,
-                    args=(
+                    (
                         project_structure,
                         function,
                         list_indices,
@@ -886,7 +918,7 @@ def make_llm_calls_for_function(
                         (combined_model, Stats.model_validate(empty_stats))
                     )
                     print(f"DONE WITH PATH {index}")
-                    continue
+                    return
 
                 stats_dict1 = stats.model_dump()
                 FUNCTION_INPUT_TOKEN += stats_dict1.get("Tokens").get("Input_tokens")
@@ -924,9 +956,10 @@ def make_llm_calls_for_function(
             new_path_str = "->".join(
                 map(lambda x: re.sub(block_regex, "", x), new_path)
             )
-            ans = run_with_retry(
+            ans = await asyncio.to_thread(
+                run_with_retry,
                 llm_calls,
-                args=(
+                (
                     project_structure,
                     dependent_functions[0],
                     dependent_function_indices,
@@ -965,7 +998,7 @@ def make_llm_calls_for_function(
                     (combined_model, Stats.model_validate(empty_stats))
                 )
                 print(f"DONE WITH PATH {index}")
-                continue
+                return
 
             validated_model_dict = (
                 validated_model.model_dump()
@@ -1030,10 +1063,12 @@ def make_llm_calls_for_function(
             answers[function].append((combined_model, stats))
             print(f"DONE WITH PATH {index}")
 
+        await gather_paths(trace_one_path, contexts, completed_paths)
+
     else:
-        for index, (path, context) in enumerate(contexts, start=1):
-            if index < PATH_TO_START_WITH:
-                continue
+
+        async def trace_one_path(index, path, context):
+            nonlocal FUNCTION_INPUT_TOKEN, FUNCTION_OUTPUT_TOKEN
             call_graph_data = call_graph_determined_datas[
                 index - 1
             ]  # data received for this path from call_graph
@@ -1096,10 +1131,11 @@ def make_llm_calls_for_function(
                     (combined_model, Stats.model_validate(empty_stats))
                 )
                 print(f"DONE WITH PATH {index}")
-                continue
-            ans = run_with_retry(
+                return
+            ans = await asyncio.to_thread(
+                run_with_retry,
                 llm_calls,
-                args=(
+                (
                     project_structure,
                     function,
                     list_indices,
@@ -1143,7 +1179,7 @@ def make_llm_calls_for_function(
                     (combined_model, Stats.model_validate(empty_stats).model_dump())
                 )
                 print(f"DONE WITH PATH {index}")
-                continue
+                return
             # console.print(stats)
             validated_model_dict = (
                 validated_model.model_dump()
@@ -1203,6 +1239,8 @@ def make_llm_calls_for_function(
             answers[function].append((combined_model, stats))
             print(f"DONE WITH PATH {index}")
 
+        await gather_paths(trace_one_path, contexts, completed_paths)
+
     return function_answer_csv
 
 
@@ -1212,23 +1250,34 @@ def trace_variable(
     summary_config: SummaryConfig | None = None,
     *,
     index_only: bool = False,
+    include_levels: int = 2,
+    extra_include_dirs: list[Path] | None = None,
 ):
     STATE = State()
     project_path = Path(project_path)
-    pickle_dir = (
-        Path(__file__).resolve().parent / "pickle_data/project_structures_pickle"
-    )
+    pickle_dir = pickle_root() / "project_structures_pickle"
     if not pickle_dir.exists():
         pickle_dir.mkdir(exist_ok=True, parents=True)
 
-    project_structure_path = pickle_dir / f"{STATE.get('PROJECT_NAME')}.pkl"
+    # The include search path decides which headers are in the project at all,
+    # so a cached structure resolved under different options must not be reused.
+    include_key = hashlib.sha1(
+        json.dumps(
+            [include_levels, [str(p) for p in (extra_include_dirs or [])]],
+            sort_keys=True,
+        ).encode("utf-8")
+    ).hexdigest()[:8]
+    project_structure_path = pickle_dir / f"{STATE.get('PROJECT_NAME')}.{include_key}.pkl"
     potential_main_files: list[str] | None = None
     if not project_structure_path.exists():
         print(
             "PROJECT STRUCTURE NEEDS TO BE RESOLVED. NO PICKLE FILE. IT WILL TAKE TIME...."
         )
         PROJECT_STRUCTURE, potential_main_files = return_project_mapping(
-            show=False, project_path=project_path
+            show=False,
+            project_path=project_path,
+            include_levels=include_levels,
+            extra_include_dirs=extra_include_dirs,
         )
         PROJECT_STRUCTURE = dict(
             sorted(PROJECT_STRUCTURE.items(), key=lambda x: str(x[0]))
@@ -1338,7 +1387,7 @@ def trace_variable(
         print(
             f"{BOLD}{RED}NO FUNCTIONS IDENTIFIED IN THE PROJECT {project_path.name}.{RESET}"
         )
-        return None
+        return {}  # same "nothing to trace" answer shape as an --index-only run
     console.print(
         "-" * 10, "DETECTED FUNCTIONS NEEDS TO BE TRACED AND THEIR ARG. NUMS.", "-" * 10
     )
@@ -1362,16 +1411,21 @@ def trace_variable(
         # if function != 'mpf_mfs_open':continue
         # if project_path.name == 'dio120d' : continue
         STATE.set("CURRENT_PROCESSED_FUNCTION", function)
-        function_dataframes: list | None = make_llm_calls_for_function(
-            function=function,
-            trees=trees,
-            functions_identified=functions_identified,
-            answers=answers,  # will be modified in place
-            main_file_name=main_file_name,
-            function_pointer_args=FUNCTION_POINTER_ARGS,  # TODO: need the same for these or make a state class holding these vars together.
-            file_functions=FILE_FUNCTIONS,
-            project_structure=PROJECT_STRUCTURE,
-            project_path=project_path,
+        # One event loop per function: its paths run concurrently, the functions
+        # themselves stay sequential because each one's call-graph and parsing
+        # work is CPU-bound and would otherwise block that loop.
+        function_dataframes: list | None = asyncio.run(
+            make_llm_calls_for_function(
+                function=function,
+                trees=trees,
+                functions_identified=functions_identified,
+                answers=answers,  # will be modified in place
+                main_file_name=main_file_name,
+                function_pointer_args=FUNCTION_POINTER_ARGS,  # TODO: need the same for these or make a state class holding these vars together.
+                file_functions=FILE_FUNCTIONS,
+                project_structure=PROJECT_STRUCTURE,
+                project_path=project_path,
+            )
         )
         if function_dataframes is not None:
             data_csvs = [*data_csvs, *function_dataframes]
@@ -1417,13 +1471,9 @@ if __name__ == "__main__":
     # endregion
 
     summaries = []
-    # parent_folder = 'results/detailed_tool_description_changed_prompt'
-    parent_folder = "logs/after_tool_modification"
     # functions_to_trace = functions_to_trace()
     from pathlib import Path
 
-    folder = Path(__file__).resolve().parent / f"{parent_folder}"
-    folder.mkdir(parents=True, exist_ok=True)
     apl_path = "/home/seigyo/c_repo/c_repo/src/src_analysis/src"
     rbt_path = "/home/seigyo/c_repo/c_repo/src/src_rbt/src"
     src_wh = "/home/seigyo/c_repo/c_repo/src/src_wh/wh-dio/src"
@@ -1524,7 +1574,51 @@ if __name__ == "__main__":
         action="store_true",
         help="Build the complete code graph (and optional summaries) without target-variable LLM tracing.",
     )
+    argument_parser.add_argument(
+        "--output-root",
+        type=Path,
+        help=(
+            "Folder that receives this run's results/, pickle_data/ and logs/. "
+            "Give one per project to analyze several projects side by side; "
+            "without it the repository's own results folder is used."
+        ),
+    )
+    argument_parser.add_argument(
+        "--targets",
+        type=Path,
+        help=(
+            "Targets JSON to trace (defaults to <json_data>/mpf_data.json). "
+            "Point it at an updated file to add tracked arguments to a project "
+            "that has already been run: finished paths are skipped and the new "
+            "results are appended to the same CSV."
+        ),
+    )
+    argument_parser.add_argument(
+        "--include-levels",
+        type=int,
+        default=2,
+        help=(
+            "How many folder levels above a process to search for header "
+            "folders the Makefile does not name (0 disables discovery)."
+        ),
+    )
+    argument_parser.add_argument(
+        "--include-dir",
+        type=Path,
+        action="append",
+        dest="include_dirs",
+        help="Extra header search folder; repeatable.",
+    )
+    argument_parser.add_argument(
+        "--trace-concurrency",
+        type=int,
+        help="Target paths traced at the same time (default 4).",
+    )
     command_args = argument_parser.parse_args()
+    if command_args.output_root:
+        set_output_root(command_args.output_root)
+    if command_args.trace_concurrency:
+        os.environ["TRACER_CONCURRENCY"] = str(max(1, command_args.trace_concurrency))
     if command_args.llm_model:
         os.environ["TRACER_LLM_MODEL"] = command_args.llm_model
     if command_args.llm_base_url:
@@ -1621,13 +1715,15 @@ if __name__ == "__main__":
             print(f"RUNNING FOR PROJECT {project_path.name}")
             try:
                 set_tool_def()
-                STATE = load_project_state(json_dir)
+                STATE = load_project_state(json_dir, command_args.targets)
                 STATE.set("TIME", f"{datetime.now():%Y%m%d_%H%M%S}")
                 STATE.set("PROJECT_NAME", project_path.name)
                 summary = trace_variable(
                     project_path=project_path,
                     summary_config=summary_config,
                     index_only=command_args.index_only,
+                    include_levels=command_args.include_levels,
+                    extra_include_dirs=command_args.include_dirs,
                 )
                 console.print(summary)
                 graph_path = STATE.get("VISUALIZER_GRAPH_PATH")
@@ -1716,7 +1812,8 @@ if __name__ == "__main__":
 
         set_tool_def()
         STATE = load_files()
-        parent_folder = "/home/seigyo/c_repo/c_repo/logs"
+        parent_folder = logs_root()
+        parent_folder.mkdir(parents=True, exist_ok=True)
         datetime_for_name = f"{datetime.now():%Y%m%d_%H%M%S}"
         STATE.set("TIME", datetime_for_name)
         logfile = f"{parent_folder}/{project}_{datetime_for_name}.txt"

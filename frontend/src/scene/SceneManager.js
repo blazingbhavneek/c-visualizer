@@ -33,8 +33,16 @@ const LABEL_DISTANCE = 950;
  * Call trees are laid out at their natural size (2000-3900 units wide), which
  * is as large as the entire ground overview. Planes are scaled to this width so
  * a raised tree stays proportionate to the plane it grows from.
+ *
+ * A fixed target crushed a big process: a 20k-wide tree came back at 12% and
+ * every label was a smear. The target therefore grows with the node count -
+ * slower than the tree does, so the plane stays a plane rather than tracking
+ * the layout one-to-one - up to a ceiling the camera can still frame.
  */
 const PLANE_TARGET_WIDTH = 2400;
+const MAX_PLANE_WIDTH = 12000;
+/** Node count the base target width was chosen for. */
+const PLANE_REFERENCE_NODES = 130;
 /**
  * Fraction of the remaining distance to the cursor a dragged node covers each
  * frame. Following the pointer exactly reproduces every tremor in the hand and
@@ -69,7 +77,9 @@ export default class SceneManager {
 
     this.scene = new THREE.Scene();
     this.scene.background = new THREE.Color(SURFACE);
-    this.scene.fog = new THREE.Fog(SURFACE, 4200, 13000);
+    // Reaches far enough that a plane scaled up to MAX_PLANE_WIDTH is still
+    // visible from the distance it takes to frame it.
+    this.scene.fog = new THREE.Fog(SURFACE, 9000, 42000);
 
     this.camera = new THREE.PerspectiveCamera(52, 1, 1, 40000);
     this.camera.position.set(0, 2600, 2600);
@@ -81,7 +91,7 @@ export default class SceneManager {
 
     this.controls = new CanvasControls(this.camera, this.renderer.domElement);
     this.controls.minDistance = 60;
-    this.controls.maxDistance = 22000;
+    this.controls.maxDistance = 60000;
 
     this.raycaster = new THREE.Raycaster();
     this.pointer = new THREE.Vector2();
@@ -254,6 +264,7 @@ export default class SceneManager {
     const tint = processColor(processIndexById.get(processName) ?? 0);
     const layer = buildProcessPlaneLayer({
       treeNodes: prepared.treeNodes,
+      edges: prepared.edges,
       treeLayout: prepared.treeLayout,
       shelf: prepared.shelf,
       portNames: prepared.portNames,
@@ -264,7 +275,12 @@ export default class SceneManager {
     });
 
     const width = Math.max(1, layer.bounds.maxX - layer.bounds.minX);
-    layer.group.scale.setScalar(Math.min(1, PLANE_TARGET_WIDTH / width));
+    const targetWidth = Math.min(
+      MAX_PLANE_WIDTH,
+      PLANE_TARGET_WIDTH *
+        Math.max(1, Math.sqrt((prepared.treeNodes.length || 1) / PLANE_REFERENCE_NODES)),
+    );
+    layer.group.scale.setScalar(Math.min(1, targetWidth / width));
     layer.group.position.copy(this._processAnchor(processName));
     layer.group.quaternion.copy(SceneManager._quaternionFor(this._viewOrientation()));
 
@@ -511,7 +527,12 @@ export default class SceneManager {
     if (this.edgeVisibility[EDGE_CATEGORIES.INTERACTION] !== false) {
       for (const plane of this.planes.values()) {
         for (const attachment of plane.prepared.attachments) {
-          const target = this._overviewNodeWorld(`resource:${attachment.resourceKey}`);
+          // A resource that turned out to name another process is drawn as a
+          // link to that process node, not to a resource of its own.
+          const targetId =
+            this.overview?.resourceAlias?.get(attachment.resourceKey) ||
+            `resource:${attachment.resourceKey}`;
+          const target = this._overviewNodeWorld(targetId);
           if (!target) continue;
           for (const origin of this._portWorldPositions(plane, attachment)) {
             const forward = attachment.direction !== "in";

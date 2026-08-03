@@ -15,7 +15,9 @@ An index-only run does not call the legacy target-variable LLM:
 ```
 
 The snapshot is written under
-`results/csv_results/visualizer/<process>/runs/<timestamp>/graph.json`. It
+`results/csv_results/visualizer/<process>/runs/<timestamp>/graph.json`, or under
+`<--output-root>/results/...` when that flag is given — see `usage.md` for the
+per-project output folder, header discovery, concurrency and `--targets`. It
 contains every resolved source/Makefile input, exact function source slices,
 all static call edges, the `main` entry ID, and functions that are not reachable
 from `main`. The frontend renders the latter on its unreached shelf.
@@ -99,6 +101,22 @@ Equivalent environment variables are:
 Summaries are content-addressed and reused from
 `visualizer/<process>/function-summary-cache.json`. Set
 `FUNCTION_SUMMARY_CACHE=0` to force regeneration.
+
+Summaries can also be produced after the fact, from finished results alone:
+
+```bash
+.venv/bin/python summarize_run.py \
+  --results-root /path/to/results/csv_results \
+  --summary-model your-model \
+  --summary-base-url http://llm-host:port/v1 \
+  --wiki-url http://llm-wiki-host:8000/llm-wiki/moove/api/ask
+```
+
+A snapshot embeds every function's source, so this needs neither the project
+structure pickle nor the original source tree. Only functions with an empty
+`summary` are sent to the model, and each snapshot is rewritten in place with
+its run id unchanged. `--process`, `--run`, `--all-runs` and `--graph` narrow
+the selection; `--redo-all` regenerates summaries that already exist.
 
 The bundled server in `../llm-wiki-dist/llm-wiki-dist` selects its database in
 the URL. With its documented defaults, the full endpoint is

@@ -43,6 +43,10 @@ class SummaryConfig:
     max_source_chars: int = 30_000
     max_dependency_chars: int = 24_000
     use_cache: bool = True
+    # Re-running summaries over finished results should only fill the gaps, even
+    # when the fingerprint cache is gone. Off during a normal run, where the
+    # cache decides what to reuse.
+    only_missing: bool = False
 
     @classmethod
     def from_env(cls) -> "SummaryConfig":
@@ -487,6 +491,9 @@ Write one compact paragraph covering purpose, inputs/outputs, key state or side 
         function = self.functions[function_id]
         fingerprint = self._fingerprint(function_id, recursive_group)
         self.fingerprints[function_id] = fingerprint
+        if self.config.only_missing and (function.get("summary") or "").strip():
+            function.setdefault("summary_status", "ready")
+            return "cached"
         cached = self.cache.get("entries", {}).get(function_id, {})
         if cached.get("fingerprint") == fingerprint and cached.get("summary"):
             function.update(

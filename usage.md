@@ -92,10 +92,79 @@ A process is discovered when its directory contains a `Makefile`.
 - Set `FUNCTION_SUMMARY_CACHE=0` to force summary regeneration.
 - Set `VISUALIZER_RESULTS_ROOT=/path/to/results` to change the output folder.
 
-## 4. Open a result
+### Output folder per project
+
+```bash
+--output-root /work/g-svm
+```
+
+Everything that run writes goes below it — `results/csv_results/`,
+`pickle_data/`, `logs/` — so two projects can be analyzed at the same time
+without sharing a CSV or a snapshot folder. Without the flag the repository's
+own `results/` is used, as before.
+
+### Headers the Makefile does not name
+
+Discovery looks for header folders (`include`, `inc`, `common`, `headers`, …,
+or any folder with loose `.h` files and no Makefile of its own) up to two
+levels above the process:
+
+```bash
+--include-levels 3          # search further up (0 = Makefile -I only)
+--include-dir /work/shared-headers   # repeatable, searched first
+```
+
+They join the `#include` search path only; a header still enters the project
+when something actually includes it.
+
+### Concurrency
+
+```bash
+--trace-concurrency 8       # target paths traced at once (default 4)
+```
+
+Each one runs the LLM call in its own worker process, so raise it with the
+memory on the machine in mind. Finished paths are recorded per path, so an
+interrupted run resumes exactly where it stopped.
+
+### Adding targets to a project already run
+
+```bash
+--targets /work/g-svm/targets-v2.json
+```
+
+Paths already traced are skipped and the new ones are appended to the same CSV;
+the snapshot that comes out contains both the old and the new results.
+
+## 4. Summaries on their own
+
+Fill in the function summaries of results that already exist — no re-parse, no
+source tree needed, only the results folder:
+
+```bash
+.venv/bin/python summarize_run.py \
+  --results-root /work/g-svm/results/csv_results \
+  --summary-model "$MODEL_NAME" --summary-base-url "$MODEL_BASE_URL" \
+  --wiki-url "$WIKI_URL"
+```
+
+Only functions whose summary is still empty are sent to the model, and each
+snapshot is rewritten in place, keeping its run id. Add `--process NAME`,
+`--run RUN_ID`, `--all-runs` or `--graph path/to/graph.json` to narrow it, and
+`--redo-all` to regenerate summaries that already exist.
+
+## 5. Open a result
 
 ```bash
 .venv/bin/python frontend/server.py --group all-processes
 ```
 
-Open `http://127.0.0.1:8765`.
+For a project with its own `--output-root`:
+
+```bash
+.venv/bin/python frontend/server.py --results-root /work/g-svm/results/csv_results
+```
+
+Open `http://127.0.0.1:8765`. In the graph view the top-left panel switches the
+process plane between **tree** and **DAG** (the DAG draws a reused function once
+with an edge per caller) and reveals functions that are never called anywhere.

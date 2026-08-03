@@ -25,6 +25,10 @@ const STR = {
     processDaemon: "プロセス ↔ デーモン",
     planePlane: "平面 ↔ 平面",
     hover: "ホバー時に強調",
+    layout: "プロセス平面",
+    tree: "ツリー",
+    dag: "DAG",
+    showIsolated: "未呼び出しの関数も表示",
     planeA: "平面 A",
     planeB: "平面 B",
     close: "{process} を閉じる",
@@ -55,6 +59,10 @@ const STR = {
     processDaemon: "process ↔ daemon",
     planePlane: "plane ↔ plane",
     hover: "highlight on hover",
+    layout: "Process plane",
+    tree: "tree",
+    dag: "DAG",
+    showIsolated: "show never-called functions",
     planeA: "plane A",
     planeB: "plane B",
     close: "Close {process}",
@@ -102,6 +110,10 @@ export default function CanvasOverlay({
   onToggleEdge,
   hoverHighlight,
   onToggleHoverHighlight,
+  layoutMode,
+  onChangeLayoutMode,
+  showIsolated,
+  onToggleIsolated,
 }) {
   const t = useT(STR);
   const [showRuns, setShowRuns] = useState(false);
@@ -174,6 +186,37 @@ export default function CanvasOverlay({
           </p>
 
           <div className="w-64 rounded-lg border border-rule bg-panel/90 p-2.5 shadow-sm backdrop-blur">
+            <p className="mb-1.5 text-[10px] font-semibold uppercase tracking-wider text-ink-faint">
+              {t.layout}
+            </p>
+            {/* Slide between the two shapes of the same plane: the tree repeats
+                a shared function under every caller, the DAG draws it once. */}
+            <div className="mb-1.5 flex rounded-md border border-rule bg-sunken p-0.5">
+              {["tree", "dag"].map((mode) => (
+                <button
+                  key={mode}
+                  type="button"
+                  onClick={() => onChangeLayoutMode(mode)}
+                  aria-pressed={layoutMode === mode}
+                  className={`flex-1 rounded px-2 py-1 text-[11px] font-medium transition ${
+                    layoutMode === mode
+                      ? "bg-panel text-ink shadow-sm"
+                      : "text-ink-faint hover:text-ink"
+                  }`}
+                >
+                  {t[mode]}
+                </button>
+              ))}
+            </div>
+            <label className="mb-2 flex cursor-pointer items-center gap-2 border-b border-rule pb-2 text-[11px] text-ink-muted">
+              <input
+                type="checkbox"
+                checked={showIsolated}
+                onChange={(event) => onToggleIsolated(event.target.checked)}
+                className="size-3 accent-slate-700"
+              />
+              {t.showIsolated}
+            </label>
             <p className="mb-1.5 text-[10px] font-semibold uppercase tracking-wider text-ink-faint">
               {t.edges}
             </p>

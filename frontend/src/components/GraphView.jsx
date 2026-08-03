@@ -24,6 +24,8 @@ export default function GraphView({
   const [selection, setSelection] = useState(null);
   const [edgeVisibility, setEdgeVisibility] = useState({});
   const [hoverHighlight, setHoverHighlight] = useState(true);
+  const [layoutMode, setLayoutMode] = useState("tree");
+  const [showIsolated, setShowIsolated] = useState(false);
 
   const overview = useMemo(() => (indexes.length ? deriveOverview(indexes) : null), [indexes]);
   const overviewLayout = useMemo(() => (overview ? layoutOverview(overview) : null), [overview]);
@@ -40,17 +42,39 @@ export default function GraphView({
     return map;
   }, [indexes]);
 
+  /**
+   * Function names that some loaded process actually calls. A never-called
+   * function is hidden on its own plane, but reappears once another open
+   * process turns out to use that name.
+   */
+  const sharedNames = useMemo(() => {
+    const names = new Set();
+    for (const index of indexes) {
+      for (const call of index.calls) {
+        const source = index.functions.get(call.source);
+        const target = index.functions.get(call.target);
+        if (source) names.add(source.name);
+        if (target) names.add(target.name);
+      }
+    }
+    return names;
+  }, [indexes]);
+
   const preparedFor = useCallback(
     (processName) => {
       if (!processName) return null;
-      if (!preparedCache.current.has(processName)) {
+      const key = `${processName}|${layoutMode}|${showIsolated ? 1 : 0}`;
+      if (!preparedCache.current.has(key)) {
         const index = indexes.find((entry) => entry.process.name === processName);
         if (!index) return null;
-        preparedCache.current.set(processName, prepareProcess(index));
+        preparedCache.current.set(
+          key,
+          prepareProcess(index, { mode: layoutMode, showIsolated, sharedNames }),
+        );
       }
-      return preparedCache.current.get(processName);
+      return preparedCache.current.get(key);
     },
-    [indexes],
+    [indexes, layoutMode, showIsolated, sharedNames],
   );
 
   const handleSelect = useCallback(
@@ -89,6 +113,27 @@ export default function GraphView({
   useEffect(() => {
     preparedCache.current.clear();
   }, [indexes]);
+
+  // Switching the plane shape (or revealing never-called functions) rebuilds
+  // whatever is already raised, so the toggle acts on what the user is looking
+  // at instead of only on the next process they open.
+  const rebuiltOnce = useRef(false);
+  useEffect(() => {
+    const scene = sceneRef.current;
+    if (!scene) return;
+    if (!rebuiltOnce.current) {
+      rebuiltOnce.current = true;
+      return;
+    }
+    const open = [...scene.planes.keys()];
+    for (const processName of open) scene.closeProcess(processName);
+    for (const processName of open) {
+      const prepared = preparedFor(processName);
+      if (prepared) scene.openProcess(prepared, processIndexById);
+    }
+    // Only the two toggles: reacting to `preparedFor` identity would reopen
+    // planes on every unrelated re-render.
+  }, [layoutMode, showIsolated]);
 
   useEffect(() => {
     if (!sceneRef.current || !overview || !overviewLayout) return;
@@ -165,6 +210,10 @@ export default function GraphView({
             sceneRef.current?.setHoverHighlight(enabled);
             setHoverHighlight(enabled);
           }}
+          layoutMode={layoutMode}
+          onChangeLayoutMode={setLayoutMode}
+          showIsolated={showIsolated}
+          onToggleIsolated={setShowIsolated}
         />
       </div>
 
