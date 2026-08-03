@@ -2,7 +2,12 @@
 
 Resources on the ground plane are drawn with a shape that says what kind of
 thing they are, before the colour or the label is read. Files are a database
-drum, queues are three stacked slots, everything else is still a disc.
+drum, queues are three stacked slots, shared libraries are a stack of slabs,
+everything else is still a disc.
+
+`library` is not a resource kind — it is used directly by `buildOverview.js` for
+the shared-library nodes on the outer ring. It lives in the same table because
+the rules below are the same.
 
 ## Where a kind comes from
 
@@ -18,6 +23,9 @@ The kind is decided by the analyzer, not the frontend: `_resource_kind()` in
 | `process` | `FORK`, `FORKP`, `KILL` |
 | `message` | `MESSAGE` |
 | `daemon_resource` | anything else |
+
+Plus one shape that is not a resource kind: `library`, for a shared code folder
+(`libdio`, `libapl`, …) indexed with `--index-libraries`.
 
 A kind with no icon falls back to a disc, so adding a new operation type never
 breaks the drawing — it just looks generic until you give it a shape.

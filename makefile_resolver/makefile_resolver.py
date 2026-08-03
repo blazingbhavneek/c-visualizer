@@ -85,6 +85,37 @@ def discover_include_dirs(project_path: Path, levels: int = 2) -> list[Path]:
     return list(dict.fromkeys(found))
 
 
+def library_project_mapping(
+    project_path: Path,
+    include_levels: int = 2,
+    extra_include_dirs: list[Path] | None = None,
+) -> tuple[dict[str, Path], list[str]]:
+    """Structure for a library folder that has no Makefile of its own.
+
+    A library is indexed as a unit rather than built, so every C source under
+    it is a seed and the usual discovery supplies the headers.  There is no
+    `main`, hence no potential main files.
+    """
+
+    project_path = Path(project_path).expanduser().resolve()
+    files = {
+        path.name: path
+        for path in sorted(project_path.rglob("*"))
+        if path.suffix in {".c", ".h"} and path.is_file()
+    }
+    search_dirs = list(
+        dict.fromkeys(
+            [
+                project_path,
+                *(Path(p).expanduser().resolve() for p in (extra_include_dirs or [])),
+                *discover_include_dirs(project_path, include_levels),
+            ]
+        )
+    )
+    combined_dependency, _ = resolve(files=files, include_dirs=search_dirs)
+    return combined_dependency, []
+
+
 class MakefileContext:
     def __init__(self, project_root_makefile: Union[str, Path]):
         self.vars: Dict[str, str] = dict(

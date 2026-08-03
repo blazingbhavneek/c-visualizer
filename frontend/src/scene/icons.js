@@ -47,10 +47,25 @@ function queueShape() {
   });
 }
 
+/** Library: two slabs stacked with an offset, read as a stack of books. */
+function libraryShape() {
+  const slab = (centreY, halfWidth, offsetX) => {
+    const shape = new THREE.Shape();
+    shape.moveTo(offsetX - halfWidth, centreY - 0.3);
+    shape.lineTo(offsetX + halfWidth, centreY - 0.3);
+    shape.lineTo(offsetX + halfWidth, centreY + 0.3);
+    shape.lineTo(offsetX - halfWidth, centreY + 0.3);
+    shape.closePath();
+    return shape;
+  };
+  return [slab(-0.42, 1.0, 0), slab(0.42, 0.82, -0.14)];
+}
+
 /** kind -> geometry. Add an entry here to give a kind its own icon. */
 const ICON_SHAPES = {
   file: databaseShape,
   queue: queueShape,
+  library: libraryShape,
 };
 
 export function hasResourceIcon(kind) {

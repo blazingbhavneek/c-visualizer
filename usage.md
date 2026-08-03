@@ -127,6 +127,38 @@ Each one runs the LLM call in its own worker process, so raise it with the
 memory on the machine in mind. Finished paths are recorded per path, so an
 interrupted run resumes exactly where it stopped.
 
+### Index the shared library first (big saving)
+
+When many processes call into the same library folder, every process
+re-resolves every route that reaches the same library call. Trace the library
+once instead:
+
+```bash
+.venv/bin/python project_aware.py \
+  --index-libraries "$SRC_ROOT" \
+  --output-root /work/dio \
+  "${SUMMARY_ARGS[@]}"
+```
+
+That finds every folder under `$SRC_ROOT` whose name starts with `lib`
+(`libdio`, `libDioTrace`, …; change with `--library-prefix`), traces each one
+rooted at its own functions instead of `main`, and writes the answers to
+`<results>/library_facts.json`.
+
+Every later run with the same `--output-root` picks that file up automatically.
+A path that walks into a cached library call is answered from the file and
+makes **no LLM call**; the run prints how many it reused. Add
+`--no-library-facts` to trace everything in full, or `--library-facts PATH` to
+point somewhere else.
+
+Only answers the library could resolve **on its own** are cached. If a value
+comes from the library function's own parameter, the library run reports it
+unresolved, nothing is stored, and the process run does the full trace as
+before — so a cached answer never depends on who called it.
+
+`--index-libraries` can run alone or in the same command as a process run; the
+libraries are always indexed first.
+
 ### Adding targets to a project already run
 
 ```bash

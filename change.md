@@ -1,5 +1,141 @@
 # Changes
 
+## Later addition: library-first indexing (item 8)
+
+**Problem.** The path count explodes in the *prefix*, not in the answer. Every
+process multiplies out its own routes into the same shared library
+(`libdio`, `libapl`, …) and pays for one LLM call per route, even though the
+resolved value at the library call site is identical for all of them.
+
+**Change** — new `library_facts.py`, plus small hooks in
+`call_graph/call_graph.py`, `makefile_resolver/makefile_resolver.py` and
+`project_aware.py`.
+
+- `discover_libraries(root, prefix="lib")` finds library folders (name starts
+  with the prefix, contains C sources, is not itself inside one).
+- `orchestrate(..., root_keys=[...])` — a library has no `main`, so it is
+  rooted at its own functions. One small addition; without `root_keys` the
+  behaviour is exactly as before.
+- `library_project_mapping()` builds a structure for a library folder with no
+  Makefile of its own (every C source is a seed; discovery supplies headers).
+- `LibraryFactStore` harvests the library run's CSV and stores each resolved
+  answer under **the path suffix that produced it**. In a later process run,
+  `make_llm_calls_for_function` looks up each path's suffixes shortest-first;
+  on a hit it writes the row from the cached answer and makes **no LLM call**.
+- The cached answer supplies only the resolved value, the call number and the
+  operation type. Where the call sits in *this* process — launch, calling
+  function, source lines — still comes from that process's own call graph.
+
+**Why a cached answer is safe for any caller.** Only answers the library could
+resolve *without a caller* are stored. A value that comes from the library
+function's own parameter comes back `UNRESOLVED` in the library run, is not
+cached, and the process run traces it in full exactly as before.
+
+**Shortest suffix wins** on lookup: a shorter suffix means the library needed
+less context, so it holds for more callers.
+
+**CLI:** `--index-libraries ROOT`, `--library-prefix`, `--library-facts PATH`,
+`--no-library-facts`. Libraries are indexed before any process run in the same
+command, and the facts file is picked up automatically by later runs sharing an
+`--output-root`.
+
+**Also fixed:** `orchestrate` did `console.print(paths)` — rich-printing the
+entire path list, which is unusable past a few dozen paths and ruinous at the
+scale this runs at. It now prints a count.
+
+**Verified.** New `tests/test_library_facts.py` (6 tests: suffix reuse across
+different routes, unresolved answers never cached, shortest-suffix and
+right-API matching, labels containing `->` surviving the round trip, save/load,
+library discovery). End to end with the LLM mocked: 10 paths where 8 share a
+library tail → **2 LLM calls instead of 10**, 8 cache hits, all 10 CSV rows
+correct, process-side fields preserved. Library-rooted enumeration checked
+against a synthetic graph with no `main`: the old call returns nothing, the
+rooted call finds both the short and the long path.
+
+### The same split in the frontend
+
+Libraries are separate code, so the visualizer stops mixing them into the
+processes that use them.
+
+- **Snapshots say what they are.** `visualizer_export.py` writes
+  `process.kind = "library" | "process"`, and tags every function with the
+  `library` it came from (matched against the library roots recorded in
+  `library_facts.json`). A process pulls the library's sources into its own
+  structure, so without this tag the two are indistinguishable.
+- **A process plane stops at the library.** The first library function a
+  process calls is drawn as a **boundary node** — its own colour, a ring, a
+  permanent `name → libdio` label — and nothing below it is expanded. Library
+  functions are also kept off that process's unreached shelf, and counted
+  separately in the coverage line.
+- **Daemon links survive the cut.** A daemon call made *inside* the library is
+  attributed to a library function that is no longer drawn, so
+  `attachInteractions` walks back through the library to the boundary the
+  process actually calls. The link still lands on the plane: "this process
+  touches file 1007, through `DioGetPtr`".
+- **The overview gives libraries their own place.** Library nodes sit on an
+  outer ring (book-stack icon, angled toward the processes that use them), with
+  a quiet `uses` edge from each process built on them. They are **not** in the
+  process ring, and their own daemon calls are not drawn there — the processes
+  that inherit those calls already draw them. A library nobody has indexed yet
+  still appears, dimmed and marked "not indexed".
+- **Opening the library reconnects the halves.** Click a library node and its
+  plane opens like a process's. With both open, a seam is drawn from each
+  boundary node to the same function inside the library plane
+  (`PLANE_TO_PLANE`, so the existing edge toggle controls it).
+
+**Verified** on a real snapshot relabelled so one file counts as a library:
+process plane 120 → 71 nodes (tree) and 74 → 55 (DAG), 3 boundary nodes, zero
+library functions expanded or shelved, **all 105 interactions still attached**,
+library plane still showing its full 74-node inside, overview showing a separate
+library node with its `uses` edge, and 3/3 boundary nodes finding their
+counterpart in the library plane. A separate synthetic check covers the
+re-attribution specifically: a daemon call two hops inside the library attaches
+to the boundary node in both tree and DAG mode. Two new Python tests cover the
+snapshot marking (`library` per function, `kind` per snapshot).
+
+### Bug fix: cross-plane links were wiring processes through shared APIs
+
+**Reported:** with two processes open, the plane-to-plane lines connected them
+through library/external functions, reading as "these two reuse this function".
+A cross-process source link should mean one process compiles code out of the
+other's source tree — not that both call the same API.
+
+Three causes, all fixed in `directPlanePairs` / `SceneManager`:
+
+1. **Unresolved resources were treated as shared objects.** Every process has
+   `UNRESOLVED` and `NO TARGET` rows and they all carry the same resource key,
+   so every plane paired with every other plane on them. Pairs are now limited
+   to resources that actually resolved. On the fixtures that alone is 22 of one
+   process's 105 interactions.
+2. **Lines were anchored on the shared API node.** The endpoints came from
+   `portNodes` — the external API leaf — so a line literally joined
+   `mpf_mfs_open` in plane A to `mpf_mfs_open` in plane B. Endpoints are now
+   each process's **own** code (`ownCodeNodes`: not external, not library, not a
+   boundary); an interaction with no own-code anchor draws no direct line at
+   all, since the ground resource node already carries that relationship.
+3. **Library boundaries could anchor a line too**, after the re-attribution
+   above, joining the same library function across two processes. Same filter
+   removes it.
+
+**And the link that was missing:** `sharedSourceNodes` joins the *same source
+function* (file + name + definition range) drawn in both planes — the real
+"process A is built from process B's source" signal — in its own colour, with a
+legend entry.
+
+Measured on the fixtures: **87 pairs before, 9 of them drawn between the same
+external function in both planes → 28 pairs after**, every one anchored on own
+code, none on an unresolved resource. With three functions borrowed from another
+process's tree, the new shared-source link finds exactly those three.
+
+**Known limits (v1).** The library run itself still traces overlapping routes
+(root `DioRead → DioGetPtr → target` as well as `DioGetPtr → target`) — the
+shortest-first pruning is listed as follow-up work. Branch variations ("this
+function passes one of 3 constants depending on its parameter") are **not**
+handled: they need a prompt/schema change and are covered in `walk_plan.md`,
+which plans the backward walker that generalises this cache.
+
+---
+
 Seven requested items, kept to the smallest diff that actually implements each.
 Nothing in `call_graph/`, `parser/`, `client/llm.py`, the tool-chain prompts or
 `wiki/` was touched beyond replacing hardcoded output paths.

@@ -26,10 +26,14 @@ export const COLORS = {
   library: "#7b8798",
   recursive: "#8b45c0",
   unreached: "#9aa5b4",
+  /** Shared library code: the boundary of a process, and its node on the ground. */
+  libraryCode: "#5d6b8a",
   edge: "#b0864a",
   edgeMuted: "#c8cdd6",
   crossPlane: "#0e7fa8",
   planeToPlane: "#c2185b",
+  /** The same source function compiled into two processes. */
+  sharedSource: "#7a5cd6",
   ground: "#eef1f5",
   /** Fill for a raised plane, so it reads as paper rather than a colour wash. */
   sheet: "#f2f5f9",

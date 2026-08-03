@@ -4,7 +4,7 @@ import { buildOverviewLayer } from "./buildOverview.js";
 import { buildProcessPlaneLayer } from "./buildProcessPlane.js";
 import { disposeObject } from "./primitives.js";
 import { COLORS, SURFACE, processColor } from "./palette.js";
-import { directPlanePairs } from "../graph/model.js";
+import { directPlanePairs, ownCodeNodes, sharedSourceNodes } from "../graph/model.js";
 import {
   EDGE_CATEGORIES,
   moveNode,
@@ -219,8 +219,16 @@ export default class SceneManager {
     return node.local.clone().applyMatrix4(this.overviewLayer.group.matrixWorld);
   }
 
+  /** Ground node for an expandable plane — a process, or a shared library. */
+  _overviewNodeIdFor(processName) {
+    const registry = this.overviewLayer?.registry;
+    if (registry?.nodes.has(`process:${processName}`)) return `process:${processName}`;
+    if (registry?.nodes.has(`library:${processName}`)) return `library:${processName}`;
+    return `process:${processName}`;
+  }
+
   _processAnchor(processName) {
-    return this._overviewNodeWorld(`process:${processName}`) || new THREE.Vector3();
+    return this._overviewNodeWorld(this._overviewNodeIdFor(processName)) || new THREE.Vector3();
   }
 
   /**
@@ -261,7 +269,9 @@ export default class SceneManager {
       this._removePlane(this.planes.keys().next().value);
     }
 
-    const tint = processColor(processIndexById.get(processName) ?? 0);
+    const tint = prepared.index?.isLibrary
+      ? COLORS.libraryCode
+      : processColor(processIndexById.get(processName) ?? 0);
     const layer = buildProcessPlaneLayer({
       treeNodes: prepared.treeNodes,
       edges: prepared.edges,
@@ -328,8 +338,8 @@ export default class SceneManager {
 
     const [a, b] = open;
     const registry = this.overviewLayer.registry;
-    const nodeA = registry.nodes.get(`process:${a.processName}`);
-    const nodeB = registry.nodes.get(`process:${b.processName}`);
+    const nodeA = registry.nodes.get(this._overviewNodeIdFor(a.processName));
+    const nodeB = registry.nodes.get(this._overviewNodeIdFor(b.processName));
     if (!nodeA || !nodeB) return;
 
     // Push the two anchors apart along the line already between them, keeping
@@ -503,8 +513,7 @@ export default class SceneManager {
 
   // ------------------------------------------------------- cross-plane edges
 
-  _portWorldPositions(plane, attachment) {
-    const nodes = attachment.portNodes.length ? attachment.portNodes : attachment.callerNodes;
+  _worldPositions(plane, nodes) {
     const positions = [];
     for (const node of nodes) {
       const entry = plane.layer.registry.nodes.get(node.uid);
@@ -512,6 +521,18 @@ export default class SceneManager {
       positions.push(entry.local.clone().applyMatrix4(plane.layer.group.matrixWorld));
     }
     return positions;
+  }
+
+  _portWorldPositions(plane, attachment) {
+    return this._worldPositions(
+      plane,
+      attachment.portNodes.length ? attachment.portNodes : attachment.callerNodes,
+    );
+  }
+
+  /** Endpoints for a plane-to-plane line: this process's own code only. */
+  _ownCodeWorldPositions(plane, attachment) {
+    return this._worldPositions(plane, ownCodeNodes(attachment));
   }
 
   _rebuildCrossPlaneEdges() {
@@ -549,7 +570,39 @@ export default class SceneManager {
       }
     }
 
-    // Plane-to-plane: producer/consumer pairs that meet on the same resource.
+    // Process boundary -> the same function inside an open library plane. The
+    // process plane deliberately stops at its library calls; opening the
+    // library is what reconnects the two halves, and this is that seam.
+    if (this.edgeVisibility[EDGE_CATEGORIES.PLANE_TO_PLANE] !== false) {
+      for (const plane of this.planes.values()) {
+        if (plane.prepared.index.isLibrary) continue;
+        for (const library of this.planes.values()) {
+          if (!library.prepared.index.isLibrary) continue;
+          const byName = new Map();
+          for (const node of library.prepared.treeNodes) {
+            if (!byName.has(node.fn.name)) byName.set(node.fn.name, node);
+          }
+          for (const node of plane.prepared.treeNodes) {
+            if (!node.boundary || node.fn.library !== library.processName) continue;
+            const target = byName.get(node.fn.name);
+            const from = plane.layer.registry.nodes.get(node.uid);
+            const to = target && library.layer.registry.nodes.get(target.uid);
+            if (!from || !to) continue;
+            this._addCrossPlaneEdge({
+              from: from.local.clone().applyMatrix4(plane.layer.group.matrixWorld),
+              to: to.local.clone().applyMatrix4(library.layer.group.matrixWorld),
+              color: COLORS.libraryCode,
+              opacity: 0.55,
+              category: EDGE_CATEGORIES.PLANE_TO_PLANE,
+              processName: plane.processName,
+            });
+          }
+        }
+      }
+    }
+
+    // Plane-to-plane: producer/consumer pairs that meet on the same resource,
+    // anchored on each process's own code at both ends.
     const open = [...this.planes.values()];
     if (open.length === 2 && this.edgeVisibility[EDGE_CATEGORIES.PLANE_TO_PLANE] !== false) {
       const pairs = directPlanePairs(open[0].prepared.attachments, open[1].prepared.attachments);
@@ -558,8 +611,8 @@ export default class SceneManager {
           ? open[0]
           : open[1];
         const consumerPlane = producerPlane === open[0] ? open[1] : open[0];
-        for (const start of this._portWorldPositions(producerPlane, pair.producer)) {
-          for (const end of this._portWorldPositions(consumerPlane, pair.consumer)) {
+        for (const start of this._ownCodeWorldPositions(producerPlane, pair.producer)) {
+          for (const end of this._ownCodeWorldPositions(consumerPlane, pair.consumer)) {
             this._addCrossPlaneEdge({
               from: start,
               to: end,
@@ -568,6 +621,27 @@ export default class SceneManager {
               category: EDGE_CATEGORIES.PLANE_TO_PLANE,
             });
           }
+        }
+      }
+
+      // The same source function compiled into both processes: one of them is
+      // built from the other's source tree. This is what a cross-process source
+      // link means; sharing an API or a library is not it.
+      if (!open[0].prepared.index.isLibrary && !open[1].prepared.index.isLibrary) {
+        for (const shared of sharedSourceNodes(
+          open[0].prepared.treeNodes,
+          open[1].prepared.treeNodes,
+        )) {
+          const from = open[0].layer.registry.nodes.get(shared.a.uid);
+          const to = open[1].layer.registry.nodes.get(shared.b.uid);
+          if (!from || !to) continue;
+          this._addCrossPlaneEdge({
+            from: from.local.clone().applyMatrix4(open[0].layer.group.matrixWorld),
+            to: to.local.clone().applyMatrix4(open[1].layer.group.matrixWorld),
+            color: COLORS.sharedSource,
+            opacity: 0.45,
+            category: EDGE_CATEGORIES.PLANE_TO_PLANE,
+          });
         }
       }
     }

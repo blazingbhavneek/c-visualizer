@@ -621,6 +621,7 @@ def orchestrate(
     function_pointer_args: dict = None,
     file_functions: dict[str, dict[str, any]] = None,
     return_whole_tree: bool = False,
+    root_keys: list[str] | None = None,
 ) -> (
     tuple[
         dict[str, tuple[str, str, str]],
@@ -655,36 +656,37 @@ def orchestrate(
     paths_with_data: list[tuple[tuple[list[str], list[CallTreeNode] | None], dict]] = []
     main_key = f"[{main_file_name}]main"
 
-    if main_key in tree_objects.keys():
-        node = tree_objects[main_key]
-        # rprint("\n=== Call Tree for Main ===")
-        # console.print(node.to_rich_tree())
-        # print("oTHER TREE...")
-        # another_node = tree_objects[other_key]
-        # console.print(another_node.to_rich_tree())
+    # Library code has no `main`: it is rooted at its own functions instead, so
+    # the paths inside it are short and can be traced once for every process
+    # that will later walk into them.
+    roots = [key for key in (root_keys or [main_key]) if key in tree_objects]
 
+    if roots:
         paths: list[list[str | CallTreeNode]] = []
+        path_trees: list[list[CallTreeNode]] = []
 
         search_target = required_func
 
-        dfs_for_finding_path(
-            node=node,
-            required_func=search_target,
-            paths=paths,
-            curr_path=[],
-            return_whole_tree=False,
-        )
-        if return_whole_tree:
-            path_trees: list[list[CallTreeNode]] = []
+        for root_key in roots:
             dfs_for_finding_path(
-                node=node,
+                node=tree_objects[root_key],
                 required_func=search_target,
-                paths=path_trees,
+                paths=paths,
                 curr_path=[],
-                return_whole_tree=True,
+                return_whole_tree=False,
             )
+            if return_whole_tree:
+                dfs_for_finding_path(
+                    node=tree_objects[root_key],
+                    required_func=search_target,
+                    paths=path_trees,
+                    curr_path=[],
+                    return_whole_tree=True,
+                )
 
-        console.print(paths)
+        # Printing the paths themselves is unusable past a few dozen and is
+        # ruinous at the scale this runs at.
+        print(f"FOUND {len(paths)} PATH(S) TO {required_func} FROM {len(roots)} ROOT(S)")
         if len(paths) > 0:
             print("\n=== Paths Found ===")
             # pprint(paths)

@@ -134,7 +134,17 @@ class VisualizerCollector:
         library_functions: set[str] | list[str] | None = None,
         run_id: str | None = None,
         results_root: Path | None = None,
+        is_library: bool = False,
+        library_roots: dict[str, str] | None = None,
     ) -> None:
+        self.is_library = is_library
+        # name -> folder. A process pulls the shared library's sources into its
+        # own structure, so every function is tagged with the library it came
+        # from (or None for the process's own code) and the frontend can keep
+        # the two apart instead of drawing the whole library under `main`.
+        self.library_roots = {
+            name: str(Path(root).resolve()) for name, root in (library_roots or {}).items()
+        }
         self.process_name = process_name
         self.process_root = str(Path(process_root))
         self.project_structure = {name: str(path) for name, path in project_structure.items()}
@@ -230,6 +240,15 @@ class VisualizerCollector:
         file_path = getattr(node, "file_path", None)
         return str(file_path) if file_path else None
 
+    def _library_for(self, definition_path: str | None) -> str | None:
+        if not definition_path or not self.library_roots:
+            return None
+        resolved = str(Path(definition_path).resolve())
+        for name, root in self.library_roots.items():
+            if resolved == root or resolved.startswith(f"{root}/"):
+                return name
+        return None
+
     def _function_id(self, node: Any) -> str:
         name = getattr(node, "name", "unknown")
         if getattr(node, "is_external", False):
@@ -266,6 +285,7 @@ class VisualizerCollector:
             "end_line": end,
             "is_external": is_external,
             "is_library_api": is_library_api,
+            "library": self._library_for(definition_path),
             "is_static": bool(getattr(node, "is_static", False)),
             "summary_status": (
                 "library" if is_external or is_library_api else "pending"
@@ -532,6 +552,9 @@ class VisualizerCollector:
             "process": {
                 "id": process_id,
                 "name": self.process_name,
+                # Library code is shared, not a running daemon; the frontend
+                # gives it its own place instead of a slot in the process ring.
+                "kind": "library" if self.is_library else "process",
                 "root": self.process_root,
                 "main_file": self.main_file_name,
                 "entry_function_id": main_id,

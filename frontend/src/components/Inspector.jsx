@@ -54,6 +54,10 @@ const STR = {
     touching: "利用するプロセス",
     note: "注記",
     resourceNote: "スナップショットごとに ID のハッシュが異なるため、資源は kind + name でスナップショット間を対応付けています。これはモデル支援解析の根拠であり、稼働中デーモンの一覧ではありません。",
+    library: "共通ライブラリ",
+    usedBy: "使用プロセス",
+    notIndexed: "未インデックス",
+    libraryNote: "ライブラリはプロセスとは別のコードとして扱う。プロセス平面はライブラリ呼び出しで止まり、ライブラリ自身の平面を開くと両者がつながる。",
     process: "プロセス",
     functions: "{n} 関数",
     resources: "{n} 資源",
@@ -110,6 +114,10 @@ const STR = {
     touching: "Processes touching it",
     note: "Note",
     resourceNote: "Resources are keyed by kind + name across snapshots because IDs are per-snapshot hashes. This is analysis evidence from the model-assisted results, not a live daemon inventory.",
+    library: "Shared library",
+    usedBy: "Used by",
+    notIndexed: "not indexed",
+    libraryNote: "A library is separate code from the processes that use it. A process plane stops at its library calls; open the library's own plane to join the two.",
     process: "Process",
     functions: "{n} functions",
     resources: "{n} resources",
@@ -146,6 +154,7 @@ export default function Inspector({ selection, index, runId, onAskFunction }) {
         )}
         {selection?.type === "resource" && <ResourcePanel resource={selection.resource} t={t} />}
         {selection?.type === "process" && <ProcessPanel process={selection.process} index={index} t={t} />}
+        {selection?.type === "library" && <LibraryPanel library={selection.library} t={t} />}
       </div>
     </aside>
   );
@@ -366,6 +375,33 @@ function ResourcePanel({ resource, t }) {
         <ul className="space-y-1">{[...resource.processes].sort().map((name) => <li key={name} className="font-mono text-xs text-ink-muted">{name}</li>)}</ul>
       </Section>
       <Section title={t.note}><p className="text-xs leading-relaxed text-ink-muted">{t.resourceNote}</p></Section>
+    </div>
+  );
+}
+
+function LibraryPanel({ library, t }) {
+  return (
+    <div>
+      <Section title={t.library}>
+        <p className="font-mono text-sm text-ink">{library.name}</p>
+        <div className="mt-2.5 flex flex-wrap gap-1.5">
+          {library.loaded ? (
+            <Badge>{fmt(t.functions, library.functionCount)}</Badge>
+          ) : (
+            <Badge tone="amber">{t.notIndexed}</Badge>
+          )}
+        </div>
+      </Section>
+      <Section title={t.usedBy} count={library.processes.size}>
+        <ul className="space-y-1">
+          {[...library.processes].sort().map((name) => (
+            <li key={name} className="font-mono text-xs text-ink-muted">{name}</li>
+          ))}
+        </ul>
+      </Section>
+      <Section title={t.note}>
+        <p className="text-xs leading-relaxed text-ink-muted">{t.libraryNote}</p>
+      </Section>
     </div>
   );
 }

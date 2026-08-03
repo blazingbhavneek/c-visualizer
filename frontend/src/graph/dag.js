@@ -17,6 +17,8 @@
  * attachment all work on either without knowing which they were given.
  */
 
+import { isBoundary } from "./model.js";
+
 const uidFor = (functionId) => `d:${functionId}`;
 
 export function buildProcessDag(index) {
@@ -36,6 +38,9 @@ export function buildProcessDag(index) {
         depth: 0,
         children: [],
         recursive: false,
+        // Same rule as the tree: a library function is where this process's
+        // own drawing stops.
+        boundary: isBoundary(index, fn),
       });
     }
     return nodes.get(fn.id);
@@ -47,6 +52,10 @@ export function buildProcessDag(index) {
   while (queue.length > 0) {
     const id = queue.shift();
     const byTarget = new Map();
+    if (nodes.get(id).boundary) {
+      outgoing.set(id, byTarget); // a boundary keeps no children
+      continue;
+    }
     for (const call of index.outgoing.get(id) || []) {
       if (!index.functions.has(call.target)) continue;
       if (!byTarget.has(call.target)) byTarget.set(call.target, []);

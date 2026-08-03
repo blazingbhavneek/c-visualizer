@@ -283,7 +283,8 @@ export function layoutUnreachedShelf(groups, treeBounds) {
 export function layoutOverview(overview, { radius = 1500 } = {}) {
   const processes = overview.processes.map((node) => ({ ...node }));
   const resources = overview.resources.map((node) => ({ ...node }));
-  const nodes = [...processes, ...resources];
+  const libraries = (overview.libraries || []).map((node) => ({ ...node }));
+  const nodes = [...processes, ...resources, ...libraries];
   const byId = new Map(nodes.map((node) => [node.id, node]));
 
   const links = [];
@@ -345,6 +346,29 @@ export function layoutOverview(overview, { radius = 1500 } = {}) {
     resource.y = Math.sin(meanAngle) * resourceRadius;
   }
 
+  // --- libraries on an outer ring -----------------------------------------
+  // Outside the process ring, not among the resources: a library is code the
+  // processes are built from, not something they exchange data through. Angle
+  // still follows its users, so it sits behind the processes that use it.
+  for (const library of libraries) {
+    const users = [...library.processes].filter((name) => angleOf.has(name));
+    if (users.length === 0) {
+      library.x = 0;
+      library.y = -radius * 1.05;
+      continue;
+    }
+    let sumX = 0;
+    let sumY = 0;
+    for (const name of users) {
+      const angle = angleOf.get(name);
+      sumX += Math.cos(angle);
+      sumY += Math.sin(angle);
+    }
+    const meanAngle = Math.atan2(sumY, sumX);
+    library.x = Math.cos(meanAngle) * radius * 1.05;
+    library.y = Math.sin(meanAngle) * radius * 1.05;
+  }
+
   // --- collision-only relaxation ------------------------------------------
   // Nudges overlapping marks apart without letting physics redesign the layout.
   // Collision radius covers the label, not just the dot, so no mark overlaps
@@ -355,7 +379,9 @@ export function layoutOverview(overview, { radius = 1500 } = {}) {
     const spec = isProcess ? LABEL_SPECS.process : LABEL_SPECS.resource;
     const lines = isProcess
       ? [node.name, `${node.functionCount} fn · ${node.interactionCount} interactions`]
-      : [`${node.kind} ${node.name}`];
+      : node.type === "library"
+        ? [node.name]
+        : [`${node.kind} ${node.name}`];
     const label = labelWorldSize(lines, spec);
     const dot = isProcess ? 46 : 22;
     node.clearance = Math.max(dot * 1.7, label.width / 2 + 26, label.height + dot * 1.2);

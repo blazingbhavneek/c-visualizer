@@ -51,7 +51,11 @@ from helpers.Preprocess.preprocess import (
 )
 from helpers.time_it import time_it
 from function_summaries import SummaryConfig, summarize_collector
-from makefile_resolver.makefile_resolver import return_project_mapping
+from library_facts import FACTS_FILENAME, LibraryFactStore, discover_libraries
+from makefile_resolver.makefile_resolver import (
+    library_project_mapping,
+    return_project_mapping,
+)
 from models import (
     Combined,
     FunctionTokenCount,
@@ -669,6 +673,8 @@ async def make_llm_calls_for_function(
     file_functions,
     project_structure,
     project_path,
+    library_facts=None,
+    root_keys: list[str] | None = None,
 ) -> (
     list | None
 ):  # will return list of dataframes containing all data to be saved in csv.
@@ -765,6 +771,35 @@ async def make_llm_calls_for_function(
     print("Already completed paths for this function:", len(completed_paths))
     # endregion
 
+    def record_library_fact(index, path, call_graph_data, fact) -> None:
+        """Write one row from a cached library answer, with no LLM call.
+
+        Only the resolved value, the call number and the operation type come
+        from the library run; where the call sits in *this* process - its
+        launch, its calling function, its source lines - stays whatever the
+        call graph determined here.
+        """
+        final_combined_data = {
+            **call_graph_data,
+            "process_name": Path(project_path).name,
+            "type": fact.get("type") or "NO DATA",
+            "call_number": fact.get("call_number", -1),
+            "target_number": {"path_str": "->".join(path), "ans": list(fact["ans"])},
+        }
+        combined_model = Combined.model_validate(final_combined_data)
+        tokens = TokenCount(Input_tokens=0, Output_tokens=0, Total_tokens=0)
+        FUNCTION_DICT[function]["Each_Path_Tokens"].append({index: tokens.model_dump()})
+        FUNCTION_DICT[function].update(
+            {
+                "Total_Tokens": FUNCTION_INPUT_TOKEN + FUNCTION_OUTPUT_TOKEN,
+                "Total_Output": FUNCTION_OUTPUT_TOKEN,
+                "Total_Input": FUNCTION_INPUT_TOKEN,
+            }
+        )
+        write_json_file(data=FUNCTION_DICT)
+        save_dict_csv(data_dict=combined_model.model_dump(), save=True)
+        answers[function].append((combined_model, Stats.model_validate(empty_stats)))
+
     # region MAKING CALL_GRAPH AND GETTING DATA
     macro_data = possible_paths_data = None
     call_graph_with_paths = orchestrate(
@@ -775,6 +810,7 @@ async def make_llm_calls_for_function(
         function_pointer_args=function_pointer_args,
         file_functions=file_functions,
         return_whole_tree=check_other_functions,  # this will tell if path_nodes will be returned or not.
+        root_keys=root_keys,
     )
 
     if not call_graph_with_paths:
@@ -850,6 +886,11 @@ async def make_llm_calls_for_function(
                 index - 1
             ]  # data received for this path from call_graph
             # It has [function_name,launch_via,call_function,function_name_src,target_name_src] -> NEEDED process_name(folder_name), type + aidetermined...
+            fact = library_facts.lookup(path, function) if library_facts else None
+            if fact:
+                record_library_fact(index, path, call_graph_data, fact)
+                print(f"DONE WITH PATH {index} (reused library answer)")
+                return
             print(f"{BOLD}{GREEN}PROCESS PATH_{index}{RESET}")
             print("-" * 20, "PATH AND CONTEXT", "-" * 20)
 
@@ -1073,6 +1114,11 @@ async def make_llm_calls_for_function(
                 index - 1
             ]  # data received for this path from call_graph
             # It has [function_name,launch_via,call_function,function_name_src,target_name_src] -> NEEDED process_name(folder_name), type + aidetermined...
+            fact = library_facts.lookup(path, function) if library_facts else None
+            if fact:
+                record_library_fact(index, path, call_graph_data, fact)
+                print(f"DONE WITH PATH {index} (reused library answer)")
+                return
             type_of_func = STATE.get("FUNCTION_TYPES").get(function).get("type")
             call_graph_data = {
                 **call_graph_data,
@@ -1252,6 +1298,8 @@ def trace_variable(
     index_only: bool = False,
     include_levels: int = 2,
     extra_include_dirs: list[Path] | None = None,
+    library_mode: bool = False,
+    library_facts=None,
 ):
     STATE = State()
     project_path = Path(project_path)
@@ -1273,12 +1321,21 @@ def trace_variable(
         print(
             "PROJECT STRUCTURE NEEDS TO BE RESOLVED. NO PICKLE FILE. IT WILL TAKE TIME...."
         )
-        PROJECT_STRUCTURE, potential_main_files = return_project_mapping(
-            show=False,
-            project_path=project_path,
-            include_levels=include_levels,
-            extra_include_dirs=extra_include_dirs,
-        )
+        if library_mode and not (project_path / "Makefile").is_file():
+            # A library folder is indexed as a unit, so it does not need a
+            # Makefile to say which of its sources take part.
+            PROJECT_STRUCTURE, potential_main_files = library_project_mapping(
+                project_path,
+                include_levels=include_levels,
+                extra_include_dirs=extra_include_dirs,
+            )
+        else:
+            PROJECT_STRUCTURE, potential_main_files = return_project_mapping(
+                show=False,
+                project_path=project_path,
+                include_levels=include_levels,
+                extra_include_dirs=extra_include_dirs,
+            )
         PROJECT_STRUCTURE = dict(
             sorted(PROJECT_STRUCTURE.items(), key=lambda x: str(x[0]))
         )
@@ -1356,6 +1413,12 @@ def trace_variable(
         library_functions=set((STATE.get("FUNCTION_MAP") or {}).keys())
         | set((STATE.get("FUNCTION_TYPES") or {}).keys()),
         run_id=STATE.get("TIME"),
+        is_library=library_mode,
+        library_roots=(
+            {project_path.name: str(project_path)}
+            if library_mode
+            else dict(getattr(library_facts, "libraries", {}) or {})
+        ),
     )
     collector.capture_call_graph(graph=graph, registry=registry)
     STATE.set("VISUALIZER_COLLECTOR", collector)
@@ -1404,6 +1467,22 @@ def trace_variable(
     # print('dio000d.c' in PROJECT_STRUCTURE)
     print("This is the main file::", main_file_name)
     # sys.exit()
+    # A library has no `main` to start from, so every function it defines is a
+    # possible way in - which is also what makes the cached answers short and
+    # therefore reusable by many callers.
+    root_keys = (
+        [
+            f"[{file_name}]{function_name}"
+            for file_name, definitions in FILE_FUNCTIONS.items()
+            for function_name in definitions
+            if function_name != "main"
+        ]
+        if library_mode
+        else None
+    )
+    if library_mode:
+        print(f"LIBRARY MODE: {len(root_keys)} possible entry function(s)")
+
     data_csvs = []
     for function in functions_identified:
         # if function == 'mpf_mfs_open' or function=='mpf_mfs_close' or function=='mpf_mfs_getrec': continue
@@ -1425,6 +1504,8 @@ def trace_variable(
                 file_functions=FILE_FUNCTIONS,
                 project_structure=PROJECT_STRUCTURE,
                 project_path=project_path,
+                library_facts=library_facts,
+                root_keys=root_keys,
             )
         )
         if function_dataframes is not None:
@@ -1614,6 +1695,31 @@ if __name__ == "__main__":
         type=int,
         help="Target paths traced at the same time (default 4).",
     )
+    argument_parser.add_argument(
+        "--index-libraries",
+        type=Path,
+        metavar="ROOT",
+        help=(
+            "Trace every library folder below ROOT first and cache the answers. "
+            "Later process runs reuse them instead of re-resolving every route "
+            "that reaches the same library call."
+        ),
+    )
+    argument_parser.add_argument(
+        "--library-prefix",
+        default="lib",
+        help="Folder name prefix that marks library code (default: lib).",
+    )
+    argument_parser.add_argument(
+        "--library-facts",
+        type=Path,
+        help=f"Where cached library answers live (default: <results>/{FACTS_FILENAME}).",
+    )
+    argument_parser.add_argument(
+        "--no-library-facts",
+        action="store_true",
+        help="Trace every path in full, ignoring any cached library answers.",
+    )
     command_args = argument_parser.parse_args()
     if command_args.output_root:
         set_output_root(command_args.output_root)
@@ -1652,6 +1758,93 @@ if __name__ == "__main__":
         )
         sys.exit(0)
 
+    summary_config = SummaryConfig.from_env()
+    if command_args.summarize_functions:
+        summary_config.enabled = True
+    elif command_args.skip_function_summaries:
+        summary_config.enabled = False
+    if command_args.summary_model:
+        summary_config.model = command_args.summary_model
+    if command_args.summary_base_url:
+        summary_config.base_url = command_args.summary_base_url
+    if command_args.wiki_url:
+        summary_config.wiki_url = command_args.wiki_url
+    if command_args.wiki_placeholder:
+        summary_config.wiki_placeholder = True
+    if command_args.summary_concurrency:
+        summary_config.concurrency = max(1, command_args.summary_concurrency)
+
+    def json_dir_for(path: Path) -> Path:
+        return next(
+            (
+                candidate / "json_data"
+                for candidate in (path, *path.parents)
+                if (candidate / "json_data").is_dir()
+            ),
+            repo_root / "json_data",
+        )
+
+    facts_path = command_args.library_facts or (results_root() / FACTS_FILENAME)
+
+    # ---- library pre-pass --------------------------------------------------
+    # Trace the shared library once, rooted at its own functions, and keep every
+    # answer it could resolve without a caller. Each one stands in for all the
+    # routes a process would otherwise have had to walk to reach the same call.
+    if command_args.index_libraries:
+        libraries = discover_libraries(
+            command_args.index_libraries, command_args.library_prefix
+        )
+        if not libraries:
+            raise SystemExit(
+                f"No {command_args.library_prefix}* folders with C sources under "
+                f"{command_args.index_libraries}"
+            )
+        print(f"INDEXING {len(libraries)} LIBRARY FOLDER(S)")
+        store = LibraryFactStore.load(facts_path)
+        STATE = State()
+        for library_path in libraries:
+            print(f"RUNNING FOR LIBRARY {library_path.name}")
+            try:
+                set_tool_def()
+                STATE = load_project_state(json_dir_for(library_path), command_args.targets)
+                STATE.set("TIME", f"{datetime.now():%Y%m%d_%H%M%S}")
+                STATE.set("PROJECT_NAME", library_path.name)
+                trace_variable(
+                    project_path=library_path,
+                    summary_config=summary_config,
+                    index_only=command_args.index_only,
+                    include_levels=command_args.include_levels,
+                    extra_include_dirs=command_args.include_dirs,
+                    library_mode=True,
+                )
+            except (Exception, SystemExit) as exc:
+                if not command_args.continue_on_error:
+                    raise
+                print(f"LIBRARY FAILED; CONTINUING: {library_path.name}: {exc}")
+            finally:
+                added = store.add_from_csv(
+                    results_root() / f"{library_path.name}.csv",
+                    library_path.name,
+                    library_path,
+                )
+                print(f"  {added} reusable answer(s) from {library_path.name}")
+                STATE.reset()
+        store.save(facts_path)
+        print(f"{len(store.facts)} cached library answer(s) written to {facts_path}")
+        if not (
+            command_args.project
+            or command_args.projects
+            or command_args.process_folder
+            or command_args.all_test_scada
+        ):
+            sys.exit(0)
+
+    library_facts = (
+        None if command_args.no_library_facts else LibraryFactStore.load(facts_path)
+    )
+    if library_facts and library_facts.facts:
+        print(f"USING {len(library_facts.facts)} CACHED LIBRARY ANSWER(S) FROM {facts_path}")
+
     if command_args.project:
         projects_to_run = [command_args.project.resolve()]
         batch_mode = False
@@ -1685,33 +1878,11 @@ if __name__ == "__main__":
             projects_to_run = validate_processes(projects_to_run)
         except ValueError as exc:
             raise SystemExit(str(exc)) from exc
-        summary_config = SummaryConfig.from_env()
-        if command_args.summarize_functions:
-            summary_config.enabled = True
-        elif command_args.skip_function_summaries:
-            summary_config.enabled = False
-        if command_args.summary_model:
-            summary_config.model = command_args.summary_model
-        if command_args.summary_base_url:
-            summary_config.base_url = command_args.summary_base_url
-        if command_args.wiki_url:
-            summary_config.wiki_url = command_args.wiki_url
-        if command_args.wiki_placeholder:
-            summary_config.wiki_placeholder = True
-        if command_args.summary_concurrency:
-            summary_config.concurrency = max(1, command_args.summary_concurrency)
         graph_paths: list[Path] = []
         failures: list[dict] = []
         STATE = State()
         for project_path in projects_to_run:
-            json_dir = next(
-                (
-                    candidate / "json_data"
-                    for candidate in (project_path, *project_path.parents)
-                    if (candidate / "json_data").is_dir()
-                ),
-                repo_root / "json_data",
-            )
+            json_dir = json_dir_for(project_path)
             print(f"RUNNING FOR PROJECT {project_path.name}")
             try:
                 set_tool_def()
@@ -1724,8 +1895,14 @@ if __name__ == "__main__":
                     index_only=command_args.index_only,
                     include_levels=command_args.include_levels,
                     extra_include_dirs=command_args.include_dirs,
+                    library_facts=library_facts,
                 )
                 console.print(summary)
+                if library_facts and library_facts.hits:
+                    print(
+                        f"REUSED {library_facts.hits} LIBRARY ANSWER(S) "
+                        f"(that many paths needed no LLM call)"
+                    )
                 graph_path = STATE.get("VISUALIZER_GRAPH_PATH")
                 if graph_path and Path(graph_path).is_file():
                     graph_paths.append(Path(graph_path))

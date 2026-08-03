@@ -40,9 +40,11 @@ const STR = {
     internal: "内部関数",
     daemonPort: "デーモン API ポート",
     library: "ライブラリ呼び出し",
+    libraryCode: "共通ライブラリ境界",
     unreached: "到達不能",
     functionResource: "関数 → 資源",
     planeToPlane: "平面 → 平面",
+    sharedSource: "共有ソース（同一関数）",
   },
   en: {
     frame: "Frame overview",
@@ -74,9 +76,11 @@ const STR = {
     internal: "internal function",
     daemonPort: "daemon API port",
     library: "library call",
+    libraryCode: "shared library boundary",
     unreached: "unreached",
     functionResource: "function → resource",
     planeToPlane: "plane → plane",
+    sharedSource: "shared source (same function)",
   },
 };
 
@@ -343,10 +347,12 @@ const LEGEND = [
   ["#b31414", "mainRoot"],
   ["#cf9010", "internal"],
   ["#0a6e2a", "daemonPort"],
+  ["#5d6b8a", "libraryCode"],
   ["#7b8798", "library"],
   ["#9aa5b4", "unreached"],
   ["#0e7fa8", "functionResource"],
   ["#c2185b", "planeToPlane"],
+  ["#7a5cd6", "sharedSource"],
 ];
 
 function Legend({ t }) {

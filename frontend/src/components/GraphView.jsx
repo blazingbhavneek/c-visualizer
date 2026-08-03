@@ -87,6 +87,12 @@ export default function GraphView({
         const prepared = preparedFor(pick.process.name);
         if (prepared) sceneRef.current?.openProcess(prepared, processIndexById);
       }
+      // A library opens like a process — that is what reconnects a process's
+      // boundary nodes to the code behind them.
+      if (pick.type === "library" && pick.library.loaded) {
+        const prepared = preparedFor(pick.library.name);
+        if (prepared) sceneRef.current?.openProcess(prepared, processIndexById);
+      }
       setSelection(pick);
     },
     [preparedFor, processIndexById],

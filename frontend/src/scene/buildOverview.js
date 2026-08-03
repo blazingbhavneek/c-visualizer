@@ -7,6 +7,7 @@ import { EDGE_CATEGORIES, addEdge, createRegistry, localPosition, registerNode }
 
 const PROCESS_RADIUS = 46;
 const RESOURCE_RADIUS = 22;
+const LIBRARY_RADIUS = 30;
 
 /**
  * The ground plane: processes and daemon resources as one flat graph.
@@ -79,6 +80,47 @@ export function buildOverviewLayer(overview, layout, { expandedProcesses = new S
     });
   }
 
+  // --- library nodes -------------------------------------------------------
+  // Shared code the processes are built from. Drawn outside the process ring,
+  // dimmed until its own snapshot has been indexed and loaded.
+  for (const library of overview.libraries || []) {
+    const point = positionOf(library.id);
+    const parts = [];
+
+    const mark = createResourceMark("library", LIBRARY_RADIUS, COLORS.libraryCode, {
+      opacity: library.loaded ? 1 : 0.35,
+    });
+    mark.position.set(point.x, point.y, 0.5);
+    mark.userData.pick = { type: "library", library };
+    mark.userData.nodeId = library.id;
+    group.add(mark);
+    pickables.push(mark);
+    parts.push(mark);
+
+    const label = createLabel(
+      [
+        library.name,
+        library.loaded
+          ? `library · ${library.functionCount} fn`
+          : "library · not indexed",
+      ],
+      { worldHeight: 24, fontSize: 14, color: COLORS.inkMuted, halo: SURFACE },
+    );
+    label.position.set(point.x, point.y - LIBRARY_RADIUS - 26, 0.6);
+    group.add(label);
+    labels.push(label);
+    parts.push(label);
+
+    registerNode(registry, library.id, {
+      kind: "library",
+      mesh: mark,
+      parts,
+      local: localPosition(point.x, point.y),
+      radius: LIBRARY_RADIUS,
+      data: library,
+    });
+  }
+
   // --- process nodes -------------------------------------------------------
   for (const process of overview.processes) {
     const point = positionOf(process.id);
@@ -134,18 +176,23 @@ export function buildOverviewLayer(overview, layout, { expandedProcesses = new S
     bowCounters.set(pairKey, seen + 1);
     const bow = seen === 0 ? 18 : (seen % 2 === 1 ? 1 : -1) * (18 + Math.ceil(seen / 2) * 26);
 
+    const uses = link.kind === "uses";
     addEdge(registry, group, {
       id: link.id,
       sourceId: forward ? processId : resourceId,
       targetId: forward ? resourceId : processId,
       category: EDGE_CATEGORIES.GROUND,
-      color: processColor(processIndex.get(link.processName) ?? 0),
-      opacity: 0.55,
-      arrowSize: 15,
-      arrowOpacity: 0.75,
+      // "built on" is a different relationship from "exchanges data with", so
+      // it is drawn quieter and never carries a call count.
+      color: uses ? COLORS.libraryCode : processColor(processIndex.get(link.processName) ?? 0),
+      opacity: uses ? 0.3 : 0.55,
+      arrowSize: uses ? 12 : 15,
+      arrowOpacity: uses ? 0.5 : 0.75,
       bow,
-      bidirectional: link.direction === "both",
-      labelLines: [
+      bidirectional: !uses && link.direction === "both",
+      labelLines: uses
+        ? ["uses"]
+        : [
         `${[...link.operations].join(", ")}`,
         `${link.count} call${link.count === 1 ? "" : "s"}`,
       ],

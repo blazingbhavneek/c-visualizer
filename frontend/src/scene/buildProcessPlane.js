@@ -119,7 +119,9 @@ export function buildProcessPlaneLayer({
     const isEntry = node.fn.id === entryFunctionId && !node.parent;
     const isPort = portNames.has(node.fn.name);
     const radius = radiusFor(node, isEntry, isPort);
-    const color = functionColor(node.fn, { isEntry, isPort, recursive: node.recursive });
+    const color = node.boundary
+      ? COLORS.libraryCode
+      : functionColor(node.fn, { isEntry, isPort, recursive: node.recursive });
     const parts = [];
 
     const disc = createDisc(radius, color, { opacity: node.fn.is_external && !isPort ? 0.6 : 1 });
@@ -142,21 +144,35 @@ export function buildProcessPlaneLayer({
       group.add(ring);
       parts.push(ring);
     }
+    if (node.boundary) {
+      // The edge of this process's own code: everything below it lives in the
+      // library's plane, which the ring is there to hint at.
+      const ring = createRing(radius * 1.45, COLORS.libraryCode, { opacity: 0.7 });
+      ring.position.copy(disc.position);
+      group.add(ring);
+      parts.push(ring);
+    }
 
-    const lines = labelLines(node.fn);
+    const lines = node.boundary ? [node.fn.name, `→ ${node.fn.library}`] : labelLines(node.fn);
     const label = createLabel(lines, {
       worldHeight: isEntry ? 26 : 21,
       fontSize: isEntry ? 16 : 14,
-      color: isEntry ? COLORS.entry : isPort ? COLORS.port : COLORS.ink,
+      color: isEntry
+        ? COLORS.entry
+        : node.boundary
+          ? COLORS.libraryCode
+          : isPort
+            ? COLORS.port
+            : COLORS.ink,
       bold: isEntry,
       halo: COLORS.sheet,
     });
     label.position.set(point.x, point.y - radius - 8 - lines.length * 10, 0.6);
-    // The root and the daemon API ports keep their labels at any distance -
-    // they are what the plane is *for*. Everything else is detail, hidden until
-    // the camera is close, which keeps a 120-node tree from becoming a wall of
-    // text the moment it is framed.
-    label.userData.detailLabel = !isEntry && !isPort;
+    // The root, the daemon API ports and the library boundaries keep their
+    // labels at any distance - they are what the plane is *for*. Everything
+    // else is detail, hidden until the camera is close, which keeps a 120-node
+    // tree from becoming a wall of text the moment it is framed.
+    label.userData.detailLabel = !isEntry && !isPort && !node.boundary;
     group.add(label);
     labels.push(label);
     parts.push(label);
@@ -169,6 +185,7 @@ export function buildProcessPlaneLayer({
       radius,
       data: node,
       isPort,
+      boundary: Boolean(node.boundary),
     });
     nodeAnchors.set(node.uid, new THREE.Vector3(point.x, point.y, 0));
   }
