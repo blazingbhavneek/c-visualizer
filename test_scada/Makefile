@@ -8,7 +8,8 @@ SRCS = src/main.c \
        src/alarm_proc.c \
        src/hist_proc.c \
        src/macro_flow.c \
-       src/edge_cases.c
+       src/edge_cases.c \
+       src/value_flow_cases.c
 
 INCLUDE = -Iheaders
 

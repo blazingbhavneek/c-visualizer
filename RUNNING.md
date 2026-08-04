@@ -118,11 +118,56 @@ In the browser, the things worth confirming by eye:
 python -m unittest discover -s tests -q
 ```
 
-`tests/test_wiki_graph.py` is the chat layer (21 tests). Two failures in
-`test_no_target_pipeline` and `test_parser_paths` predate this work and are
-unrelated to it.
+`tests/test_value_flow.py` covers syntax-only resolution, callback reachability,
+handle linking, reopen semantics, external origins, return-use caching, and all
+three CSV outputs. `tests/test_wiki_graph.py` exercises the chat layer when
+visualizer snapshots are present.
 
-## 7. Ports in use here
+## 7. Value-flow resolver against a local model
+
+Point the tracer at any OpenAI-compatible server and run the bundled fixture:
+
+```bash
+export TRACER_LLM_BASE_URL=http://127.0.0.1:8000/v1
+export TRACER_LLM_MODEL=<model-id-the-server-reports>
+export TRACER_LLM_API_KEY=EMPTY
+
+VISUALIZER_RESULTS_ROOT=/tmp/vf \
+  python project_aware.py --project test_scada \
+    --resolver valueflow --skip-function-summaries
+```
+
+The first line of resolver output says whether the endpoint was reachable:
+
+```
+VALUE-FLOW LLM READY: http://127.0.0.1:8000/v1 model qwen2.5-coder-7b
+VALUE-FLOW LLM DISABLED (syntax-only run): ... unreachable (APIConnectionError)
+```
+
+`DISABLED` is not fatal — the run finishes syntax-only. That probe exists
+because a wrong URL or model id otherwise costs the full per-query timeout on
+every ambiguous expression and looks like a hang.
+
+On the fixture, 59 of 67 facts resolve with no model at all. The model is asked
+only about the cases the AST cannot answer, which is what to check afterwards:
+
+```bash
+python - <<'PY'
+import csv
+rows = list(csv.DictReader(open('/tmp/vf/test_scada_value_facts.csv', encoding='utf-8-sig')))
+for row in rows:
+    if row['resolved_by'] == 'LLM' or row['origin_kind'] == 'EXTERNAL_DATA':
+        print(row['function_name'], row['target_site_line'], row['origin_kind'],
+              row['type'], row['value'])
+PY
+```
+
+Expected once a model is answering: the three `vf_pick_file()` rows resolve to
+`0x1002`, and the discarded `scf_file_access` return gets `READF` or `WRITEF`
+instead of `UNRESOLVED`. `results/csv_results/stats/<process>_VALUEFLOW_STATS.json`
+records `llm_query_count` and token totals for the run.
+
+## 8. Ports in use here
 
 | port | what |
 |---|---|

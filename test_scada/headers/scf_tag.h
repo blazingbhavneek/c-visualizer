@@ -20,6 +20,13 @@ int   scf_hist_save(int archive_id, void *rec);             /* SAVEF  */
 void *scf_hist_load(int archive_id, void *buf);             /* LOADF (returns loaded record ptr) */
 int   scf_cfg_clear(int cfg_id);                            /* CLEARF */
 
+/* Handle-bound API used to validate dependent_functions value flow. */
+int   scf_file_open  (TagCtx *ctx, int file_no);
+int   scf_file_read  (TagCtx *ctx, void *buf);
+int   scf_file_write (TagCtx *ctx, const void *buf);
+int   scf_file_close (TagCtx *ctx);
+void *scf_file_access(TagCtx *ctx);
+
 /* Shared snapshot context used by the TAG_SNAPSHOT macro. */
 extern TagCtx g_snap_ctx;
 

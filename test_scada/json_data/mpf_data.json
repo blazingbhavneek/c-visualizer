@@ -7,6 +7,11 @@
   "scf_hist_save":    { "type": "SAVEF",  "launch": "FORK", "indices": [1],    "get_upper": true,  "dependent_functions": [] },
   "scf_hist_load":    { "type": "LOADF",  "launch": "FORK", "indices": [1],    "get_upper": false, "dependent_functions": [] },
   "scf_cfg_clear":    { "type": "CLEARF", "launch": "FORK", "indices": [1],    "get_upper": true,  "dependent_functions": [] },
+  "scf_file_open":    { "type": "OPENF",  "launch": "FORK", "indices": [2],    "handle_index": 1, "get_upper": true, "dependent_functions": [] },
+  "scf_file_read":    { "type": "READF",  "launch": "FORK", "indices": [],     "handle_index": 1, "get_upper": true, "dependent_functions": ["scf_file_open"] },
+  "scf_file_write":   { "type": "WRITEF", "launch": "FORK", "indices": [],     "handle_index": 1, "get_upper": true, "dependent_functions": ["scf_file_open"] },
+  "scf_file_close":   { "type": "CLOSEF", "launch": "FORK", "indices": [],     "handle_index": 1, "get_upper": true, "dependent_functions": ["scf_file_open"] },
+  "scf_file_access":  { "type": "WRITEF/READF", "launch": "FORK", "indices": [], "handle_index": 1, "get_upper": false, "dependent_functions": ["scf_file_open"] },
 
   "scf_alarmq_enq":   { "type": "ENQ",    "launch": "FORK", "indices": [1, 2], "get_upper": true,  "dependent_functions": [] },
   "scf_alarmq_deq":   { "type": "DEQ",    "launch": "FORK", "indices": [1],    "get_upper": true,  "dependent_functions": [] },

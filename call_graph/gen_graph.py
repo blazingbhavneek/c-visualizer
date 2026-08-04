@@ -15,9 +15,21 @@ import json
 
 import numpy as np
 
+from output_paths import target_results_dir
 from state.state import State
 
 BLOCKS = r"\[([^\[\]]*)\]"
+
+
+def graph_output_dir(destination_name: str) -> Path:
+    """Per-target graph directory under the configured results root.
+
+    This used to be an absolute path on one machine, so the diagrams silently
+    went somewhere the caller was not looking.
+    """
+    return target_results_dir(
+        State().get("PROJECT_NAME", default="DBG"), destination_name
+    )
 
 
 def process_first_block(first_block: str) -> tuple[str, int] | int | str:
@@ -342,12 +354,9 @@ def visualize_large_graph(
     # ================================================================
     # Save
     # ================================================================
-    results_path = Path(
-        f"/home/seigyo/c_repo/c_repo/results/csv_results/graphs/"
-        f'{State().get("PROJECT_NAME", default="DBG")}/{destination_name}'
-    )
+    results_path = graph_output_dir(destination_name)
     results_path.mkdir(parents=True, exist_ok=True)
-    net.show(str(results_path / f"graph_{destination_name}.html"), notebook=False)
+    net.show(str(results_path / "graph.html"), notebook=False)
     # return net
 
 
@@ -459,11 +468,9 @@ def make_graph(
     # print(mermaid_diag)
     # pprint(adjacency_dict)
     mermaid_diag = graph_to_mermaid(graph=adjacency_dict)
-    results_path = Path(
-        f"/home/seigyo/c_repo/c_repo/results/csv_results/graphs/{State().get('PROJECT_NAME',default='DBG')}/{destination_name}"
-    )
+    results_path = graph_output_dir(destination_name)
     results_path.mkdir(parents=True, exist_ok=True)
-    with open(results_path / f"graph_{destination_name}.md", "w") as f:
+    with open(results_path / "graph.md", "w") as f:
         f.write(f"DIAGRAM FOR {destination_name}\n```mermaid\n{mermaid_diag}\n```")
 
     # print(mermaid_diag)

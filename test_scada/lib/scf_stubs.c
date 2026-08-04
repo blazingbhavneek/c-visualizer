@@ -23,6 +23,11 @@ int   scf_tag_copy (int src_id, int dst_id)               { (void)src_id; (void)
 int   scf_hist_save(int archive_id, void *rec)            { (void)archive_id; (void)rec; return 0; }
 void *scf_hist_load(int archive_id, void *buf)            { (void)archive_id; (void)buf; return 0; }
 int   scf_cfg_clear(int cfg_id)                           { (void)cfg_id; return 0; }
+int   scf_file_open(TagCtx *ctx, int file_no)             { (void)ctx; (void)file_no; return 0; }
+int   scf_file_read(TagCtx *ctx, void *buf)                { (void)ctx; (void)buf; return 0; }
+int   scf_file_write(TagCtx *ctx, const void *buf)         { (void)ctx; (void)buf; return 0; }
+int   scf_file_close(TagCtx *ctx)                          { (void)ctx; return 0; }
+void *scf_file_access(TagCtx *ctx)                         { (void)ctx; return 0; }
 
 /* ---- queue ---- */
 int scf_alarmq_enq(int queue_id, int alarm_code) { (void)queue_id; (void)alarm_code; return 0; }

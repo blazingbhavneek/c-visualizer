@@ -405,7 +405,12 @@ class CallGraphBuilder:
                     line_number = node.start_point.row + 1
 
                     # ── Create call-site ────────────────────────────────
-                    call_site = CallSite(callee=callee_node, line_number=line_number)
+                    call_site = CallSite(
+                        callee=callee_node,
+                        line_number=line_number,
+                        start_byte=node.start_byte,
+                        end_byte=node.end_byte,
+                    )
                     self.graph[caller_node.unique_id].append(call_site)
 
                     # ── Function-pointer argument handling ──────────────
@@ -456,7 +461,12 @@ class CallGraphBuilder:
                         name="indirect_call", file_name="", is_external=True
                     )
                     self.graph[caller_node.unique_id].append(
-                        CallSite(callee=indirect_node, line_number=line)
+                        CallSite(
+                            callee=indirect_node,
+                            line_number=line,
+                            start_byte=node.start_byte,
+                            end_byte=node.end_byte,
+                        )
                     )
 
             for child in reversed(node.children):

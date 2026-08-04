@@ -1,4 +1,7 @@
 #include "app.h"
+
+void value_flow_cases(int mode);
+void value_flow_external_handler(int event_no, void *data);
 #include "scf_event.h"
 #include "scf_tag.h"
 #include "scf_const.h"
@@ -110,6 +113,10 @@ int main(void)
 
     /* Run edge-case simulator and other extended test flows. */
     ec_run();
+
+    /* Value-flow resolver fixture: handle binding, reopen, and callbacks. */
+    value_flow_cases(1);
+    scf_evt_register(EVT_HIST_FLUSH, (EvtHandler)value_flow_external_handler);
 
     return 0;
 }

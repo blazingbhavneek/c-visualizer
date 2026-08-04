@@ -61,8 +61,9 @@ from models import (
     aiDetermined,
     outputModel,
     outputModelForReturn,
+    outputModelOneHop,
 )
-from output_paths import results_root
+from output_paths import process_results_dir, results_root, target_results_dir
 from process_groups import (
     discover_processes,
     load_project_state,
@@ -80,6 +81,9 @@ from visualizer_export import (
     build_complete_call_graph,
     build_complete_file_functions,
 )
+from value_flow.outputs import write_outputs, write_trace_logs
+from value_flow.queries import OneHopAnswer
+from value_flow.resolver import IndexedSite, ValueFlowResolver
 
 # endregion Imports
 
@@ -597,13 +601,149 @@ def llm_calls(
     return ans, stats
 
 
+def llm_calls_one_hop(
+    project_structure: dict[str, str],
+    function_name_to_trace: str,
+    argument_number: int,
+    initial_context: str,
+    expression: str,
+) -> tuple[type[BaseModel], dict[str, any]]:
+    """Resolve one call-site expression without asking for a main-to-target path."""
+    state = State()
+    data = {
+        "user_prompt": """
+Where does argument {argument_number} of {function_name_to_trace} get its value?
+The expression at that position is: {expression}
+
+INITIAL_CONTEXT:
+{initial_context}
+""",
+        "system_prompt": """
+You are a conservative C value-flow analyser. You answer ONE question about ONE
+call site: where the named argument's value comes from. Do not follow callers of
+the enclosing function -- that hop is handled for you.
+
+Answer with a JSON object using EXACTLY these field names:
+
+  kind         one of "VALUE", "PARAM", "EXTERNAL", "UNRESOLVED"
+  value        the concrete literal, when kind is "VALUE"
+  param_index  the 1-based parameter position, when kind is "PARAM"
+  source_expr  the expression the value came from (always useful)
+
+How to choose kind:
+
+- "VALUE": the expression resolves to a concrete literal here. This includes a
+  macro that expands to a literal, and a call to a function whose body you can
+  read that returns a literal or macro. USE find_definition to read any function
+  or macro you do not already see in the context -- a call you have not looked
+  at is NOT automatically external.
+    {{"kind": "VALUE", "value": "0x1002", "source_expr": "pick_file()"}}
+
+- "PARAM": the value arrives unchanged as a parameter of the enclosing function.
+  Give its 1-based position.
+    {{"kind": "PARAM", "param_index": 1, "source_expr": "file_no"}}
+
+- "EXTERNAL": the value genuinely originates outside the program -- a message or
+  packet field, user input, a device/socket read, or a global written by another
+  process. Only after find_definition has failed to reach a literal.
+    {{"kind": "EXTERNAL", "source_expr": "msg->file_no"}}
+
+- "UNRESOLVED": you cannot tell.
+
+If several control-flow paths reach the call with different values, do not pick
+the last textual assignment; answer "UNRESOLVED" instead.
+""",
+        "tools": state.get("TOOL_DEFINITION"),
+        "tool_functions": state.get("TOOLS"),
+        "project_structure": project_structure,
+        "function_map": state.get("FUNCTION_MAP"),
+        "output_model": outputModelOneHop,
+    }
+    client = OllamaClient(data=data)
+    return client.start_tool_chain(
+        prompt_data={
+            "user_prompt": {
+                "argument_number": argument_number,
+                # start_tool_chain reads this key when it re-prompts for a
+                # schema-valid answer; str.format ignores the unused extra.
+                "argument_numbers": [argument_number],
+                "function_name_to_trace": function_name_to_trace,
+                "initial_context": initial_context,
+                "expression": expression,
+            },
+            "system_prompt": {},
+        }
+    )
+
+
+def llm_endpoint_status(timeout: float = 10.0) -> tuple[bool, str]:
+    """Probe the configured OpenAI-compatible endpoint before the resolver runs.
+
+    ``run_with_retry`` spends its full timeout on every query when the endpoint
+    is wrong or down, which reads as a hung run rather than a misconfiguration.
+    One cheap probe up front turns that into a single clear line.
+    """
+    from openai import OpenAI
+
+    base_url = os.environ.get("TRACER_LLM_BASE_URL", "http://175.28.230.22:54062/v1")
+    model = os.environ.get("TRACER_LLM_MODEL", "gemma-4-31B")
+    try:
+        client = OpenAI(
+            api_key=os.environ.get("TRACER_LLM_API_KEY", "EMPTY"),
+            base_url=base_url,
+            timeout=timeout,
+            max_retries=0,
+        )
+        served = [item.id for item in client.models.list().data]
+    except Exception as exc:
+        return False, f"{base_url} unreachable ({type(exc).__name__}: {exc})"
+    if served and model not in served:
+        return False, f"{base_url} serves {served}, not configured model {model!r}"
+    return True, f"{base_url} model {model}"
+
+
+# ``fork`` is what this worker has always relied on: the child inherits the
+# State() singleton (tools, function map) and the local target needs no
+# pickling.  macOS defaults to ``spawn``, where both of those break, so the
+# context is selected explicitly rather than left to the platform default.
+_RETRY_CONTEXT = multiprocessing.get_context(
+    "fork" if "fork" in multiprocessing.get_all_start_methods() else "spawn"
+)
+
+
+def write_unique_path_report(
+    *,
+    function: str,
+    process_name: str,
+    all_paths_rows: list[dict],
+    invocation_rows: list[dict],
+) -> Path:
+    """Two-sheet audit workbook: paths considered, and unique target invocations.
+
+    Shared by both resolvers so the file name, sheet names and columns stay
+    identical whichever engine produced the rows.
+    """
+    path_report = target_results_dir(process_name, function) / "unique_paths.xlsx"
+    path_report.parent.mkdir(parents=True, exist_ok=True)
+    with pd.ExcelWriter(path_report, engine="openpyxl") as writer:
+        pd.DataFrame(all_paths_rows).to_excel(writer, sheet_name="all_paths", index=False)
+        pd.DataFrame(invocation_rows).to_excel(
+            writer, sheet_name="unique_target_invocations", index=False
+        )
+    print(
+        f"Unique-path report written to {path_report} "
+        f"({len(all_paths_rows)} paths; {len(invocation_rows)} target invocations)"
+    )
+    return path_report
+
+
 def run_with_retry(func, args=(), timeout=180, retries=2):
     if not isinstance(args, (tuple, list)):
         args = (args,)
 
     for attempt in range(retries):
         # Create the pipe inside the loop so each attempt gets a fresh connection
-        parent_conn, child_conn = multiprocessing.Pipe()
+        parent_conn, child_conn = _RETRY_CONTEXT.Pipe()
 
         def target_wrapper(conn, *func_args):
             try:
@@ -614,7 +754,7 @@ def run_with_retry(func, args=(), timeout=180, retries=2):
             finally:
                 conn.close()
 
-        process = multiprocessing.Process(
+        process = _RETRY_CONTEXT.Process(
             target=target_wrapper, args=(child_conn, *args)
         )
         process.start()
@@ -869,19 +1009,11 @@ async def make_llm_calls_for_function(
             sorted(invocation_paths.items()), start=1
         )
     ]
-    safe_function_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", function).strip("_")
-    path_report = results_root() / (
-        f"{Path(project_path).name}_{safe_function_name}_unique_paths.xlsx"
-    )
-    path_report.parent.mkdir(parents=True, exist_ok=True)
-    with pd.ExcelWriter(path_report, engine="openpyxl") as writer:
-        pd.DataFrame(all_paths_rows).to_excel(writer, sheet_name="all_paths", index=False)
-        pd.DataFrame(invocation_rows).to_excel(
-            writer, sheet_name="unique_target_invocations", index=False
-        )
-    print(
-        f"Unique-path report written to {path_report} "
-        f"({len(all_paths_rows)} paths; {len(invocation_rows)} target invocations)"
+    write_unique_path_report(
+        function=function,
+        process_name=Path(project_path).name,
+        all_paths_rows=all_paths_rows,
+        invocation_rows=invocation_rows,
     )
     # print_or_return_possible_paths_trees(paths=path_strs) FOR JUST PRINTING ALL PATH TREES BEFOREHAND FOR OBSERVATION..
     # endregion
@@ -1372,12 +1504,389 @@ async def make_llm_calls_for_function(
     return function_answer_csv
 
 
+async def make_value_flow_calls(
+    *,
+    graph: dict,
+    registry: dict,
+    trees: dict,
+    functions_identified: dict[str, dict[str, any]],
+    answers: dict[str, list[tuple[BaseModel, BaseModel]]],
+    main_file_name: str,
+    function_pointer_args: dict,
+    file_functions: dict,
+    project_structure: dict[str, str],
+    project_path: Path,
+    path_cap: int = 100,
+    llm_concurrency: int = 20,
+) -> list:
+    """Run the additive backward resolver once for every target in a process."""
+    state = State()
+    process_name = project_path.name
+    file_name_bytes = {key: value[1] for key, value in trees.items()}
+    configured = state.get("FUNCTION_TYPES") or {}
+    # Limit seeds to detected APIs, but retain dependent/open configurations
+    # needed by handle resolution.
+    valueflow_configs = {
+        name: dict(configured.get(name, config))
+        for name, config in functions_identified.items()
+    }
+    for config in functions_identified.values():
+        for dependency in config.get("dependent_functions") or []:
+            if dependency in configured:
+                valueflow_configs.setdefault(dependency, dict(configured[dependency]))
+
+    token_totals = {"Input_tokens": 0, "Output_tokens": 0, "Total_tokens": 0}
+    query_stats: list[dict] = []
+
+    def record_stats(kind: str, site: IndexedSite, stats) -> None:
+        if stats is None:
+            return
+        stats_dict = stats.model_dump() if hasattr(stats, "model_dump") else dict(stats)
+        tokens = stats_dict.get("Tokens") or {}
+        for key in token_totals:
+            token_totals[key] += int(tokens.get(key, 0) or 0)
+        query_stats.append(
+            {
+                "kind": kind,
+                "call_site_id": site.site_id,
+                "function": site.callee_name,
+                "stats": stats_dict,
+            }
+        )
+
+    def context_for(site: IndexedSite, *, get_upper: bool) -> tuple[list[str], str]:
+        caller = registry.get(site.caller_id)
+        callee = registry.get(site.callee_id) or site.raw_call_site.callee
+        if caller is None:
+            return [], ""
+        path = [caller.label]
+        if site.macro_name:
+            # parseFiles emits the "signature -> replacement" comment only when
+            # the macro proxy node is on the path, which is what lets the model
+            # remap argument positions across the expansion.
+            path.append(site.raw_call_site.callee.label_with_line(line=site.line))
+        path.append(callee.label_with_line(line=site.line))
+        parser = parseFiles(
+            project_structure=project_structure,
+            paths=[path],
+            macro_data=state.get("BUILDER_MACROS") or {},
+            file_name_bytes=file_name_bytes,
+        )
+        _, context = parser.parse_for_path(path, get_upper=get_upper)
+        return path, context
+
+    async def resolve_one_hop(
+        site: IndexedSite, argument_number: int, expression: str
+    ) -> OneHopAnswer | None:
+        path, context = context_for(site, get_upper=True)
+        if not path:
+            return None
+        print(
+            f"{ORANGE}  LLM one-hop{RESET} {site.file_name}:{site.line} "
+            f"{site.callee_name} arg {argument_number} -> {expression!r}"
+        )
+        result = await asyncio.to_thread(
+            run_with_retry,
+            llm_calls_one_hop,
+            (
+                project_structure,
+                site.callee_name,
+                argument_number,
+                context,
+                expression,
+            ),
+        )
+        if result:
+            model, stats = result
+            record_stats("one_hop", site, stats)
+            model_data = model.model_dump() if hasattr(model, "model_dump") else model
+            try:
+                return OneHopAnswer(**model_data)
+            except (TypeError, ValueError):
+                pass
+
+        # Per-query safety fallback: re-ask the same annotated sub-problem with
+        # the established tracer prompt, which tolerates expressions the strict
+        # one-hop schema rejects. Reached only after a one-hop failure.
+        fallback = await asyncio.to_thread(
+            run_with_retry,
+            llm_calls,
+            (
+                project_structure,
+                site.callee_name,
+                [argument_number],
+                context,
+                "->".join(re.sub(r"\[([^\[\]]*)\]", "", node) for node in path),
+                True,
+            ),
+        )
+        if not fallback:
+            return None
+        model, stats = fallback
+        record_stats("legacy_subproblem_fallback", site, stats)
+        output = (model.model_dump() if hasattr(model, "model_dump") else model).get(
+            "output", ""
+        )
+        for item in output.split(","):
+            if ":" not in item:
+                continue
+            index, value = item.split(":", 1)
+            if index.strip() != str(argument_number):
+                continue
+            cleaned = value.strip().strip('"')
+            # The legacy prompt answers "index:value". Guard against a control
+            # token echoing back as if it were the resolved value.
+            if cleaned and cleaned.upper() not in {
+                "UNRESOLVED",
+                "EXTERNAL",
+                "PARAM",
+                "VALUE",
+                "NO TARGET",
+            }:
+                return OneHopAnswer(kind="VALUE", value=cleaned)
+        return None
+
+    async def resolve_return_use(site: IndexedSite, function_name: str) -> str | None:
+        path, context = context_for(site, get_upper=False)
+        if not path:
+            return None
+        print(
+            f"{ORANGE}  LLM return-use{RESET} {site.file_name}:{site.line} "
+            f"{function_name}"
+        )
+        result = await asyncio.to_thread(
+            run_with_retry,
+            llm_calls,
+            (
+                project_structure,
+                function_name,
+                [-1],
+                context,
+                "->".join(re.sub(r"\[([^\[\]]*)\]", "", node) for node in path),
+                False,
+            ),
+        )
+        if not result:
+            return None
+        model, stats = result
+        record_stats("return_use", site, stats)
+        return (model.model_dump() if hasattr(model, "model_dump") else model).get(
+            "output"
+        )
+
+    async def resolve_handle_with_llm(
+        site: IndexedSite, argument_number: int, dependencies: tuple[str, ...]
+    ) -> list[OneHopAnswer] | None:
+        path, context = context_for(site, get_upper=True)
+        if not path:
+            return None
+        dependency_text = ", ".join(dependencies)
+        result = await asyncio.to_thread(
+            run_with_retry,
+            llm_calls_one_hop,
+            (
+                project_structure,
+                site.callee_name,
+                max(1, argument_number),
+                context,
+                f"handle binding for argument {argument_number}; resolve the configured open family {dependency_text}",
+            ),
+        )
+        if not result:
+            return None
+        model, stats = result
+        record_stats("handle_link", site, stats)
+        data = model.model_dump() if hasattr(model, "model_dump") else model
+        try:
+            answer = OneHopAnswer(**data)
+        except (TypeError, ValueError):
+            return None
+        return [answer] if answer.kind == "VALUE" else None
+
+    resolved_count = [0]
+
+    def report_seed(seed, rows, seconds: float) -> None:
+        resolved_count[0] += 1
+        values = ", ".join(
+            f"{row.fact.value} ({row.fact.origin_kind})" for row in rows
+        )
+        print(
+            f"[{resolved_count[0]}/{len(resolver.seeds)}] {seconds:6.2f}s "
+            f"{seed.target_function} {seed.site.file_name}:{seed.site.line}"
+            f" -> {values or 'no target'}"
+        )
+
+    llm_ready, llm_status = llm_endpoint_status()
+    print(
+        f"{BOLD}{GREEN if llm_ready else ORANGE}VALUE-FLOW LLM "
+        f"{'READY' if llm_ready else 'DISABLED (syntax-only run)'}{RESET}: {llm_status}"
+    )
+
+    cache_path = process_results_dir(process_name) / "query_cache.json"
+    resolver = ValueFlowResolver(
+        graph=graph,
+        registry=registry,
+        trees=trees,
+        project_structure=project_structure,
+        main_file_name=main_file_name,
+        function_configs=valueflow_configs,
+        macros=state.get("BUILDER_MACROS") or {},
+        file_macros=state.get("MACROS") or {},
+        one_hop_resolver=resolve_one_hop if llm_ready else None,
+        return_use_resolver=resolve_return_use if llm_ready else None,
+        handle_llm_resolver=resolve_handle_with_llm if llm_ready else None,
+        cache_path=cache_path,
+        path_cap=path_cap,
+        llm_concurrency=llm_concurrency,
+        progress=report_seed,
+    )
+    print(
+        f"Resolving {len(resolver.seeds)} target invocation(s) "
+        f"with LLM concurrency {llm_concurrency}"
+    )
+    started_at = time.perf_counter()
+    records = await resolver.run()
+    run_stats = {
+        "resolver": "valueflow",
+        "wall_seconds": round(time.perf_counter() - started_at, 3),
+        "llm_concurrency": llm_concurrency,
+        "seed_count": len(resolver.seeds),
+        "fact_count": len(records),
+        "answered_query_count": len(resolver.results),
+        "llm_query_count": len(query_stats),
+        "Tokens": token_totals,
+        "queries": query_stats,
+    }
+    output_paths = write_outputs(
+        records=records,
+        resolver=resolver,
+        process_name=process_name,
+        output_root=results_root(),
+        run_stats=run_stats,
+    )
+    log_dir = write_trace_logs(
+        records=records,
+        resolver=resolver,
+        process_name=process_name,
+        output_root=results_root(),
+    )
+    # Same per-target artefacts the legacy branch produced -- audit workbook,
+    # visualizer traces, mermaid/pyvis diagrams -- built from resolver records.
+    collector = state.get("VISUALIZER_COLLECTOR")
+    grouped: dict[str, list] = defaultdict(list)
+    for record in records:
+        grouped[record.seed.target_function].append(record)
+    for target_function, function_records in sorted(grouped.items()):
+        drawn = [item.legacy_labels for item in function_records if item.legacy_labels]
+        write_unique_path_report(
+            function=target_function,
+            process_name=process_name,
+            all_paths_rows=[
+                {
+                    "path_number": number,
+                    "target_function": target_function,
+                    "node_count": len(path),
+                    "path": " -> ".join(path),
+                }
+                for number, path in enumerate(
+                    (path for item in function_records for path in item.paths), start=1
+                )
+            ],
+            invocation_rows=[
+                {
+                    "invocation_number": number,
+                    "target_function": target_function,
+                    "target_source_path": site_id_rows[0].seed.site.file_path,
+                    "target_source_line": site_id_rows[0].seed.site.line,
+                    "reachable_unique_path_count": sum(
+                        item.path_count for item in site_id_rows
+                    ),
+                }
+                for number, site_id_rows in enumerate(
+                    (
+                        [
+                            item
+                            for item in function_records
+                            if item.seed.site.site_id == site_id
+                        ]
+                        for site_id in dict.fromkeys(
+                            item.seed.site.site_id for item in function_records
+                        )
+                    ),
+                    start=1,
+                )
+            ],
+        )
+        if collector is not None:
+            collector.capture_call_graph(
+                graph=state.get("CALL_GRAPH"),
+                registry=state.get("FUNCTION_REGISTRY"),
+                target_function=target_function,
+                trace_paths=drawn,
+            )
+        try:
+            make_graph(paths=drawn)
+        except Exception as exc:
+            # Drawing is presentation only; never lose a resolved run over it.
+            print(f"Could not draw the graph for {target_function}: {exc}")
+    print(
+        f"Value-flow outputs written: {output_paths.facts} and {output_paths.paths} "
+        f"({len(resolver.seeds)} target invocations; {len(records)} facts)"
+    )
+    print(f"Per-path resolution logs: {log_dir}")
+
+    stats_path = process_results_dir(process_name) / "run_stats.json"
+    stats_path.parent.mkdir(parents=True, exist_ok=True)
+    stats_path.write_text(
+        json.dumps(run_stats, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+
+    empty_stats = Stats.model_validate(
+        {
+            "Tokens": {"Input_tokens": 0, "Output_tokens": 0, "Total_tokens": 0},
+            "Iterations": 0,
+            "Random_tool_calls": 0,
+            "Other_tool_errors": 0,
+            "Incorrect_details": [],
+        }
+    )
+    for record in records:
+        path_string = "->".join(record.legacy_labels)
+        combined = Combined.model_validate(
+            {
+                "call_number": record.call_number,
+                "target_number": {
+                    "path_str": path_string,
+                    "ans": [record.fact.value],
+                },
+                "process_name": process_name,
+                "launch_via": record.seed.launch_via,
+                "call_function": record.seed.call_function,
+                "function_name": record.seed.target_function,
+                "type": record.operation,
+                "function_name_src": {
+                    "path": record.seed.function_source_file or project_path,
+                    "line_number": str(record.seed.function_source_line),
+                },
+                "target_name_src": {
+                    "path": record.seed.site.file_path,
+                    "line_number": str(record.seed.site.line),
+                },
+            }
+        )
+        answers[record.seed.target_function].append((combined, empty_stats))
+    return records
+
+
 @time_it()
 def trace_variable(
     project_path: Path | str,
     summary_config: SummaryConfig | None = None,
     *,
     index_only: bool = False,
+    resolver: Literal["legacy", "valueflow"] = "legacy",
+    valueflow_path_cap: int = 100,
+    valueflow_concurrency: int = 20,
 ):
     STATE = State()
     project_path = Path(project_path)
@@ -1505,7 +2014,7 @@ def trace_variable(
         print(
             f"{BOLD}{RED}NO FUNCTIONS IDENTIFIED IN THE PROJECT {project_path.name}.{RESET}"
         )
-        return None
+        return {}
     console.print(
         "-" * 10, "DETECTED FUNCTIONS NEEDS TO BE TRACED AND THEIR ARG. NUMS.", "-" * 10
     )
@@ -1523,25 +2032,40 @@ def trace_variable(
     print("This is the main file::", main_file_name)
     # sys.exit()
     data_csvs = []
-    for function in functions_identified:
-        # if function == 'mpf_mfs_open' or function=='mpf_mfs_close' or function=='mpf_mfs_getrec': continue
-        # if 'pmf_addevent' not in function: continue
-        # if function != 'mpf_mfs_open':continue
-        # if project_path.name == 'dio120d' : continue
-        STATE.set("CURRENT_PROCESSED_FUNCTION", function)
-        function_dataframes: list | None = asyncio.run(make_llm_calls_for_function(
-            function=function,
-            trees=trees,
-            functions_identified=functions_identified,
-            answers=answers,  # will be modified in place
-            main_file_name=main_file_name,
-            function_pointer_args=FUNCTION_POINTER_ARGS,  # TODO: need the same for these or make a state class holding these vars together.
-            file_functions=FILE_FUNCTIONS,
-            project_structure=PROJECT_STRUCTURE,
-            project_path=project_path,
-        ))
-        if function_dataframes is not None:
-            data_csvs = [*data_csvs, *function_dataframes]
+    if resolver == "valueflow":
+        asyncio.run(
+            make_value_flow_calls(
+                graph=graph,
+                registry=registry,
+                trees=trees,
+                functions_identified=functions_identified,
+                answers=answers,
+                main_file_name=main_file_name,
+                function_pointer_args=FUNCTION_POINTER_ARGS,
+                file_functions=FILE_FUNCTIONS,
+                project_structure=PROJECT_STRUCTURE,
+                project_path=project_path,
+                path_cap=valueflow_path_cap,
+                llm_concurrency=valueflow_concurrency,
+            )
+        )
+    else:
+        for function in functions_identified:
+            # The legacy path enumerator is intentionally retained as a run-level fallback.
+            STATE.set("CURRENT_PROCESSED_FUNCTION", function)
+            function_dataframes: list | None = asyncio.run(make_llm_calls_for_function(
+                function=function,
+                trees=trees,
+                functions_identified=functions_identified,
+                answers=answers,  # will be modified in place
+                main_file_name=main_file_name,
+                function_pointer_args=FUNCTION_POINTER_ARGS,
+                file_functions=FILE_FUNCTIONS,
+                project_structure=PROJECT_STRUCTURE,
+                project_path=project_path,
+            ))
+            if function_dataframes is not None:
+                data_csvs = [*data_csvs, *function_dataframes]
 
     # Full result data can be very large for projects with many paths.
     # console.print(data_csvs)
@@ -1692,6 +2216,24 @@ if __name__ == "__main__":
         action="store_true",
         help="Build the complete code graph (and optional summaries) without target-variable LLM tracing.",
     )
+    argument_parser.add_argument(
+        "--resolver",
+        choices=("valueflow", "legacy"),
+        default="legacy",
+        help="Target tracing engine. Default legacy until a valueflow run is diffed against it on the real sources.",
+    )
+    argument_parser.add_argument(
+        "--valueflow-path-cap",
+        type=int,
+        default=100,
+        help="Maximum provenance paths written per fact; the true count is retained.",
+    )
+    argument_parser.add_argument(
+        "--valueflow-concurrency",
+        type=int,
+        default=1,
+        help="Concurrent value-flow model queries (default 1, so the run is watchable).",
+    )
     command_args = argument_parser.parse_args()
     if command_args.llm_model:
         os.environ["TRACER_LLM_MODEL"] = command_args.llm_model
@@ -1796,6 +2338,9 @@ if __name__ == "__main__":
                     project_path=project_path,
                     summary_config=summary_config,
                     index_only=command_args.index_only,
+                    resolver=command_args.resolver,
+                    valueflow_path_cap=max(1, command_args.valueflow_path_cap),
+                    valueflow_concurrency=max(1, command_args.valueflow_concurrency),
                 )
                 console.print(summary)
                 graph_path = STATE.get("VISUALIZER_GRAPH_PATH")

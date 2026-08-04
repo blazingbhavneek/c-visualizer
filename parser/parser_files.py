@@ -226,6 +226,10 @@ class parseFiles:
             second_block_result = self.process_second_block(second_block=second_block)
 
             if second_block_result and file_name:
+                # The terminal node exists only to supply the selected call
+                # line for its caller; it contributes no body of its own.
+                if index + 1 >= len(path):
+                    continue
                 start_line = second_block_result[0]
                 end_line = second_block_result[1]
 

@@ -69,6 +69,34 @@ daemon-resource interactions. Omit it for the real multi-process interaction
 run. Function summaries and llm-wiki lookup are orthogonal and may be enabled
 for any single, list, or folder run.
 
+## Target-value resolver
+
+`--resolver valueflow` starts at each configured API invocation, walks only
+value-carrying caller edges, resolves literals and constant macros locally, and
+uses the tracer LLM only when syntax is ambiguous. That avoids enumerating every
+main-to-target path, which is what makes large processes slow.
+
+The default is still `legacy`, the original path enumerator. Promote valueflow
+to the default only after diffing the two on real sources:
+
+```bash
+.venv/bin/python project_aware.py --project /src/process-a --resolver legacy
+.venv/bin/python project_aware.py --project /src/process-a --resolver valueflow
+```
+
+Value-flow runs write these files under `results/csv_results/`:
+
+- `<process>_value_facts.csv`: one source/argument fact per exact target call;
+- `<process>_value_paths.csv`: source-to-target provenance paths joined by
+  `fact_id` (capped at 100 rows per fact by default);
+- `<process>.csv`: the legacy machine-readable feed consumed by the visualizer;
+- `<process>_value_path_truncations.log`: which facts hit the path cap.
+
+Use `--valueflow-path-cap N` to change only the number of path rows written.
+The fact table always retains the true `path_count`. Query answers are resumed
+from `value_flow_cache/<process>.json` and invalidated when sources or target
+configuration change.
+
 ## Enable bottom-up function summaries
 
 ```bash

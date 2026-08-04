@@ -25,6 +25,16 @@ class outputModelForReturn(BaseModel):
     )
 
 
+class outputModelOneHop(BaseModel):
+    """A local data-flow answer which can explicitly continue through a parameter."""
+
+    model_config = ConfigDict(extra="forbid")
+    kind: Literal["VALUE", "PARAM", "EXTERNAL", "UNRESOLVED"]
+    value: str | None = None
+    param_index: int | None = Field(default=None, ge=1)
+    source_expr: str | None = None
+
+
 # endregion
 class Target(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -101,6 +111,10 @@ class Combined(aiDetermined):
         "MESSAGE",
         "ENQFORK",
         "ENQSEM",
+        # Configured by SIGNAL/INPUT registrars; previously missing here even
+        # though launch_via already accepted both.
+        "SIGNAL",
+        "INPUT",
         "NO DATA",
         "UNRESOLVED",
     ] = Field(description="Type of operation.")
