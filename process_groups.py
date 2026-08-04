@@ -31,24 +31,17 @@ _IGNORED_DISCOVERY_DIRS = {
 }
 
 
-def load_project_state(json_dir: Path, targets_path: Path | None = None):
+def load_project_state(json_dir: Path):
     """Load one process family's configuration without changing legacy loaders."""
     import pickle
 
     from state.state import State
 
     json_dir = json_dir.expanduser().resolve()
-    # An updated targets file is the only thing that changes between an initial
-    # run and a run that adds more tracked arguments to the same process.
-    targets_file = (
-        Path(targets_path).expanduser().resolve()
-        if targets_path
-        else json_dir / "mpf_data.json"
-    )
     state = State()
     state.set(
         "FUNCTION_TYPES",
-        json.loads(targets_file.read_text(encoding="utf-8")),
+        json.loads((json_dir / "mpf_data.json").read_text(encoding="utf-8")),
     )
     state.set(
         "FUNCTION_POINTER_ARGS",

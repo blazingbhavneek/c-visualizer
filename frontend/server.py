@@ -232,8 +232,8 @@ def main():
         handler = type("VisualizerChatHandler", (WikiHandlerMixin, VisualizerHandler), {})
         handler.wiki_service = WikiService(VisualizerHandler.results_root)
 
-    server = ThreadingHTTPServer(("127.0.0.1", args.port), handler)
-    print(f"Visualizer: http://127.0.0.1:{args.port}")
+    server = ThreadingHTTPServer(("0.0.0.0", args.port), handler)
+    print(f"Visualizer: http://10.160.152.38:{args.port}")
     if handler is VisualizerHandler:
         reason = WIKI_IMPORT_ERROR or "disabled with --no-chat"
         print(f"Chat endpoints off ({reason}). Graph browsing is unaffected.")

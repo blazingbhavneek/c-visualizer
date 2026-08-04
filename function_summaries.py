@@ -43,10 +43,6 @@ class SummaryConfig:
     max_source_chars: int = 30_000
     max_dependency_chars: int = 24_000
     use_cache: bool = True
-    # Re-running summaries over finished results should only fill the gaps, even
-    # when the fingerprint cache is gone. Off during a normal run, where the
-    # cache decides what to reuse.
-    only_missing: bool = False
 
     @classmethod
     def from_env(cls) -> "SummaryConfig":
@@ -220,16 +216,17 @@ class HttpWikiClient:
 
 
 class PlaceholderWikiClient:
-    """Honest offline stand-in used to exercise wiki-enriched scheduling."""
+    """wiki連携ありのスケジューリングをテストするための正直なオフライン代替。"""
 
     is_placeholder = True
 
     async def ask(self, question: str) -> str:
         return (
-            "[OFFLINE LLM-WIKI PLACEHOLDER] No theory/API/manual facts were "
-            "available during this test. Do not infer library behavior from this "
-            "placeholder. A real run must call the configured llm-wiki /api/ask "
-            "endpoint. Requested lookup: "
+            "[オフライン llm-wiki プレースホルダー] "
+            "このテスト実行では、理論・API・マニュアル由来の知識は利用できません。"
+            "このプレースホルダーからライブラリの挙動を推測しないでください。"
+            "本番実行では、設定済みの llm-wiki /api/ask エンドポイントを呼び出す必要があります。"
+            "要求された問い合わせ: "
             + question
         )
 
@@ -402,7 +399,7 @@ class FunctionSummarizer:
         value = json.dumps(
             {
                 "source": function.get("source_sha256")
-                or hashlib.sha256(function.get("source", "").encode("utf-8", errors="replace")).hexdigest(),
+                or hashlib.sha256((function.get("source") or "").encode("utf-8", errors="replace")).hexdigest(),
                 "dependencies": dependency_fingerprints,
                 "recursive_peers": peer_sources,
                 "external_calls": sorted(self.external_calls[function_id]),
@@ -421,10 +418,12 @@ class FunctionSummarizer:
             return "unconfigured", ""
         function = self.functions[function_id]
         question = (
-            "Using the theory/API/manual knowledge in this wiki, explain only the behavior, "
-            "parameters, return values, side effects, and important constraints of these library "
-            f"functions used by {function.get('name')}: {', '.join(external_calls)}. "
-            "Do not infer behavior for project-local functions."
+            "このwikiに含まれる理論・API・マニュアル知識だけを使って、"
+            f"{function.get('name')} が使用している次のライブラリ関数について説明してください: "
+            f"{', '.join(external_calls)}。"
+            "説明する内容は、挙動、引数、戻り値、副作用、重要な制約に限定してください。"
+            "プロジェクト内で定義されたローカル関数の挙動は推測しないでください。"
+            "回答は日本語で書いてください。"
         )
         try:
             status = (
@@ -433,8 +432,9 @@ class FunctionSummarizer:
                 else "ready"
             )
             return status, (await self.wiki_client.ask(question))[:20_000]
-        except Exception as exc:  # Wiki knowledge is enrichment; code summarization can continue.
-            return "error", f"llm-wiki unavailable: {exc}"
+        except Exception as exc:
+            # wiki知識は補助情報なので、利用できなくてもコード要約は継続する。
+            return "error", f"llm-wiki を利用できません: {exc}"
 
     def _prompt(
         self,
@@ -446,37 +446,41 @@ class FunctionSummarizer:
         dependency_blocks = []
         for child in sorted(self.dependencies[function_id] - recursive_group):
             child_function = self.functions[child]
-            child_summary = child_function.get("summary") or "Summary unavailable; rely on the call name only."
+            child_summary = child_function.get("summary") or "要約は利用できません。呼び出し名だけを参考にしてください。"
             dependency_blocks.append(f"- {child_function.get('name')}: {child_summary}")
-        dependencies = "\n".join(dependency_blocks) or "(none; this is a leaf function)"
+        dependencies = "\n".join(dependency_blocks) or "なし。この関数はリーフ関数です。"
         dependencies = dependencies[: self.config.max_dependency_chars]
 
         recursive_peers = [
             self.functions[peer].get("name", peer)
             for peer in sorted(recursive_group - {function_id})
         ]
-        source = function.get("source", "")[: self.config.max_source_chars]
-        external = ", ".join(sorted(self.external_calls[function_id])) or "(none)"
-        return f"""Summarize this C function for engineers navigating a code graph.
+        source = (function.get("source") or "")[: self.config.max_source_chars]
+        external = ", ".join(sorted(self.external_calls[function_id])) or "なし"
 
-Function: {function.get('name')}
-File: {function.get('file')}
-Definition lines: {function.get('start_line')}–{function.get('end_line')}
-Recursive peers in the same dependency component: {', '.join(recursive_peers) or '(none)'}
-External/library calls: {external}
+        return f"""Cコードグラフを読むエンジニア向けに、このC関数を日本語で要約してください。
 
-Already-computed direct callee summaries:
+関数名: {function.get('name')}
+ファイル: {function.get('file')}
+定義行: {function.get('start_line')}–{function.get('end_line')}
+同じ依存コンポーネント内の再帰ピア: {', '.join(recursive_peers) or 'なし'}
+外部/ライブラリ呼び出し: {external}
+
+計算済みの直接呼び出し先の要約:
 {dependencies}
 
-Relevant llm-wiki API/manual knowledge:
-{wiki_context or '(none available)'}
+関連する llm-wiki API/マニュアル知識:
+{wiki_context or '利用可能な情報はありません。'}
 
-Function source:
+関数ソース:
 ```c
 {source}
 ```
 
-Write one compact paragraph covering purpose, inputs/outputs, key state or side effects, control flow, and how its callees contribute. Distinguish facts visible in code from API facts supplied by the wiki. Do not invent missing behavior."""
+日本語の短い1段落で書いてください。
+含める内容は、目的、入力/出力、主要な状態変更や副作用、制御フロー、呼び出し先関数がどのように寄与するかです。
+コードから確認できる事実と、wikiから提供されたAPI知識を区別してください。
+不足している挙動を推測しないでください。"""
 
     @staticmethod
     def _clean_summary(summary: str) -> str:
@@ -491,9 +495,6 @@ Write one compact paragraph covering purpose, inputs/outputs, key state or side 
         function = self.functions[function_id]
         fingerprint = self._fingerprint(function_id, recursive_group)
         self.fingerprints[function_id] = fingerprint
-        if self.config.only_missing and (function.get("summary") or "").strip():
-            function.setdefault("summary_status", "ready")
-            return "cached"
         cached = self.cache.get("entries", {}).get(function_id, {})
         if cached.get("fingerprint") == fingerprint and cached.get("summary"):
             function.update(
@@ -513,8 +514,9 @@ Write one compact paragraph covering purpose, inputs/outputs, key state or side 
             try:
                 summary = await self.summary_client.summarize(
                     system=(
-                        "You are a precise C codebase documentation assistant. "
-                        "Use provided callee summaries as established context and never guess."
+                        "あなたはCコードベースを正確に文書化するアシスタントです。"
+                        "回答は必ず日本語で書いてください。"
+                        "提供された呼び出し先の要約は確定済みの文脈として扱い、推測はしないでください。"
                     ),
                     prompt=self._prompt(function_id, recursive_group, wiki_context),
                 )

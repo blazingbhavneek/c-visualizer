@@ -12,78 +12,6 @@ from makefile_resolver.extract_includes import resolve
 
 console = Console()
 
-# Folders that hold headers for a whole package rather than for one process.
-_HEADER_DIR_NAMES = {
-    "include",
-    "includes",
-    "inc",
-    "header",
-    "headers",
-    "common",
-    "public",
-    "api",
-}
-_SKIP_DIR_NAMES = {
-    ".git",
-    ".hg",
-    ".svn",
-    ".venv",
-    "__pycache__",
-    "build",
-    "dist",
-    "node_modules",
-    "results",
-    "logs",
-    "pickle_data",
-}
-
-
-def discover_include_dirs(project_path: Path, levels: int = 2) -> list[Path]:
-    """Header folders beside or above a process that its Makefile never names.
-
-    A delivered package usually looks like ``pkg/{include,common}`` next to
-    ``pkg/g-svm/src``: the headers with all the answers are one or two levels
-    up, and the process Makefile either does not mention them or names them
-    through a variable that only exists on the build machine.  Those folders
-    are added to the ``#include`` *search path* only - never to the file list -
-    so a header still enters the project exactly when something includes it.
-    """
-
-    project_path = Path(project_path).expanduser().resolve()
-    found: list[Path] = []
-    base = project_path
-    for _ in range(max(0, levels)):
-        parent = base.parent
-        if parent == base:
-            break
-        try:
-            children = sorted(parent.iterdir())
-        except OSError:
-            break
-        for child in children:
-            if child == project_path or child.name.startswith("."):
-                continue
-            if child.name in _SKIP_DIR_NAMES:
-                continue
-            try:
-                if not child.is_dir():
-                    continue
-                if child.name.lower() in _HEADER_DIR_NAMES:
-                    found.append(child.resolve())
-                elif not (child / "Makefile").is_file() and next(
-                    child.glob("*.h"), None
-                ):
-                    # Loose headers in a sibling folder count, but a sibling
-                    # that builds something of its own is another process, not
-                    # a header pool.
-                    found.append(child.resolve())
-            except OSError:
-                # Unreadable neighbours (permissions, dead mounts) are simply
-                # not part of the search path.
-                continue
-        base = parent
-    return list(dict.fromkeys(found))
-
 
 class MakefileContext:
     def __init__(self, project_root_makefile: Union[str, Path]):
@@ -222,10 +150,7 @@ class MakefileContext:
 
 @time_it(message="")
 def return_project_mapping(
-    show: bool = False,
-    project_path: Path | None = None,
-    include_levels: int = 2,
-    extra_include_dirs: list[Path] | None = None,
+    show: bool = False, project_path: Path | None = None
 ) -> tuple[dict[str, Path], list[str]]:  # mapping and potential main files names
     os.environ["VERSION_MNG"] = "/home/seigyo/c_repo/c_repo/src"
     os.environ["PROJECT"] = "/home/seigyo/c_repo/c_repo/src"
@@ -268,7 +193,7 @@ def return_project_mapping(
     #     os.environ['MODERNLIB']
     makefile_input = folder_path / "Makefile"
     # os.environ['ORDERLIB']
-    os.environ["HOME"] = "../.."
+    # os.environ["HOME"] = "../.."
     os.environ["MODERNLIB"] = str(makefile_input.parent.parent)  # /src
     os.environ["HOMELIB"] = str(makefile_input.parent.parent)
     os.environ["MODERN"] = str(makefile_input.parent.parent)
@@ -292,6 +217,22 @@ def return_project_mapping(
 
         return c_and_h_files
 
+    def get_local_library_files():
+        """Find source directories for local libraries named in the Makefile."""
+        library_names = set()
+        for key in ("LIBS", "LDLIBS", "LIBRARIES"):
+            library_names.update(
+                re.findall(r"lib([^/\s]+?)\.(?:a|so|lib|sl)\b", ctx.vars.get(key, ""))
+            )
+
+        library_files = {}
+        source_root = project_path.parent
+        for library_name in library_names:
+            for directory in source_root.rglob(f"lib{library_name}"):
+                if directory.is_dir():
+                    library_files.update(get_c_and_h_files(directory))
+        return library_files
+
     files: dict[str, Path] = {}
     potential_main_files: list[str] = []
     for key in info:
@@ -309,19 +250,26 @@ def return_project_mapping(
                     files.update(get_c_and_h_files(p))  # dict.update merges dicts
                 elif p.is_file() and p != makefile_input.parent:
                     files[p.name] = p
+    if not files:
+        files = get_c_and_h_files(project_path)
+        potential_main_files = [name for name in files if name.endswith(".c")]
+    files.update(get_local_library_files())
     # console.print(files)
-    # Makefile -I dirs first, then whatever discovery found: a header named by
-    # the Makefile still wins when two folders hold the same file name.
-    search_dirs = [
-        *info.get("INCLUDES", []),
-        *(Path(p).expanduser().resolve() for p in (extra_include_dirs or [])),
-        *discover_include_dirs(folder_path, include_levels),
-    ]
-    search_dirs = list(dict.fromkeys(search_dirs))
-    if show:
-        console.print("INCLUDE SEARCH PATH", search_dirs)
+    include_dirs = list(info.get("INCLUDES", []))
+    include_dirs.append(project_path.parent)
+    include_dirs.append(project_path.parent.parent)
+    shared_include = next(
+        (parent / "include" for parent in project_path.parents if (parent / "include").is_dir()),
+        None,
+    )
+    if shared_include:
+        include_dirs.append(shared_include)
+        modern_include = shared_include.parent / "modern" / "include"
+        if modern_include.is_dir():
+            include_dirs.append(modern_include)
+        include_dirs.append(shared_include.parent)
     combined_dependency, file_wise_dependency = resolve(
-        files=files, include_dirs=search_dirs
+        files=files, include_dirs=include_dirs
     )
     if show:
         console.print(file_wise_dependency)

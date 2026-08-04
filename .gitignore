@@ -30,3 +30,9 @@ c-repo.zip
 
 # Embedding cache for the wiki agent - rebuilt on demand from graph.json
 .wiki_cache/
+
+json_data/
+SoudenKeisei/
+
+results/
+results_backups/

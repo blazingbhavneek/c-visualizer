@@ -8,7 +8,9 @@ from typing import Optional
 from rich import print as rprint
 from rich.tree import Tree
 
-
+# Represents metadata for a function definition.
+# Stores its name, source file, line range, and flags like external/static.
+# Also supports macro-expansion labeling for display.
 @dataclass(slots=True)
 class FunctionNode:
     name: str
@@ -64,7 +66,9 @@ class FunctionNode:
             return f"{base} (macro expansion)-> {self.macro_expansion.name}"
         return base + suffix
 
-
+# Represents a single function call occurrence in the code.
+# Stores the called function, call line number, and callbacks passed at that call site.
+# Used as an edge-like object in the call graph.
 @dataclass(slots=True)
 class CallSite:
     """
@@ -76,7 +80,9 @@ class CallSite:
     line_number: int  # at which it was called to build the intial context..
     callbacks: list[FunctionNode] = field(default_factory=list)
 
-
+# Represents one node in the logical call tree.
+# Wraps a FunctionNode and stores child calls, call line number, and callbacks.
+# Can convert itself into a Rich Tree for visualization.
 @dataclass(slots=True)
 class CallTreeNode:
     """
@@ -117,7 +123,9 @@ class CallTreeNode:
             rich_tree.add(child.to_rich_tree())
         return rich_tree
 
-
+# Lightweight tree structure used for path/DFS operations.
+# Stores only a node name and its child nodes.
+# get_name removes bracketed file/line info from the display label.
 @dataclass(slots=True)
 class custom_tree:
     name: str

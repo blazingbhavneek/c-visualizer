@@ -5,7 +5,6 @@ from pathlib import Path
 
 import pandas as pd
 
-from output_paths import results_root
 from state.state import State
 
 
@@ -22,7 +21,7 @@ def save_dict_csv(
     """
     project_state = State()
     if path_of_csv is None and save:
-        results_dir = results_root()
+        results_dir = Path("/home/seigyo/c_repo/c_repo/results/csv_results")
         results_dir.mkdir(exist_ok=True, parents=True)
         path_of_csv = results_dir / f"{project_state.get('PROJECT_NAME')}.csv"
     data_list = [data_dict] if isinstance(data_dict, dict) else data_dict
@@ -57,7 +56,7 @@ def save_dict_csv(
     if f"target_number{nested_joiner}ans" in df.columns:
         df[f"target_number{nested_joiner}ans"] = df[
             f"target_number{nested_joiner}ans"
-        ].apply(lambda x: ", ".join(map(str, x)) if isinstance(x, list) else x)
+        ].apply(lambda x: "_".join(map(str, x)) if isinstance(x, list) else x)
     if "call_number" in df.columns:
         df["call_number"] = df["call_number"].apply(
             lambda x: "NA" if x == -1 or str(x) == "-1" or str(x) == "-1.0" else str(x)
@@ -68,21 +67,6 @@ def save_dict_csv(
         df["PATH_NO"] = path_no
     if save:
         if path_of_csv.exists():
-            # Appending keeps one path's write O(1). Rewriting the whole file per
-            # path made a 100k-row run quadratic, and it is the only step here
-            # long enough to matter once paths are traced concurrently.
-            header = pd.read_csv(path_of_csv, nrows=0, keep_default_na=False)
-            if list(header.columns) == list(df.columns):
-                df.to_csv(
-                    path_of_csv,
-                    index=False,
-                    header=False,
-                    mode="a",
-                    encoding="utf-8-sig",
-                )
-                return
-            # A file from an older column set still goes through the slow,
-            # column-aligning path rather than being corrupted by an append.
             # CRITICAL: keep_default_na=False prevents 'NA' from becoming NaN
             loaded = pd.read_csv(path_of_csv, keep_default_na=False)
 

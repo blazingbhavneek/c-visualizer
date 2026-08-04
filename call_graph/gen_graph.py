@@ -15,7 +15,6 @@ import json
 
 import numpy as np
 
-from output_paths import results_root
 from state.state import State
 
 BLOCKS = r"\[([^\[\]]*)\]"
@@ -343,11 +342,9 @@ def visualize_large_graph(
     # ================================================================
     # Save
     # ================================================================
-    results_path = (
-        results_root()
-        / "graphs"
-        / State().get("PROJECT_NAME", default="DBG")
-        / str(destination_name)
+    results_path = Path(
+        f"/home/seigyo/c_repo/c_repo/results/csv_results/graphs/"
+        f'{State().get("PROJECT_NAME", default="DBG")}/{destination_name}'
     )
     results_path.mkdir(parents=True, exist_ok=True)
     net.show(str(results_path / f"graph_{destination_name}.html"), notebook=False)
@@ -462,11 +459,8 @@ def make_graph(
     # print(mermaid_diag)
     # pprint(adjacency_dict)
     mermaid_diag = graph_to_mermaid(graph=adjacency_dict)
-    results_path = (
-        results_root()
-        / "graphs"
-        / State().get("PROJECT_NAME", default="DBG")
-        / str(destination_name)
+    results_path = Path(
+        f"/home/seigyo/c_repo/c_repo/results/csv_results/graphs/{State().get('PROJECT_NAME',default='DBG')}/{destination_name}"
     )
     results_path.mkdir(parents=True, exist_ok=True)
     with open(results_path / f"graph_{destination_name}.md", "w") as f:

@@ -58,7 +58,7 @@ export function buildOverviewLayer(overview, layout, { expandedProcesses = new S
       parts.push(ring);
     }
 
-    const label = createLabel([`${resource.kind} ${resource.name}`], {
+    const label = createLabel([resource.name], {
       worldHeight: 26,
       fontSize: 15,
       color: resource.resolved ? COLORS.ink : "#a3134b",
@@ -100,10 +100,13 @@ export function buildOverviewLayer(overview, layout, { expandedProcesses = new S
     group.add(ring);
     parts.push(ring);
 
-    const label = createLabel(
-      [process.name, `${process.functionCount} fn · ${process.interactionCount} interactions`],
-      { worldHeight: 30, fontSize: 17, color: COLORS.ink, bold: true, halo: SURFACE },
-    );
+    const label = createLabel([process.name], {
+      worldHeight: 30,
+      fontSize: 17,
+      color: COLORS.ink,
+      bold: true,
+      halo: SURFACE,
+    });
     label.position.set(point.x, point.y - PROCESS_RADIUS - 40, 0.9);
     group.add(label);
     labels.push(label);

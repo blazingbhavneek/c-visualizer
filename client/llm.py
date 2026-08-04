@@ -129,7 +129,8 @@ class OllamaClient:
             response = self.client.chat(
                 model=self.model,
                 messages=self.messages,
-                options={"temperature": self.temp, "num_ctx": self.num_ctx},
+                # options={"temperature": self.temp, "num_ctx": self.num_ctx},
+                options={"temperature": self.temp},
             )
         except Exception as e:
             print("Error in llm calling ", e)
@@ -207,7 +208,8 @@ class OllamaClient:
                             model=self.model,
                             messages=self.messages,
                             tools=self.tools,
-                            options={"temperature": self.temp, "num_ctx": self.num_ctx},
+                            # options={"temperature": self.temp, "num_ctx": self.num_ctx},
+                            options={"temperature": self.temp},
                             keep_alive=-1,
                         )
                         # print(messages,end='\n\n')
@@ -282,7 +284,7 @@ class OllamaClient:
                                     think=True,
                                     options={
                                         "temperature": self.temp,
-                                        "num_ctx": self.num_ctx,
+                                        # "num_ctx": self.num_ctx,
                                     },
                                 )
                                 OUTPUT_TOKEN += self.get_token_count(
@@ -458,7 +460,7 @@ class OllamaClient:
                             tools=self.tools,
                             tool_choice="auto",
                             temperature=self.temp,
-                            max_tokens=self.num_ctx,
+                            # max_tokens=self.num_ctx,
                         )
                     except Exception as e:
                         if attempt < MAX_RETRY_ATTEMPTS - 1:
@@ -530,7 +532,7 @@ class OllamaClient:
                                     model=self.model,
                                     messages=format_messages,
                                     temperature=self.temp,
-                                    max_tokens=1000,
+                                    # max_tokens=1000,
                                 )
 
                                 if fmt_response.usage:

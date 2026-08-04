@@ -34,6 +34,15 @@ ORANGE = "\033[38;5;208m"
 RESET = "\033[0m"
 # FILE_FUNCTIONS: dict[str,dict[str,any]] = {}
 
+from pprint import pprint
+
+DEBUG = False
+
+def dbg(name, value):
+    if DEBUG:
+        print(f"\n[DEBUG] {name}:")
+        pprint(value)
+        print()
 
 class CallGraphBuilder:
     def __init__(
@@ -73,6 +82,33 @@ class CallGraphBuilder:
         )  # macro func , str abs path of the file in which its defined.
         self.file_functions = file_functions
 
+        # dbg("INIT project_structure", self.project_structure)
+
+        # dbg("INIT fp_args_map", self.fp_args_map)
+
+        # dbg("INIT C_LANGUAGE", self.C_LANGUAGE)
+        # dbg("INIT parser", self.parser)
+
+        # dbg("INIT file_trees keys", list(self.file_trees.keys()))
+        # dbg("INIT file_trees count", len(self.file_trees))
+
+        # dbg("INIT global_funcs", self.global_funcs)
+        # dbg("INIT static_funcs", self.static_funcs)
+        # dbg("INIT graph", self.graph)
+        # dbg("INIT node_registry", self.node_registry)
+
+        # dbg("INIT macros", self.macros)
+        # dbg("INIT macro_expansion_to_file", self.macro_expansion_to_file)
+
+        # dbg("INIT file_functions keys", list(self.file_functions.keys()) if self.file_functions else None)
+        # dbg("INIT file_functions", self.file_functions)
+
+        # dbg("INIT DONE", "CallGraphBuilder initialized")
+
+    # Given a macro name, checks if it exists in the collected macro map.
+    # Follows macro replacements to find what it expands into.
+    # If the expansion directly calls a function, returns that function name.
+    # Returns None if no direct function call can be found.
     def _get_expanded_macro_name(self, macro_name: str) -> Optional[str]:
         if macro_name not in self.macros:
             return None
@@ -138,9 +174,19 @@ class CallGraphBuilder:
                 return True
         return False
 
+    # Walks through all project files and processes only .c/.h files.
+    # Loads the already-parsed Tree-sitter AST from self.file_trees.
+    # Finds function definitions and stores them as global or static functions.
+    # For header files, also collects macro definitions and their expansions.
+    # Builds lookup maps used later for resolving calls in the call graph.
+    # uses self.file_trees which get its data from tree sitter, the format is basically file:(tree sitter tree, raw cleaned file)
     def _collect_definitions(self):
+        dbg("COLLECT start", len(self.project_structure))
+
         for filename, filepath_str in self.project_structure.items():
             filepath = Path(filepath_str)
+            # dbg("file", filename)
+
             if filepath.suffix not in (".c", ".h"):
                 continue
             elif not filepath.exists():
@@ -148,21 +194,24 @@ class CallGraphBuilder:
                 continue
 
             try:
-                # source = filepath.read_bytes()
-                # tree = self.parser.parse(source)
-                # self.file_trees[filepath_str] = tree
-                if not filename in self.file_trees:
+                if filename not in self.file_trees:
+                    dbg("missing in file_trees", filename)
                     print("FILE NAME NOT IN FILE TREES..")
+                    continue
+
                 tree = self.file_trees[filename][0]
                 source = self.file_trees[filename][1]
                 stack = [tree.root_node]
 
                 while stack:
                     node = stack.pop()
+
                     if node.type == "function_definition":
                         name = self._extract_function_name(node)
                         if name:
                             is_static = self._is_static_function(node)
+                            # dbg("func found", f"{name} static={is_static}")
+                            # dbg("node", node)
                             if is_static:
                                 self.static_funcs[str(filepath)][name] = node
                             else:
@@ -213,8 +262,13 @@ class CallGraphBuilder:
                     for child in reversed(node.children):
                         stack.append(child)
 
+                # dbg("file done", filename)
+
             except Exception as e:
+                # dbg("collect error", f"{filepath}: {e}")
                 print(f"Warning: Failed to process {filepath}: {e}", file=sys.stderr)
+
+        dbg("COLLECT done funcs/macros", f"global={self.global_funcs}, static_files={self.static_funcs}, macros={self.macros}")
 
     def _get_or_create_node(
         self,
@@ -422,6 +476,7 @@ class CallGraphBuilder:
 
         for macro in self.macros.keys():
             resolved_func = self._get_expanded_macro_name(macro)
+            dbg("resolved_func", resolved_func)
             if resolved_func in self.global_funcs.keys():
                 self.macro_expansion_to_file[resolved_func] = self.global_funcs[
                     resolved_func
@@ -657,6 +712,7 @@ def orchestrate(
 
     if main_key in tree_objects.keys():
         node = tree_objects[main_key]
+        # Full-tree rendering is prohibitively large for linked-library graphs.
         # rprint("\n=== Call Tree for Main ===")
         # console.print(node.to_rich_tree())
         # print("oTHER TREE...")
@@ -684,7 +740,8 @@ def orchestrate(
                 return_whole_tree=True,
             )
 
-        console.print(paths)
+        # Path lists can be very large; retain only the concise count below.
+        # console.print(paths)
         if len(paths) > 0:
             print("\n=== Paths Found ===")
             # pprint(paths)
@@ -804,6 +861,8 @@ def orchestrate(
 
 
 if __name__ == "__main__":
+    DEBUG = True
+
     import atexit
     import sys
     from datetime import datetime
@@ -826,15 +885,30 @@ if __name__ == "__main__":
     sys.stderr = Tee(sys.__stderr__, log)
 
     # region INPUTS.
+    from pathlib import Path
+
     PROJECT_STRUCTURE = {
-        "apl_getmode.c": "/home/seigyo/c_repo/c_repo/src/apl110d/apl_getmode.c",
-        "apl_in.h": "/home/seigyo/c_repo/c_repo/src/headers/apl_in.h",
-        "main.c": "/home/seigyo/c_repo/c_repo/src/apl110d/main.c",
-        "mpf_com.h": "/home/seigyo/c_repo/c_repo/src/headers/mpf_com.h",
-        "mpf_mfs.h": "/home/seigyo/c_repo/c_repo/src/headers/mpf_mfs.h",
-        "mpf_mfs_err.h": "/home/seigyo/c_repo/c_repo/src/headers/mpf_mfs_err.h",
-        "pmf.h": "/home/seigyo/c_repo/c_repo/src/headers/pmf.h",
+        "apl_getmode.c": Path("/home/seigyo/c_repo/c_repo/src/src_analysis/src/libapl/apl_getmode.c"),
+        "apl_in.h": Path("/home/seigyo/c_repo/c_repo/src/src_analysis/include/apl_in.h"),
+        "main.c": Path("/home/seigyo/c_repo/c_repo/src/src_analysis/src/apl110d/main.c"),
+        "mpf_com.h": Path("/home/seigyo/c_repo/c_repo/src/moove_header/mpf_com.h"),
+        "mpf_mfs.h": Path("/home/seigyo/c_repo/c_repo/src/moove_header/mpf_mfs.h"),
+        "mpf_mfs_err.h": Path("/home/seigyo/c_repo/c_repo/src/moove_header/mpf_mfs_err.h"),
+        "pmf.h": Path("/home/seigyo/c_repo/c_repo/src/moove_header/pmf.h"),
     }
+
+    from helpers.Preprocess.preprocess import (
+        Preprocess,
+        extract_all_macros,
+        extract_includes,
+    )
+
+    trees = Preprocess().preprocess(
+        project_structure=PROJECT_STRUCTURE
+    )  # str, tuple[Tree,bytes]
+
+    dbg("Main trees", trees["main.c"][0])
+
     # PROJECT_STRUCTURE = {
     # 'apl_in.h': '/home/seigyo/c_repo/c_repo/src/headers/apl_in.h',
     # 'main.c': '/home/seigyo/c_repo/c_repo/src/apl100d/main.c',
@@ -853,13 +927,19 @@ if __name__ == "__main__":
 
     # region caching the functions in each c file
     FILE_FUNCTIONS = {}
-    for files in PROJECT_STRUCTURE.keys():
-        if files.endswith(".h"):
+    for file_name, file_path in PROJECT_STRUCTURE.items():
+        if file_name.endswith(".h"):
             continue
 
-        file_path = PROJECT_STRUCTURE[files]
-        functions = get_local_function_definitions(file_path=file_path)
-        FILE_FUNCTIONS[files] = functions
+        with open(file_path, "rb") as f:
+            code_bytes = f.read()
+
+        functions = get_local_function_definitions(
+            code_bytes=code_bytes,
+            file_name=file_name,
+        )
+        dbg(f"FILE_FUNCTIONS[{file_name}]", functions)
+        FILE_FUNCTIONS[file_name] = functions
 
     # pprint(FILE_FUNCTIONS)
     # endregion
@@ -872,6 +952,7 @@ if __name__ == "__main__":
                 main_file_name="main.c",
                 function_pointer_args=FUNCTION_POINTER_ARGS,
                 file_functions=FILE_FUNCTIONS,
+                trees=trees
             )
         )[1]
     )

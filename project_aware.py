@@ -1,6 +1,7 @@
+# region Imports
+
 import asyncio
 import gc
-import hashlib
 import json
 import multiprocessing
 import os
@@ -61,7 +62,7 @@ from models import (
     outputModel,
     outputModelForReturn,
 )
-from output_paths import logs_root, pickle_root, results_root, set_output_root
+from output_paths import results_root
 from process_groups import (
     discover_processes,
     load_project_state,
@@ -79,6 +80,11 @@ from visualizer_export import (
     build_complete_call_graph,
     build_complete_file_functions,
 )
+
+# endregion Imports
+
+
+# region Global vars
 
 # set_tool_def()
 
@@ -98,7 +104,12 @@ BOLD = "\033[1m"
 ORANGE = "\033[38;5;208m"  # 38;5;208m is an 8-bit color code for orange
 RESET = "\033[0m"
 
+# endregion Global vars
 
+# region HELPERS (Identifying funs to trace and printing trees, dfs.)
+
+
+## lists function calls only in given code, checks recursively
 def extract_function_calls(code: bytes) -> list[str]:
     """
     RETURNS A LIST OF FUNCTION CALLED IN THIS CODE.
@@ -128,8 +139,9 @@ def extract_function_calls(code: bytes) -> list[str]:
     traverse(tree.root_node)
     return calls
 
-
-# region HELPERS (Identifying funs to trace and printing trees, dfs.)
+# Scans project source files to identify calls to configured functions from STATE["FUNCTION_TYPES"].
+# For each detected function, returns the argument indices and related tracing metadata.
+# Header files are skipped since only actual function calls in source files are considered.
 def identify_funs_to_trace(
     project_structure: dict[str, str],
     trees: dict,
@@ -140,7 +152,17 @@ def identify_funs_to_trace(
 
     # file_path = Path(name_of_json)
     STATE = State()
-    functions_to_detect = STATE.get("FUNCTION_TYPES")
+    functions_to_detect = {
+        function_name.strip(): {
+            **config,
+            "dependent_functions": [
+                dependent_function.strip()
+                for dependent_function in config.get("dependent_functions", [])
+            ],
+        }
+        for function_name, config in (STATE.get("FUNCTION_TYPES") or {}).items()
+    }
+    STATE.set("FUNCTION_TYPES", functions_to_detect)
     ans = {}  # {function_name, [indices to trace for it....]}
     if not functions_to_detect:
         print(f"Data 'FUNCTION_TYPES' Not in state.")
@@ -172,7 +194,7 @@ def identify_funs_to_trace(
 
     return ans
 
-
+# doing dfs on tree to find the path of  dependent_function starting from main, returns bool, and changes str_path inplace for results, curr_path is temp for dfs ops
 def dfs_on_path_trees(
     tree_node: custom_tree,
     dependent_function: str,
@@ -198,14 +220,16 @@ def dfs_on_path_trees(
     curr_path.pop()
     return found
 
-
+# make a simple call tree with just names, nothing else
 def make_tree_custom(node: CallTreeNode) -> custom_tree:
     t = custom_tree(name=node.get_display_label)
     for children in node.children:
         t.add(make_tree_custom(node=children))
     return t
 
-
+# Builds a tree representation from either a string path or indexed CallTreeNode path.
+# For CallTreeNode paths, it converts nodes to custom_tree and extracts the path to dependent_function.
+# For string paths, it creates a Rich Tree mainly for display/printing.
 def make_tree(
     path: list[str] | tuple[int, list[CallTreeNode]],
     dependent_function: str | None = None,
@@ -248,7 +272,9 @@ def make_tree(
         # console.print(tree)
         return tree
 
-
+# Prints or processes possible call paths as tree structures.
+# If paths contain CallTreeNode objects, it uses multiprocessing to extract dependent-function paths.
+# If paths contain strings, it builds and prints Rich Trees for visualization.
 @time_it()
 def print_or_return_possible_paths_trees(
     paths: list[list[str | CallTreeNode]],
@@ -264,7 +290,7 @@ def print_or_return_possible_paths_trees(
             processes=min(10, multiprocessing.cpu_count())
         ) as pool:
             print("Using multiprocessing for processing paths")
-            result_iter = pool.imap_unordered(
+            result_iter = pool.imap(
                 partial(make_tree, dependent_function=dependent_function),
                 enumerate(paths),
                 chunksize=2,
@@ -288,7 +314,9 @@ def print_or_return_possible_paths_trees(
 
 # endregion
 
-
+# Builds LLM prompts for static C-code backward tracing.
+# Depending on get_upper, it either resolves target function argument values
+# or classifies how the target function's return value is used.
 # --- AGENT LOGIC ---
 def llm_calls(
     project_structure: dict[str, str],
@@ -628,37 +656,6 @@ def run_with_retry(func, args=(), timeout=180, retries=2):
     return None
 
 
-def trace_concurrency() -> int:
-    """How many target paths may have an LLM call in flight at once."""
-    try:
-        return max(1, int(os.environ.get("TRACER_CONCURRENCY", "4")))
-    except ValueError:
-        return 4
-
-
-async def gather_paths(runner, contexts, completed_paths) -> None:
-    """Trace the outstanding paths of one function, N LLM calls in flight.
-
-    Only the LLM call itself awaits (it blocks inside a worker thread), so the
-    result writes that follow it - the stats JSON, the CSV row, the in-memory
-    answers - run to completion before another path can resume.  That is what
-    keeps those writes consistent without a lock.
-    """
-    semaphore = asyncio.Semaphore(trace_concurrency())
-
-    async def bounded(index, path, context):
-        async with semaphore:
-            return await runner(index, path, context)
-
-    await asyncio.gather(
-        *(
-            bounded(index, path, context)
-            for index, (path, context) in enumerate(contexts, start=1)
-            if index not in completed_paths
-        )
-    )
-
-
 async def make_llm_calls_for_function(
     function,
     trees: dict,
@@ -697,7 +694,7 @@ async def make_llm_calls_for_function(
             functions_identified[function].get("dependent_functions"),
         )
     )  # filtering out the dependent function based on what are in the project.
-    check_other_functions: bool = bool(dependent_functions) and (
+    check_other_functions = bool(dependent_functions) and (
         dependent_functions[0] != function
     )  # assuming that after filtering we are left only with one function
     dependent_function_indices = None
@@ -716,8 +713,10 @@ async def make_llm_calls_for_function(
             dependent_function_get_upper,
         )
     # return None
-    stats_json_path = results_root() / "stats" / f"{STATE.get('PROJECT_NAME')}_STATS.json"
-    stats_json_path.parent.mkdir(parents=True, exist_ok=True)
+    stats_json_path = Path(
+        f"/home/seigyo/c_repo/c_repo/results/csv_results/stats/{STATE.get('PROJECT_NAME')}_STATS.json"
+    )
+    (stats_json_path.parent / "stats").mkdir(parents=True, exist_ok=True)
     # endregion
 
     # region INTIALIZING EMPTY TOKEN VARIABLES
@@ -754,15 +753,13 @@ async def make_llm_calls_for_function(
     # endregion
 
     # region FINDING OUT FROM WHICH PART WE NEED TO RESUME
-    # A set, not a high-water mark: paths finish out of order once they are
-    # traced concurrently, so "everything below the last entry is done" is no
-    # longer true.  Old stats files, written in order, resume identically.
-    completed_paths = {
-        int(path_number)
-        for entry in FUNCTION_DICT[function]["Each_Path_Tokens"]
-        for path_number in entry
-    }
-    print("Already completed paths for this function:", len(completed_paths))
+    if FUNCTION_DICT[function]["Each_Path_Tokens"] == []:
+        PATH_TO_START_WITH = 1
+    else:
+        PATH_TO_START_WITH = (
+            int(list(FUNCTION_DICT[function]["Each_Path_Tokens"][-1].keys())[0]) + 1
+        )
+    print("Need to start with the path", PATH_TO_START_WITH)
     # endregion
 
     # region MAKING CALL_GRAPH AND GETTING DATA
@@ -781,6 +778,42 @@ async def make_llm_calls_for_function(
         print(f"{BOLD}{RED}No possible paths for: {GREEN}{function}{RESET}")
         return None
     macro_data, possible_paths_data = call_graph_with_paths
+
+    # A selected process is the only valid trace entry point.  Its paths may
+    # traverse linked libraries, but paths rooted in a library must not become
+    # independent trace/LLM work for this process.
+    target_root = Path(project_path).resolve()
+
+    def starts_in_target_process(path_data) -> bool:
+        path = path_data[0][0]
+        if not path:
+            return False
+        first_match = re.match(r"\[([^:\]]+)(?::[^\]]+)?\]", path[0])
+        if first_match is None:
+            return False
+        source_path = project_structure.get(first_match.group(1))
+        if source_path is None:
+            return False
+        try:
+            return Path(source_path).resolve().is_relative_to(target_root)
+        except OSError:
+            return False
+
+    total_candidate_paths = len(possible_paths_data)
+    possible_paths_data = [
+        path_data
+        for path_data in possible_paths_data
+        if starts_in_target_process(path_data)
+    ]
+    if len(possible_paths_data) != total_candidate_paths:
+        print(
+            "Skipped "
+            f"{total_candidate_paths - len(possible_paths_data)} library-rooted path(s) "
+            f"outside {target_root}"
+        )
+    if not possible_paths_data:
+        print(f"{BOLD}{RED}No target-rooted paths for: {GREEN}{function}{RESET}")
+        return None
     if not macro_data:
         print("For ", function, " no macro data")
     call_graph_determined_datas = [
@@ -798,6 +831,58 @@ async def make_llm_calls_for_function(
             target_function=function,
             trace_paths=path_strs,
         )
+
+    # Keep a readable, pre-LLM audit of the paths considered for this target.
+    # Excel is used because CSV has no concept of multiple sheets.
+    unique_paths: dict[str, tuple[list[str], dict]] = {}
+    for path_data in possible_paths_data:
+        nodes, metadata = path_data[0][0], path_data[1]
+        unique_paths.setdefault("->".join(nodes), (nodes, metadata))
+
+    all_paths_rows = [
+        {
+            "path_number": index,
+            "target_function": function,
+            "node_count": len(nodes),
+            "path": path_text,
+        }
+        for index, (path_text, (nodes, _)) in enumerate(unique_paths.items(), start=1)
+    ]
+    invocation_paths: dict[tuple[str, str, str], set[str]] = defaultdict(set)
+    for path_text, (_, metadata) in unique_paths.items():
+        target_source = metadata.get("target_name_src")
+        invocation_key = (
+            function,
+            str(getattr(target_source, "path", "unknown")),
+            str(getattr(target_source, "line_number", "unknown")),
+        )
+        invocation_paths[invocation_key].add(path_text)
+    invocation_rows = [
+        {
+            "invocation_number": index,
+            "target_function": target_function,
+            "target_source_path": source_path,
+            "target_source_line": source_line,
+            "reachable_unique_path_count": len(reaching_paths),
+        }
+        for index, ((target_function, source_path, source_line), reaching_paths) in enumerate(
+            sorted(invocation_paths.items()), start=1
+        )
+    ]
+    safe_function_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", function).strip("_")
+    path_report = results_root() / (
+        f"{Path(project_path).name}_{safe_function_name}_unique_paths.xlsx"
+    )
+    path_report.parent.mkdir(parents=True, exist_ok=True)
+    with pd.ExcelWriter(path_report, engine="openpyxl") as writer:
+        pd.DataFrame(all_paths_rows).to_excel(writer, sheet_name="all_paths", index=False)
+        pd.DataFrame(invocation_rows).to_excel(
+            writer, sheet_name="unique_target_invocations", index=False
+        )
+    print(
+        f"Unique-path report written to {path_report} "
+        f"({len(all_paths_rows)} paths; {len(invocation_rows)} target invocations)"
+    )
     # print_or_return_possible_paths_trees(paths=path_strs) FOR JUST PRINTING ALL PATH TREES BEFOREHAND FOR OBSERVATION..
     # endregion
 
@@ -818,6 +903,44 @@ async def make_llm_calls_for_function(
     )
     contexts = parser.get_parsed_results(get_upper=get_upper)
     # endregion
+
+    async def run_llm_requests(requests):
+        semaphore = asyncio.Semaphore(20)
+
+        async def run_request(key, args):
+            async with semaphore:
+                try:
+                    return key, await asyncio.to_thread(
+                        run_with_retry, llm_calls, args
+                    )
+                except Exception as exc:
+                    print(f"LLM request failed for {key}: {exc}")
+                    return key, None
+
+        return dict(await asyncio.gather(*(run_request(*request) for request in requests)))
+
+    async def run_llm_pairs(path_requests):
+        semaphore = asyncio.Semaphore(20)
+
+        async def run_pair(index, primary_args, dependent_args):
+            async with semaphore:
+                try:
+                    primary_result = (
+                        await asyncio.to_thread(run_with_retry, llm_calls, primary_args)
+                        if primary_args
+                        else None
+                    )
+                    dependent_result = (
+                        await asyncio.to_thread(run_with_retry, llm_calls, dependent_args)
+                        if not primary_args or primary_result
+                        else None
+                    )
+                    return index, (primary_result, dependent_result)
+                except Exception as exc:
+                    print(f"LLM requests failed for path {index}: {exc}")
+                    return index, (None, None)
+
+        return dict(await asyncio.gather(*(run_pair(*request) for request in path_requests)))
 
     if len(path_nodes) > 0:
 
@@ -844,8 +967,39 @@ async def make_llm_calls_for_function(
         )
         # endregion
 
-        async def trace_one_path(index, path, context):
-            nonlocal FUNCTION_INPUT_TOKEN, FUNCTION_OUTPUT_TOKEN
+        path_requests = []
+        for index, (path, context) in enumerate(contexts, start=1):
+            if index < PATH_TO_START_WITH:
+                continue
+            path_str = "->".join(
+                re.sub(r"\[([^\[\]]*)\]", "", node) for node in path
+            )
+            primary_args = None
+            if STATE.get("FUNCTION_TYPES").get(function, {}).get("type") == "WRITEF/READF":
+                primary_args = (
+                    project_structure, function, list_indices, context, path_str, get_upper
+                )
+            new_path, context_new = dependent_contexts[index - 1]
+            new_path_str = "->".join(
+                re.sub(r"\[([^\[\]]*)\]", "", node) for node in new_path
+            )
+            path_requests.append((
+                index,
+                primary_args,
+                (
+                    project_structure,
+                    dependent_functions[0],
+                    dependent_function_indices,
+                    context_new,
+                    new_path_str,
+                    dependent_function_get_upper,
+                ),
+            ))
+        llm_results = await run_llm_pairs(path_requests)
+
+        for index, (path, context) in enumerate(contexts, start=1):
+            if index < PATH_TO_START_WITH:
+                continue
             call_graph_data = call_graph_determined_datas[
                 index - 1
             ]  # data received for this path from call_graph
@@ -858,9 +1012,8 @@ async def make_llm_calls_for_function(
                 map(lambda x: re.sub(block_regex, "", x), path)
             )  # path like func_a->func_b ...
 
-            print(
-                highlight(context, CLexer(), TerminalFormatter())
-            )  # for highlighting the c code in terminal..
+            # Per-path source context can be very large.
+            # print(highlight(context, CLexer(), TerminalFormatter()))
             print("-" * 56)
             stats_dict1 = None
             # region WHEN WE NEED TO DETERMINE FUNCTION_TYPE LIKE (mpf_mfs_getrec etc)
@@ -874,18 +1027,7 @@ async def make_llm_calls_for_function(
                 }
                 print(" STEP - 1 DETERMINING THE CALL_TYPE")
 
-                ans = await asyncio.to_thread(
-                    run_with_retry,
-                    llm_calls,
-                    (
-                        project_structure,
-                        function,
-                        list_indices,
-                        context,
-                        path_str,
-                        get_upper,
-                    ),
-                )
+                ans = llm_results[index][0]
                 if ans:
                     validated_model, stats = ans
                 else:
@@ -918,7 +1060,7 @@ async def make_llm_calls_for_function(
                         (combined_model, Stats.model_validate(empty_stats))
                     )
                     print(f"DONE WITH PATH {index}")
-                    return
+                    continue
 
                 stats_dict1 = stats.model_dump()
                 FUNCTION_INPUT_TOKEN += stats_dict1.get("Tokens").get("Input_tokens")
@@ -950,24 +1092,13 @@ async def make_llm_calls_for_function(
 
             print("NOW RUNNING FOR THE DEPENDENT FUNCTION.")
             new_path, context_new = dependent_contexts[index - 1]
-            print("CONTEXT FOR THE DEPENDENT FUNCTION")
-            print(highlight(context_new, CLexer(), TerminalFormatter()))
+            # print("CONTEXT FOR THE DEPENDENT FUNCTION")
+            # print(highlight(context_new, CLexer(), TerminalFormatter()))
 
             new_path_str = "->".join(
                 map(lambda x: re.sub(block_regex, "", x), new_path)
             )
-            ans = await asyncio.to_thread(
-                run_with_retry,
-                llm_calls,
-                (
-                    project_structure,
-                    dependent_functions[0],
-                    dependent_function_indices,
-                    context_new,
-                    new_path_str,
-                    dependent_function_get_upper,
-                ),
-            )  # as the functions right now depend only on mpf_mfs_open...
+            ans = llm_results[index][1]
 
             if ans:
                 validated_model, stats = ans
@@ -998,7 +1129,7 @@ async def make_llm_calls_for_function(
                     (combined_model, Stats.model_validate(empty_stats))
                 )
                 print(f"DONE WITH PATH {index}")
-                return
+                continue
 
             validated_model_dict = (
                 validated_model.model_dump()
@@ -1063,12 +1194,23 @@ async def make_llm_calls_for_function(
             answers[function].append((combined_model, stats))
             print(f"DONE WITH PATH {index}")
 
-        await gather_paths(trace_one_path, contexts, completed_paths)
-
     else:
+        requests = []
+        for index, (path, context) in enumerate(contexts, start=1):
+            if index < PATH_TO_START_WITH or ("pmf" in function and len(list_indices) == 0):
+                continue
+            path_str = "->".join(
+                re.sub(r"\[([^\[\]]*)\]", "", node) for node in path
+            )
+            requests.append((
+                ("primary", index),
+                (project_structure, function, list_indices, context, path_str, get_upper),
+            ))
+        llm_results = await run_llm_requests(requests)
 
-        async def trace_one_path(index, path, context):
-            nonlocal FUNCTION_INPUT_TOKEN, FUNCTION_OUTPUT_TOKEN
+        for index, (path, context) in enumerate(contexts, start=1):
+            if index < PATH_TO_START_WITH:
+                continue
             call_graph_data = call_graph_determined_datas[
                 index - 1
             ]  # data received for this path from call_graph
@@ -1092,9 +1234,8 @@ async def make_llm_calls_for_function(
             #         path_str+='->'
 
             # pprint(path_str)
-            print(
-                highlight(context, CLexer(), TerminalFormatter())
-            )  # for highlighting the c code in terminal..
+            # Per-path source context can be very large.
+            # print(highlight(context, CLexer(), TerminalFormatter()))
             print("-" * 56)
             if (
                 "pmf" in function and len(list_indices) == 0
@@ -1131,19 +1272,8 @@ async def make_llm_calls_for_function(
                     (combined_model, Stats.model_validate(empty_stats))
                 )
                 print(f"DONE WITH PATH {index}")
-                return
-            ans = await asyncio.to_thread(
-                run_with_retry,
-                llm_calls,
-                (
-                    project_structure,
-                    function,
-                    list_indices,
-                    context,
-                    path_str,
-                    get_upper,
-                ),
-            )
+                continue
+            ans = llm_results[("primary", index)]
             if ans:
                 validated_model, stats = ans
             else:
@@ -1179,7 +1309,7 @@ async def make_llm_calls_for_function(
                     (combined_model, Stats.model_validate(empty_stats).model_dump())
                 )
                 print(f"DONE WITH PATH {index}")
-                return
+                continue
             # console.print(stats)
             validated_model_dict = (
                 validated_model.model_dump()
@@ -1239,8 +1369,6 @@ async def make_llm_calls_for_function(
             answers[function].append((combined_model, stats))
             print(f"DONE WITH PATH {index}")
 
-        await gather_paths(trace_one_path, contexts, completed_paths)
-
     return function_answer_csv
 
 
@@ -1250,44 +1378,33 @@ def trace_variable(
     summary_config: SummaryConfig | None = None,
     *,
     index_only: bool = False,
-    include_levels: int = 2,
-    extra_include_dirs: list[Path] | None = None,
 ):
     STATE = State()
     project_path = Path(project_path)
-    pickle_dir = pickle_root() / "project_structures_pickle"
+    pickle_dir = (
+        Path(__file__).resolve().parent / "pickle_data/project_structures_pickle"
+    )
     if not pickle_dir.exists():
         pickle_dir.mkdir(exist_ok=True, parents=True)
 
-    # The include search path decides which headers are in the project at all,
-    # so a cached structure resolved under different options must not be reused.
-    include_key = hashlib.sha1(
-        json.dumps(
-            [include_levels, [str(p) for p in (extra_include_dirs or [])]],
-            sort_keys=True,
-        ).encode("utf-8")
-    ).hexdigest()[:8]
-    project_structure_path = pickle_dir / f"{STATE.get('PROJECT_NAME')}.{include_key}.pkl"
+    project_structure_path = pickle_dir / f"{STATE.get('PROJECT_NAME')}_include_v5.pkl"
     potential_main_files: list[str] | None = None
     if not project_structure_path.exists():
         print(
             "PROJECT STRUCTURE NEEDS TO BE RESOLVED. NO PICKLE FILE. IT WILL TAKE TIME...."
         )
         PROJECT_STRUCTURE, potential_main_files = return_project_mapping(
-            show=False,
-            project_path=project_path,
-            include_levels=include_levels,
-            extra_include_dirs=extra_include_dirs,
+            show=False, project_path=project_path
         )
         PROJECT_STRUCTURE = dict(
             sorted(PROJECT_STRUCTURE.items(), key=lambda x: str(x[0]))
         )
         STATE.set("PROJECT_STRUCTURE", PROJECT_STRUCTURE)
-        with open(project_structure_path, "wb") as f:
-            pickle.dump((PROJECT_STRUCTURE, potential_main_files), f)
-    else:
-        with open(project_structure_path, "rb") as f:
-            PROJECT_STRUCTURE, potential_main_files = pickle.load(f)  # already sored.
+        # with open(project_structure_path, "wb") as f:
+        #     pickle.dump((PROJECT_STRUCTURE, potential_main_files), f)
+    # else:
+    #     with open(project_structure_path, "rb") as f:
+    #         PROJECT_STRUCTURE, potential_main_files = pickle.load(f)  # already sored.
 
         STATE.set("PROJECT_STRUCTURE", PROJECT_STRUCTURE)
     print("THE MAIN FILES ARE: ", potential_main_files)
@@ -1363,19 +1480,20 @@ def trace_variable(
     STATE.set("VISUALIZER_GRAPH_PATH", graph_path)
     print(f"Complete source graph checkpoint written to {graph_path}")
 
-    summary_config = summary_config or SummaryConfig.from_env()
-    if summary_config.enabled:
-        try:
-            summary_report = asyncio.run(summarize_collector(collector, summary_config))
-            print(f"Bottom-up function summaries: {summary_report}")
-        except Exception as exc:
-            print(f"Function summarization unavailable: {exc}")
-            for function_data in collector.functions.values():
-                if not function_data.get("is_external") and not function_data.get(
-                    "summary"
-                ):
-                    function_data["summary_error"] = str(exc)
-            collector.write()
+    # TODO: Bring it back:
+    # summary_config = summary_config or SummaryConfig.from_env()
+    # if summary_config.enabled:
+    #     try:
+    #         summary_report = asyncio.run(summarize_collector(collector, summary_config))
+    #         print(f"Bottom-up function summaries: {summary_report}")
+    #     except Exception as exc:
+    #         print(f"Function summarization unavailable: {exc}")
+    #         for function_data in collector.functions.values():
+    #             if not function_data.get("is_external") and not function_data.get(
+    #                 "summary"
+    #             ):
+    #                 function_data["summary_error"] = str(exc)
+    #         collector.write()
 
     if index_only:
         return {}
@@ -1387,7 +1505,7 @@ def trace_variable(
         print(
             f"{BOLD}{RED}NO FUNCTIONS IDENTIFIED IN THE PROJECT {project_path.name}.{RESET}"
         )
-        return {}  # same "nothing to trace" answer shape as an --index-only run
+        return None
     console.print(
         "-" * 10, "DETECTED FUNCTIONS NEEDS TO BE TRACED AND THEIR ARG. NUMS.", "-" * 10
     )
@@ -1411,26 +1529,22 @@ def trace_variable(
         # if function != 'mpf_mfs_open':continue
         # if project_path.name == 'dio120d' : continue
         STATE.set("CURRENT_PROCESSED_FUNCTION", function)
-        # One event loop per function: its paths run concurrently, the functions
-        # themselves stay sequential because each one's call-graph and parsing
-        # work is CPU-bound and would otherwise block that loop.
-        function_dataframes: list | None = asyncio.run(
-            make_llm_calls_for_function(
-                function=function,
-                trees=trees,
-                functions_identified=functions_identified,
-                answers=answers,  # will be modified in place
-                main_file_name=main_file_name,
-                function_pointer_args=FUNCTION_POINTER_ARGS,  # TODO: need the same for these or make a state class holding these vars together.
-                file_functions=FILE_FUNCTIONS,
-                project_structure=PROJECT_STRUCTURE,
-                project_path=project_path,
-            )
-        )
+        function_dataframes: list | None = asyncio.run(make_llm_calls_for_function(
+            function=function,
+            trees=trees,
+            functions_identified=functions_identified,
+            answers=answers,  # will be modified in place
+            main_file_name=main_file_name,
+            function_pointer_args=FUNCTION_POINTER_ARGS,  # TODO: need the same for these or make a state class holding these vars together.
+            file_functions=FILE_FUNCTIONS,
+            project_structure=PROJECT_STRUCTURE,
+            project_path=project_path,
+        ))
         if function_dataframes is not None:
             data_csvs = [*data_csvs, *function_dataframes]
 
-    console.print(data_csvs)
+    # Full result data can be very large for projects with many paths.
+    # console.print(data_csvs)
     # save_dicts_to_csv(data_csvs)
 
     collector = STATE.get("VISUALIZER_COLLECTOR")
@@ -1471,9 +1585,13 @@ if __name__ == "__main__":
     # endregion
 
     summaries = []
+    # parent_folder = 'results/detailed_tool_description_changed_prompt'
+    parent_folder = "logs/after_tool_modification"
     # functions_to_trace = functions_to_trace()
     from pathlib import Path
 
+    folder = Path(__file__).resolve().parent / f"{parent_folder}"
+    folder.mkdir(parents=True, exist_ok=True)
     apl_path = "/home/seigyo/c_repo/c_repo/src/src_analysis/src"
     rbt_path = "/home/seigyo/c_repo/c_repo/src/src_rbt/src"
     src_wh = "/home/seigyo/c_repo/c_repo/src/src_wh/wh-dio/src"
@@ -1574,51 +1692,7 @@ if __name__ == "__main__":
         action="store_true",
         help="Build the complete code graph (and optional summaries) without target-variable LLM tracing.",
     )
-    argument_parser.add_argument(
-        "--output-root",
-        type=Path,
-        help=(
-            "Folder that receives this run's results/, pickle_data/ and logs/. "
-            "Give one per project to analyze several projects side by side; "
-            "without it the repository's own results folder is used."
-        ),
-    )
-    argument_parser.add_argument(
-        "--targets",
-        type=Path,
-        help=(
-            "Targets JSON to trace (defaults to <json_data>/mpf_data.json). "
-            "Point it at an updated file to add tracked arguments to a project "
-            "that has already been run: finished paths are skipped and the new "
-            "results are appended to the same CSV."
-        ),
-    )
-    argument_parser.add_argument(
-        "--include-levels",
-        type=int,
-        default=2,
-        help=(
-            "How many folder levels above a process to search for header "
-            "folders the Makefile does not name (0 disables discovery)."
-        ),
-    )
-    argument_parser.add_argument(
-        "--include-dir",
-        type=Path,
-        action="append",
-        dest="include_dirs",
-        help="Extra header search folder; repeatable.",
-    )
-    argument_parser.add_argument(
-        "--trace-concurrency",
-        type=int,
-        help="Target paths traced at the same time (default 4).",
-    )
     command_args = argument_parser.parse_args()
-    if command_args.output_root:
-        set_output_root(command_args.output_root)
-    if command_args.trace_concurrency:
-        os.environ["TRACER_CONCURRENCY"] = str(max(1, command_args.trace_concurrency))
     if command_args.llm_model:
         os.environ["TRACER_LLM_MODEL"] = command_args.llm_model
     if command_args.llm_base_url:
@@ -1715,15 +1789,13 @@ if __name__ == "__main__":
             print(f"RUNNING FOR PROJECT {project_path.name}")
             try:
                 set_tool_def()
-                STATE = load_project_state(json_dir, command_args.targets)
+                STATE = load_project_state(json_dir)
                 STATE.set("TIME", f"{datetime.now():%Y%m%d_%H%M%S}")
                 STATE.set("PROJECT_NAME", project_path.name)
                 summary = trace_variable(
                     project_path=project_path,
                     summary_config=summary_config,
                     index_only=command_args.index_only,
-                    include_levels=command_args.include_levels,
-                    extra_include_dirs=command_args.include_dirs,
                 )
                 console.print(summary)
                 graph_path = STATE.get("VISUALIZER_GRAPH_PATH")
@@ -1812,8 +1884,7 @@ if __name__ == "__main__":
 
         set_tool_def()
         STATE = load_files()
-        parent_folder = logs_root()
-        parent_folder.mkdir(parents=True, exist_ok=True)
+        parent_folder = "/home/seigyo/c_repo/c_repo/logs"
         datetime_for_name = f"{datetime.now():%Y%m%d_%H%M%S}"
         STATE.set("TIME", datetime_for_name)
         logfile = f"{parent_folder}/{project}_{datetime_for_name}.txt"

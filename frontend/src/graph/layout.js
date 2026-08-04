@@ -353,9 +353,7 @@ export function layoutOverview(overview, { radius = 1500 } = {}) {
   for (const node of nodes) {
     const isProcess = node.type === "process";
     const spec = isProcess ? LABEL_SPECS.process : LABEL_SPECS.resource;
-    const lines = isProcess
-      ? [node.name, `${node.functionCount} fn · ${node.interactionCount} interactions`]
-      : [`${node.kind} ${node.name}`];
+    const lines = [node.name];
     const label = labelWorldSize(lines, spec);
     const dot = isProcess ? 46 : 22;
     node.clearance = Math.max(dot * 1.7, label.width / 2 + 26, label.height + dot * 1.2);

@@ -326,7 +326,7 @@ class fallbackAi:
                     model=self.model,
                     messages=messages,
                     tools=self.tools,
-                    options={"temperature": 0, "num_ctx": 8192},
+                    options={"temperature": 0.1, "num_ctx": 8192},
                 )
             except Exception as e:
                 return f"Error communicating with LLM: {e}"

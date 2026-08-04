@@ -11,6 +11,7 @@ tiktoken
 libclang
 # Install the repository's grammar with its own compatible tree-sitter core
 # requirement; an arbitrary newest core can crash the native grammar binding.
+tree-sitter==0.25.2
 -e ./tree-sitter-c[core]
 
 # Tracer CLI and outputs
