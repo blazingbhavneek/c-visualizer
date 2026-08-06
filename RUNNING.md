@@ -46,7 +46,7 @@ python frontend/server.py --port 8765
 cd frontend && npm run dev
 ```
 
-Open <http://127.0.0.1:5173>.
+Open [http://127.0.0.1:5173](http://127.0.0.1:5173).
 
 > A 500 from `/api/*` in dev almost always means `server.py` is not running —
 > Vite's proxy returns 500 on connection refused, which looks like an app error
@@ -59,7 +59,7 @@ cd frontend && npm run build && cd ..
 python frontend/server.py --port 8765
 ```
 
-Open <http://127.0.0.1:8765>. `server.py` serves `frontend/dist/` when it
+Open [http://127.0.0.1:8765](http://127.0.0.1:8765). `server.py` serves `frontend/dist/` when it
 exists, so this is one process for UI and API both.
 
 ## 4. Without any model
@@ -169,9 +169,9 @@ records `llm_query_count` and token totals for the run.
 
 ## 8. Ports in use here
 
-| port | what |
-|---|---|
-| 8000 | vLLM — `Qwen/Qwen3-Embedding-0.6B` |
-| 8001 | vLLM — `BAAI/bge-reranker-v2-m3` |
-| 5173 | Vite dev server |
-| 8765 | `server.py` (UI + API + chat) |
+| port | what                                 |
+| ---- | ------------------------------------ |
+| 8000 | vLLM —`Qwen/Qwen3-Embedding-0.6B` |
+| 8001 | vLLM —`BAAI/bge-reranker-v2-m3`   |
+| 5173 | Vite dev server                      |
+| 8765 | `server.py` (UI + API + chat)      |

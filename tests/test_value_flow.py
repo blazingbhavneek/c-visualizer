@@ -429,6 +429,114 @@ class ValueFlowTests(unittest.TestCase):
             self.assertEqual(len(records[0].paths), 1)
             self.assertTrue(records[0].paths_truncated)
 
+    def test_legacy_output_emits_each_materialized_value_path_separately(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            resolver = self.build_resolver(
+                root,
+                {
+                    "main.c": (
+                        "void target(int value);\n"
+                        "void inner(int value) { target(value); }\n"
+                        "void outer(int value) { inner(value); inner(value); }\n"
+                        "int main(void) { outer(5); return 0; }\n"
+                    )
+                },
+                {
+                    "target": {
+                        "type": "READF",
+                        "indices": [1],
+                        "dependent_functions": [],
+                    }
+                },
+            )
+            records = asyncio.run(resolver.run())
+            output = write_outputs(
+                records=records,
+                resolver=resolver,
+                process_name="process",
+                output_root=root / "results",
+            )
+
+            with output.legacy.open(encoding="utf-8-sig", newline="") as handle:
+                legacy = list(csv.DictReader(handle))
+            self.assertEqual(len(legacy), 2)
+            self.assertEqual({row["target_number->ans"] for row in legacy}, {"5"})
+
+    def test_legacy_output_combines_target_arguments_with_underscore(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            resolver = self.build_resolver(
+                root,
+                {
+                    "main.c": (
+                        "void set_sem(const char *process, int index);\n"
+                        "int main(void) { set_sem(\"svm300d\", 0); }\n"
+                    )
+                },
+                {
+                    "set_sem": {
+                        "type": "SEMAPHORE",
+                        "indices": [1, 2],
+                        "dependent_functions": [],
+                    }
+                },
+            )
+            records = asyncio.run(resolver.run())
+            output = write_outputs(
+                records=records,
+                resolver=resolver,
+                process_name="process",
+                output_root=root / "results",
+            )
+
+            with output.legacy.open(encoding="utf-8-sig", newline="") as handle:
+                legacy = list(csv.DictReader(handle))
+            self.assertEqual(len(legacy), 1)
+            self.assertEqual(legacy[0]["target_number->ans"], "svm300d_0")
+
+    def test_handle_consumer_resolves_once_for_multiple_open_families(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            resolver = self.build_resolver(
+                Path(temp_dir),
+                {
+                    "main.c": (
+                        "void open_a(int *handle, int file_no);\n"
+                        "void open_b(int *handle, int file_no);\n"
+                        "void close_h(int *handle);\n"
+                        "int main(void) { int handle; open_a(&handle, 42); close_h(&handle); }\n"
+                    )
+                },
+                {
+                    "open_a": {
+                        "type": "OPENF",
+                        "indices": [2],
+                        "dependent_functions": [],
+                    },
+                    "open_b": {
+                        "type": "OPENF",
+                        "indices": [2],
+                        "dependent_functions": [],
+                    },
+                    "close_h": {
+                        "type": "CLOSEF",
+                        "indices": [],
+                        "handle_index": 1,
+                        "dependent_functions": ["open_a", "open_b"],
+                    },
+                },
+            )
+            records = asyncio.run(resolver.run())
+            closes = [
+                record
+                for record in records
+                if record.seed.target_function == "close_h"
+            ]
+
+            self.assertEqual(len(closes), 1)
+            self.assertEqual(closes[0].arg_index, 1)
+            self.assertEqual(closes[0].fact.value, "42")
+
     def test_extended_scada_fixture_matches_handle_ground_truth(self):
         repo = Path(__file__).resolve().parents[1]
         fixture = repo / "test_scada"

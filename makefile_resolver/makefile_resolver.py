@@ -12,135 +12,154 @@ from makefile_resolver.extract_includes import resolve
 
 console = Console()
 
-
 class MakefileContext:
     def __init__(self, project_root_makefile: Union[str, Path]):
-        self.vars: Dict[str, str] = dict(
-            os.environ
-        )  # might have any conflicts so we can make a dict and trasfer it here.
+        self.vars: Dict[str, str] = dict(os.environ)
         self.root_makefile_path = Path(project_root_makefile)
         self.root_dir = self.root_makefile_path.parent
         self.parsed_files = set()
         self.unresolved_log: List[Tuple[str, str, str]] = []
 
     def resolve_string(self, raw_str: str) -> str:
+        """Resolve Makefile-style variables like $(HOME) or ${HOME}."""
         if not raw_str:
             return ""
+
         var_pattern = re.compile(r"\$[({]([a-zA-Z0-9_]+)[)}]")
         resolved = str(raw_str)
-        # Recursive resolution for nested macros
+
+        # Resolve nested variables, capped to avoid infinite recursion.
         for _ in range(10):
             matches = list(var_pattern.finditer(resolved))
             if not matches:
                 break
+
             for match in reversed(matches):
                 var_name = match.group(1)
                 var_value = self.vars.get(var_name, "")
                 resolved = (
-                    resolved[: match.start()] + var_value + resolved[match.end() :]
+                    resolved[: match.start()]
+                    + var_value
+                    + resolved[match.end() :]
                 )
+
         return resolved.strip()
 
     def _process_path(
-        self, tag: str, raw_token: str, is_lib: bool = False
+        self,
+        tag: str,
+        raw_token: str,
+        is_lib: bool = False,
     ) -> Path | None:
-        """Fully resolves a single token into an absolute Path."""
-        # 1. Expand macro (e.g., $(HOME)/include -> /abs/path/include)
-        # print('tag',tag,'raw_token ',raw_token)
+        """Resolve one Makefile token into an existing absolute Path."""
         expanded = self.resolve_string(raw_token).replace("'", "").strip()
+
+        # Convert lib archive paths/names into their likely source directory path.
         if is_lib:
-            expanded = str(Path(expanded).parent) + f"/{Path(expanded).stem}"
-            expanded = expanded.strip(".")
+            expanded = str(Path(expanded).parent / Path(expanded).stem).strip(".")
 
         if not expanded:
             return None
 
-        # if is_lib:
-        #     expanded = expanded.replace('.a','').strip()
-        p = Path(expanded)
-        # print(p)
-        # 2. If it's absolute, Path handles it. If relative, join to root_dir.
-        final_path = p if p.is_absolute() else (self.root_dir / p)
-        resolved_path = final_path.resolve()
-        # 3. For LIBS: If it's a file (libapl.a), return the directory containing it
-        if is_lib and resolved_path.suffix in [".a", ".so", ".lib", ".sl", ".o", "."]:
+        path = Path(expanded)
+        resolved_path = path if path.is_absolute() else self.root_dir / path
+        resolved_path = resolved_path.resolve()
+
+        if is_lib and resolved_path.suffix in {".a", ".so", ".lib", ".sl", ".o", "."}:
             resolved_path = resolved_path.parent
+
+        # Some SRCS entries omit .c or point to object-like names.
         if tag == "SRCS" and resolved_path.suffix != ".c":
             resolved_path = resolved_path.parent / f"{resolved_path.stem}.c"
 
-        # 4. Debugging log for missing paths
         if not resolved_path.exists():
-            # print(resolved_path)
             self.unresolved_log.append((tag, raw_token, str(resolved_path)))
             return None
 
         return resolved_path
 
     def parse_file(self, filepath: Union[str, Path]):
-        file_path_obj = Path(filepath)
-        if file_path_obj in self.parsed_files or not file_path_obj.exists():
-            return
-        self.parsed_files.add(file_path_obj)
+        """Parse a Makefile and recursively parse included Makefiles."""
+        file_path = Path(filepath)
 
-        with open(file_path_obj, "r", errors="ignore") as f:
+        if file_path in self.parsed_files or not file_path.exists():
+            return
+
+        self.parsed_files.add(file_path)
+
+        with open(file_path, "r", errors="ignore") as f:
             content = f.read().replace("\\\n", " ")
             lines = content.splitlines()
 
         for line in lines:
             line = line.strip()
+
             if not line or line.startswith("#"):
                 continue
 
-            # Variable Assignment
-            assign_match = re.match(r"^([a-zA-Z0-9_]+)\s*(\??:?|\+?)=\s*(.*)", line)
+            assign_match = re.match(r"^([a-zA-Z0-9_]+)\s*(\+=|\?=|:=|=)\s*(.*)", line)
             if assign_match:
-                key, operator, val = assign_match.groups()
-                # if key=='HOME':
-                #     print(key,operator,val,'ooo')
+                key, operator, value = assign_match.groups()
+
                 if operator == "+=":
-                    self.vars[key] = f"{self.vars.get(key, '')} {val}".strip()
+                    self.vars[key] = f"{self.vars.get(key, '')} {value}".strip()
                 elif operator == "?=":
                     if key not in self.vars:
-                        self.vars[key] = val
+                        self.vars[key] = value
                 else:
-                    self.vars[key] = val
+                    self.vars[key] = value
 
-            # Include Directives (Recursive)
+                continue
+
             include_match = re.match(r"^include\s+(.+)", line)
             if include_match:
-                inc_path_str = self.resolve_string(include_match.group(1))
-                # print("Inc_path_str", inc_path_str)
-                inc_path = self._process_path("INCLUDE_DIRECTIVE", inc_path_str)
-                if inc_path:
-                    self.parse_file(inc_path)
+                include_path_raw = self.resolve_string(include_match.group(1))
+                include_path = self._process_path(
+                    "INCLUDE_DIRECTIVE",
+                    include_path_raw,
+                )
+
+                if include_path:
+                    self.parse_file(include_path)
 
     def get_final_info(self):
-        # A. Helper to process a whole tag (e.g. INCLUDE) that might contain multiple tokens
+        """Return resolved source files, include dirs, library dirs, and unresolved paths."""
+
         def resolve_tag_list(
-            keys: List[str], prefix_to_strip: str = "", is_lib: bool = False
-        ) -> list:
+            keys: List[str],
+            prefix_to_strip: str = "",
+            is_lib: bool = False,
+        ) -> list[Path]:
             results = []
+
             for key in keys:
-                raw_val = self.vars.get(key, "")
-                expanded_line = self.resolve_string(raw_val)
+                raw_value = self.vars.get(key, "")
+                expanded_line = self.resolve_string(raw_value)
+
                 for token in expanded_line.split():
                     clean_token = token
-                    # print(clean_token)
+
                     if prefix_to_strip and token.lower().startswith(
                         prefix_to_strip.lower()
                     ):
                         clean_token = token[len(prefix_to_strip) :]
-                    # print(clean_token)
-                    p = self._process_path(key, clean_token, is_lib=is_lib)
-                    if p:
-                        results.append(p)
-            return list(dict.fromkeys(results))  # Deduplicate
+
+                    path = self._process_path(
+                        key,
+                        clean_token,
+                        is_lib=is_lib,
+                    )
+
+                    if path:
+                        results.append(path)
+
+            # Deduplicate while preserving order.
+            return list(dict.fromkeys(results))
 
         return {
-            # "HOME": self._process_path("HOME", self.vars.get("HOME", "")),
-            "HOME": self._process_path(
-                self.vars.get("HOME", ""), "../.."
-            ),  # this is because in some makefiles the HOME is set to according to some other env that we don't have.
+            # Many project Makefiles define HOME relative to their own build setup,
+            # so this keeps the old fallback behavior.
+            "HOME": self._process_path("HOME", "../.."),
             "SRCS": resolve_tag_list(["SRCS"]),
             "INCLUDES": resolve_tag_list(["INCLUDE"], prefix_to_strip="-I"),
             "LIB_DIRS": resolve_tag_list(["LIBS"], is_lib=True),
@@ -150,130 +169,126 @@ class MakefileContext:
 
 @time_it(message="")
 def return_project_mapping(
-    show: bool = False, project_path: Path | None = None
-) -> tuple[dict[str, Path], list[str]]:  # mapping and potential main files names
-    os.environ["VERSION_MNG"] = "/home/seigyo/c_repo/c_repo/src"
-    os.environ["PROJECT"] = "/home/seigyo/c_repo/c_repo/src"
-    print(project_path)
-    # os.environ['HOMELIB'] = '/home/seigyo/c_repo/c_repo/src/src_analysis'
+    show: bool = False,
+    project_path: Path | None = None,
+) -> tuple[dict[str, Path], list[str]]:
+    if project_path is None:
+        raise ValueError("project_path is required in CLI mode")
 
-    if not project_path:
-        apl_paths = "/home/seigyo/c_repo/c_repo/src/src_analysis/src"
-        rbt_paths = "/home/seigyo/c_repo/c_repo/src/src_rbt/src"
-        # region PATH HANDLING OF FOLDERS
-        select_path, select_index = pick(
-            ["apl", "rbt"], "Select the folder", indicator="==>>", default_index=0
-        )
-        if select_index == 0:
-            # os.environ['ORDERINC'] = '/home/seigyo/c_repo/c_repo/src/moove_header'
-            # apl folder
-            # os.environ['ORDERINC'] = 'home/seigyo/c_repo/c_repo/src/src_analysis'
-            folders = [d.name for d in Path(apl_paths).iterdir() if d.is_dir()]
-            folders.remove("libapl")
-            select_folders, folder_index = pick(
-                folders, "Select the apl folder", indicator="==>>", default_index=0
-            )
-            folder_path = Path(apl_paths) / f"{select_folders}"
-        else:
-            folders = [d.name for d in Path(rbt_paths).iterdir() if d.is_dir()]
-            folders.remove("libRbt")
-            select_folders, folder_index = pick(
-                folders, "Select the apl folder", indicator="==>>", default_index=0
-            )
-            folder_path = Path(rbt_paths) / f"{select_folders}"
-    else:
-        folder_path = project_path
+    project_path = Path(project_path)
+    makefile_input = project_path / "Makefile"
 
-    # endregion
-    apl_path = "/home/seigyo/c_repo/c_repo/src/src_analysis/src"
-    rbt_path = "/home/seigyo/c_repo/c_repo/src/src_rbt/src"
-    src_wh = "/home/seigyo/c_repo/c_repo/src/src_wh/wh-dio/src"
-    # if apl_path in str(project_path):
-    #     # set env variables for apl projects.
-    #     os.environ['MODERNLIB']
-    makefile_input = folder_path / "Makefile"
-    # os.environ['ORDERLIB']
-    # os.environ["HOME"] = "../.."
-    os.environ["MODERNLIB"] = str(makefile_input.parent.parent)  # /src
-    os.environ["HOMELIB"] = str(makefile_input.parent.parent)
-    os.environ["MODERN"] = str(makefile_input.parent.parent)
-    os.environ["ORDERLIB"] = str(makefile_input.parent.parent)
+    # Environment expected by existing Makefile variables.
+    project_root = makefile_input.parent.parent
+    os.environ["MODERNLIB"] = str(project_root)
+    os.environ["HOMELIB"] = str(project_root)
+    os.environ["MODERN"] = str(project_root)
+    os.environ["ORDERLIB"] = str(project_root)
 
     ctx = MakefileContext(makefile_input)
-
     ctx.parse_file(makefile_input)
 
     info = ctx.get_final_info()
     console.print(info)
 
-    # FROM THIS INFO EXTRACT ALL THE .C AND .H FILES..
-    def get_c_and_h_files(directory):
+    def get_c_and_h_files(directory: Path | str) -> dict[str, Path]:
+        """Collect all .c and .h files under a directory."""
         path = Path(directory)
 
-        # Using rglob to get all .c and .h files recursively
-        c_and_h_files = {
-            file.name: file for file in path.rglob("*") if file.suffix in {".c", ".h"}
+        return {
+            file.name: file
+            for file in path.rglob("*")
+            if file.suffix in {".c", ".h"}
         }
 
-        return c_and_h_files
-
-    def get_local_library_files():
-        """Find source directories for local libraries named in the Makefile."""
+    def get_local_library_files() -> dict[str, Path]:
+        """Find local library source folders referenced by the Makefile."""
         library_names = set()
+
         for key in ("LIBS", "LDLIBS", "LIBRARIES"):
             library_names.update(
-                re.findall(r"lib([^/\s]+?)\.(?:a|so|lib|sl)\b", ctx.vars.get(key, ""))
+                re.findall(
+                    r"lib([^/\s]+?)\.(?:a|so|lib|sl)\b",
+                    ctx.vars.get(key, ""),
+                )
             )
 
         library_files = {}
         source_root = project_path.parent
+
         for library_name in library_names:
             for directory in source_root.rglob(f"lib{library_name}"):
                 if directory.is_dir():
                     library_files.update(get_c_and_h_files(directory))
+
         return library_files
 
     files: dict[str, Path] = {}
     potential_main_files: list[str] = []
+
+    # Build source/header set from resolved Makefile info.
     for key in info:
         if key in ("UNRESOLVED", "HOME"):
             continue
+
         if key == "SRCS":
-            for p in info[key]:
-                files[p.name] = p
-                potential_main_files.append(p.name)
-        else:
-            for p in info[key]:
-                if p == project_path.parent:
-                    continue
-                if p.is_dir() and p != makefile_input.parent:
-                    files.update(get_c_and_h_files(p))  # dict.update merges dicts
-                elif p.is_file() and p != makefile_input.parent:
-                    files[p.name] = p
+            for path in info[key]:
+                files[path.name] = path
+                potential_main_files.append(path.name)
+            continue
+
+        for path in info[key]:
+            if path == project_path.parent:
+                continue
+
+            if path.is_dir() and path != makefile_input.parent:
+                files.update(get_c_and_h_files(path))
+            elif path.is_file():
+                files[path.name] = path
+
+    # Fallback if Makefile parsing did not produce source files.
     if not files:
         files = get_c_and_h_files(project_path)
-        potential_main_files = [name for name in files if name.endswith(".c")]
+        potential_main_files = [
+            name for name in files
+            if name.endswith(".c")
+        ]
+
+    # Include local library files after project files.
     files.update(get_local_library_files())
-    # console.print(files)
+
     include_dirs = list(info.get("INCLUDES", []))
     include_dirs.append(project_path.parent)
     include_dirs.append(project_path.parent.parent)
+
+    # Add shared include roots if present in parent folders.
     shared_include = next(
-        (parent / "include" for parent in project_path.parents if (parent / "include").is_dir()),
+        (
+            parent / "include"
+            for parent in project_path.parents
+            if (parent / "include").is_dir()
+        ),
         None,
     )
+
     if shared_include:
         include_dirs.append(shared_include)
+
         modern_include = shared_include.parent / "modern" / "include"
         if modern_include.is_dir():
             include_dirs.append(modern_include)
+
         include_dirs.append(shared_include.parent)
+
     combined_dependency, file_wise_dependency = resolve(
-        files=files, include_dirs=include_dirs
+        files=files,
+        include_dirs=include_dirs,
     )
+
     if show:
         console.print(file_wise_dependency)
         console.print(combined_dependency)
+
     return combined_dependency, potential_main_files
 
 

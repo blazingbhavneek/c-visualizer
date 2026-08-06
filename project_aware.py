@@ -84,6 +84,13 @@ from visualizer_export import (
 from value_flow.outputs import write_outputs, write_trace_logs
 from value_flow.queries import OneHopAnswer
 from value_flow.resolver import IndexedSite, ValueFlowResolver
+from typing import Any
+
+import argparse
+import os
+import sys
+from datetime import datetime
+from pathlib import Path
 
 # endregion Imports
 
@@ -150,12 +157,15 @@ def identify_funs_to_trace(
     project_structure: dict[str, str],
     trees: dict,
     name_of_json: str = "json_data/mpf_data.json",
-) -> (
-    dict[str, dict[str, any]] | None
-):  # will return {function_name, [list of indice of arguments to trace...]}
+) -> dict[str, dict[str, Any]] | None:
+    """
+    Identify configured functions that are called in project source files.
 
-    # file_path = Path(name_of_json)
-    STATE = State()
+    Function trace config is read from State()["FUNCTION_TYPES"].
+    Header files are skipped because only source-file calls are scanned.
+    """
+    state = State()
+
     functions_to_detect = {
         function_name.strip(): {
             **config,
@@ -164,39 +174,41 @@ def identify_funs_to_trace(
                 for dependent_function in config.get("dependent_functions", [])
             ],
         }
-        for function_name, config in (STATE.get("FUNCTION_TYPES") or {}).items()
+        for function_name, config in (state.get("FUNCTION_TYPES") or {}).items()
     }
-    STATE.set("FUNCTION_TYPES", functions_to_detect)
-    ans = {}  # {function_name, [indices to trace for it....]}
+
+    state.set("FUNCTION_TYPES", functions_to_detect)
+
+    functions_to_trace = {}
+
     if not functions_to_detect:
-        print(f"Data 'FUNCTION_TYPES' Not in state.")
-    for file_name, file_path_str in project_structure.items():
+        print("Data 'FUNCTION_TYPES' Not in state.")
+
+    for file_name in project_structure:
         if file_name.endswith(".h"):
-            continue  # as we don't look at the function declared in the header files...
+            continue
 
-        bytes_content = trees[file_name][1]  # content
+        bytes_content = trees[file_name][1]
         functions_called = extract_function_calls(bytes_content)
-        # print('Functions called in ',file_name,functions_called)
-        # sys.exit()
-        for func in functions_to_detect:
 
-            if func in functions_called:
+        for function_name in functions_to_detect:
+            if function_name in functions_called:
                 list_of_indices = [
-                    ind for ind in functions_to_detect[func].get("indices")
+                    index
+                    for index in functions_to_detect[function_name].get("indices")
                 ]
-                get_upper = functions_to_detect[func].get("get_upper")
-                # for argument in functions_to_detect[func]:
-                #     if isinstance(argument.get('indices'),list):
-                #         list_of_indices.append(argument[1]+1) # +1 as its and index to convert it to 1 based indexing.
-                ans[func] = {
+
+                get_upper = functions_to_detect[function_name].get("get_upper")
+
+                functions_to_trace[function_name] = {
                     "indices": list_of_indices,
                     "get_upper": get_upper,
-                    "dependent_functions": functions_to_detect[func].get(
+                    "dependent_functions": functions_to_detect[function_name].get(
                         "dependent_functions"
-                    ),  # list of str
+                    ),
                 }
 
-    return ans
+    return functions_to_trace
 
 # doing dfs on tree to find the path of  dependent_function starting from main, returns bool, and changes str_path inplace for results, curr_path is temp for dfs ops
 def dfs_on_path_trees(
@@ -1503,7 +1515,6 @@ async def make_llm_calls_for_function(
 
     return function_answer_csv
 
-
 async def make_value_flow_calls(
     *,
     graph: dict,
@@ -1519,32 +1530,75 @@ async def make_value_flow_calls(
     path_cap: int = 100,
     llm_concurrency: int = 20,
 ) -> list:
-    """Run the additive backward resolver once for every target in a process."""
+    """
+    Run the value-flow resolver for every detected target API call in this process.
+
+    This builds target seeds from the complete call graph, walks backward through
+    call paths, resolves argument values, writes output artifacts, and appends
+    legacy-compatible results into `answers`.
+    """
+
+    # NEW VALUE-FLOW PIPELINE (read this before following the helpers below):
+    #
+    # 1. trace_variable() has already parsed the project and built `graph`.
+    # 2. ValueFlowResolver finds every reachable configured target CALL.
+    # 3. For each target argument it walks BACKWARD to the value source.
+    #    Example: close(handle) -> open(handle, FILE_NO) -> FILE_NO macro.
+    # 4. The resolver returns one record per value/path.  This function only
+    #    supplies LLM context, writes files, and adapts results for old callers.
+    #
+    # Important: this is not the old main-to-target path enumerator.  The
+    # resolver follows only edges that carry the selected value.
     state = State()
     process_name = project_path.name
+
+    # parseFiles still needs the original file bytes when it prepares an LLM
+    # prompt. Tree-sitter trees are already inside `trees`; keep only bytes here.
+    # Keep only file bytes from the preprocessed Tree-sitter data.
+    # parseFiles uses this to generate source context for LLM prompts.
     file_name_bytes = {key: value[1] for key, value in trees.items()}
+
+    # FUNCTION_TYPES was normalized and saved back into State inside identify_funs_to_trace().
+    # We read it again here because functions_identified only contains targets found in this project,
+    # but the full State config may also contain richer/default config and dependency function configs.
+    # Example: if "mpf_read" is detected and depends on "mpf_open", we trace "mpf_read" as a seed,
+    # but also include "mpf_open" config so value-flow can resolve the handle/resource relationship.
     configured = state.get("FUNCTION_TYPES") or {}
-    # Limit seeds to detected APIs, but retain dependent/open configurations
-    # needed by handle resolution.
+
+    # Build the small resolver configuration for THIS project.
+    # Start with only functions actually detected in this project.
+    # This avoids resolving every configured API from the JSON/state.
     valueflow_configs = {
         name: dict(configured.get(name, config))
         for name, config in functions_identified.items()
     }
+
+    # A read/close API can depend on an open/create/register API.  Keep those
+    # dependency configs even when the open API was not itself a direct target.
+    # Add those dependency configs too, even if they were not direct seeds.
     for config in functions_identified.values():
         for dependency in config.get("dependent_functions") or []:
             if dependency in configured:
                 valueflow_configs.setdefault(dependency, dict(configured[dependency]))
 
+    # Aggregated LLM token/query stats for this whole resolver run.
     token_totals = {"Input_tokens": 0, "Output_tokens": 0, "Total_tokens": 0}
     query_stats: list[dict] = []
 
     def record_stats(kind: str, site: IndexedSite, stats) -> None:
+        """
+        Record token usage and query metadata for one LLM call.
+        `kind` identifies why the LLM was called.
+        """
         if stats is None:
             return
+
         stats_dict = stats.model_dump() if hasattr(stats, "model_dump") else dict(stats)
         tokens = stats_dict.get("Tokens") or {}
+
         for key in token_totals:
             token_totals[key] += int(tokens.get(key, 0) or 0)
+
         query_stats.append(
             {
                 "kind": kind,
@@ -1555,36 +1609,63 @@ async def make_value_flow_calls(
         )
 
     def context_for(site: IndexedSite, *, get_upper: bool) -> tuple[list[str], str]:
+        """
+        Build a small call-path context around one call site.
+
+        This converts resolver site metadata back into the legacy path-label
+        format expected by parseFiles and the existing LLM prompts.
+        """
+        # Convert one resolver call site back to the older label format that
+        # parseFiles understands. This exists only for an LLM prompt; it does
+        # not decide which value-flow path the resolver follows.
         caller = registry.get(site.caller_id)
         callee = registry.get(site.callee_id) or site.raw_call_site.callee
+
         if caller is None:
             return [], ""
+
         path = [caller.label]
+
+        # If the call goes through a macro, include the macro proxy node.
+        # This lets parseFiles expose macro expansion info to the LLM.
         if site.macro_name:
-            # parseFiles emits the "signature -> replacement" comment only when
-            # the macro proxy node is on the path, which is what lets the model
-            # remap argument positions across the expansion.
             path.append(site.raw_call_site.callee.label_with_line(line=site.line))
+
         path.append(callee.label_with_line(line=site.line))
+
         parser = parseFiles(
             project_structure=project_structure,
             paths=[path],
             macro_data=state.get("BUILDER_MACROS") or {},
             file_name_bytes=file_name_bytes,
         )
+
         _, context = parser.parse_for_path(path, get_upper=get_upper)
         return path, context
 
     async def resolve_one_hop(
         site: IndexedSite, argument_number: int, expression: str
     ) -> OneHopAnswer | None:
+        """
+        Resolve one argument expression at a specific call site.
+
+        Example: for `foo(x)`, resolve what `x` means at that call location.
+        """
+        # The resolver reaches this callback only after its cheap syntax rules
+        # could not explain the expression (literal/macro/local assignment/etc).
         path, context = context_for(site, get_upper=True)
+
         if not path:
             return None
+
         print(
             f"{ORANGE}  LLM one-hop{RESET} {site.file_name}:{site.line} "
             f"{site.callee_name} arg {argument_number} -> {expression!r}"
         )
+
+        # First try the strict one-hop prompt/schema.  It answers only this
+        # one expression: VALUE, PARAM, EXTERNAL, or UNRESOLVED.
+        # It is designed for small local expression resolution.
         result = await asyncio.to_thread(
             run_with_retry,
             llm_calls_one_hop,
@@ -1596,18 +1677,20 @@ async def make_value_flow_calls(
                 expression,
             ),
         )
+
         if result:
             model, stats = result
             record_stats("one_hop", site, stats)
+
             model_data = model.model_dump() if hasattr(model, "model_dump") else model
+
             try:
                 return OneHopAnswer(**model_data)
             except (TypeError, ValueError):
                 pass
 
-        # Per-query safety fallback: re-ask the same annotated sub-problem with
-        # the established tracer prompt, which tolerates expressions the strict
-        # one-hop schema rejects. Reached only after a one-hop failure.
+        # If the strict one-hop parser fails, retry using the older prompt.
+        # This keeps valueflow compatible with cases the newer schema rejects.
         fallback = await asyncio.to_thread(
             run_with_retry,
             llm_calls,
@@ -1620,22 +1703,31 @@ async def make_value_flow_calls(
                 True,
             ),
         )
+
         if not fallback:
             return None
+
         model, stats = fallback
         record_stats("legacy_subproblem_fallback", site, stats)
+
         output = (model.model_dump() if hasattr(model, "model_dump") else model).get(
             "output", ""
         )
+
+        # Legacy output is expected as comma-separated "index:value" pairs.
+        # Extract only the requested argument number.
         for item in output.split(","):
             if ":" not in item:
                 continue
+
             index, value = item.split(":", 1)
+
             if index.strip() != str(argument_number):
                 continue
+
             cleaned = value.strip().strip('"')
-            # The legacy prompt answers "index:value". Guard against a control
-            # token echoing back as if it were the resolved value.
+
+            # Ignore control/status words if the model echoed them as values.
             if cleaned and cleaned.upper() not in {
                 "UNRESOLVED",
                 "EXTERNAL",
@@ -1644,16 +1736,28 @@ async def make_value_flow_calls(
                 "NO TARGET",
             }:
                 return OneHopAnswer(kind="VALUE", value=cleaned)
+
         return None
 
     async def resolve_return_use(site: IndexedSite, function_name: str) -> str | None:
+        """
+        Resolve how a function return value is used at this call site.
+
+        This is used for target configs that need return-value tracing instead
+        of normal argument tracing.
+        """
+        # This is separate from argument tracing: it asks whether a returned
+        # pointer/result is later used as a READF or WRITEF resource.
         path, context = context_for(site, get_upper=False)
+
         if not path:
             return None
+
         print(
             f"{ORANGE}  LLM return-use{RESET} {site.file_name}:{site.line} "
             f"{function_name}"
         )
+
         result = await asyncio.to_thread(
             run_with_retry,
             llm_calls,
@@ -1666,10 +1770,13 @@ async def make_value_flow_calls(
                 False,
             ),
         )
+
         if not result:
             return None
+
         model, stats = result
         record_stats("return_use", site, stats)
+
         return (model.model_dump() if hasattr(model, "model_dump") else model).get(
             "output"
         )
@@ -1677,10 +1784,21 @@ async def make_value_flow_calls(
     async def resolve_handle_with_llm(
         site: IndexedSite, argument_number: int, dependencies: tuple[str, ...]
     ) -> list[OneHopAnswer] | None:
+        """
+        Resolve handle-style relationships using dependency/open-family functions.
+
+        Example: a target uses a handle, and the handle may have been created by
+        one of the configured dependent functions.
+        """
+        # Normal handle matching is syntactic: find the earlier open using the
+        # same fcb/handle variable. This callback is only the last fallback.
         path, context = context_for(site, get_upper=True)
+
         if not path:
             return None
+
         dependency_text = ", ".join(dependencies)
+
         result = await asyncio.to_thread(
             run_with_retry,
             llm_calls_one_hop,
@@ -1692,37 +1810,59 @@ async def make_value_flow_calls(
                 f"handle binding for argument {argument_number}; resolve the configured open family {dependency_text}",
             ),
         )
+
         if not result:
             return None
+
         model, stats = result
         record_stats("handle_link", site, stats)
+
         data = model.model_dump() if hasattr(model, "model_dump") else model
+
         try:
             answer = OneHopAnswer(**data)
         except (TypeError, ValueError):
             return None
+
         return [answer] if answer.kind == "VALUE" else None
 
     resolved_count = [0]
 
     def report_seed(seed, rows, seconds: float) -> None:
+        """
+        Progress callback passed into ValueFlowResolver.
+
+        Called once per resolved target invocation/seed.
+        """
         resolved_count[0] += 1
+
         values = ", ".join(
             f"{row.fact.value} ({row.fact.origin_kind})" for row in rows
         )
+
         print(
             f"[{resolved_count[0]}/{len(resolver.seeds)}] {seconds:6.2f}s "
             f"{seed.target_function} {seed.site.file_name}:{seed.site.line}"
             f" -> {values or 'no target'}"
         )
 
+    # The resolver is useful without an LLM.  It can still resolve literals,
+    # macros, assignments, parameters, and many handle bindings syntactically.
+    # Check whether the optional LLM endpoint is available.
+    # If unavailable, resolver still runs syntax/static-only paths.
     llm_ready, llm_status = llm_endpoint_status()
+
     print(
         f"{BOLD}{GREEN if llm_ready else ORANGE}VALUE-FLOW LLM "
         f"{'READY' if llm_ready else 'DISABLED (syntax-only run)'}{RESET}: {llm_status}"
     )
 
+    # Cache stores previously answered LLM subqueries for this process.
+    # This avoids repeating expensive identical prompts across runs.
     cache_path = process_results_dir(process_name) / "query_cache.json"
+
+    # Hand the prepared project index and the three optional LLM callbacks to
+    # the actual value resolver. From this point, resolver.run() owns tracing.
     resolver = ValueFlowResolver(
         graph=graph,
         registry=registry,
@@ -1740,12 +1880,18 @@ async def make_value_flow_calls(
         llm_concurrency=llm_concurrency,
         progress=report_seed,
     )
+
     print(
         f"Resolving {len(resolver.seeds)} target invocation(s) "
         f"with LLM concurrency {llm_concurrency}"
     )
+
     started_at = time.perf_counter()
+
+    # Main resolver execution.
+    # Produces fact records: target call + resolved value + paths/evidence.
     records = await resolver.run()
+
     run_stats = {
         "resolver": "valueflow",
         "wall_seconds": round(time.perf_counter() - started_at, 3),
@@ -1757,6 +1903,11 @@ async def make_value_flow_calls(
         "Tokens": token_totals,
         "queries": query_stats,
     }
+
+    # Write machine-readable resolver outputs.  facts.csv keeps individual
+    # values; paths.csv keeps every source-to-target provenance chain; the
+    # top-level process CSV is the compatibility feed used by the visualizer.
+    # Usually includes fact rows and path rows under the process result folder.
     output_paths = write_outputs(
         records=records,
         resolver=resolver,
@@ -1764,20 +1915,27 @@ async def make_value_flow_calls(
         output_root=results_root(),
         run_stats=run_stats,
     )
+
+    # Write detailed trace/debug logs for each resolved path.
     log_dir = write_trace_logs(
         records=records,
         resolver=resolver,
         process_name=process_name,
         output_root=results_root(),
     )
-    # Same per-target artefacts the legacy branch produced -- audit workbook,
-    # visualizer traces, mermaid/pyvis diagrams -- built from resolver records.
+
+    # Build the same presentation artifacts that the legacy branch generated:
+    # path reports, visualizer traces, and graph diagrams.
     collector = state.get("VISUALIZER_COLLECTOR")
+
     grouped: dict[str, list] = defaultdict(list)
+
     for record in records:
         grouped[record.seed.target_function].append(record)
+
     for target_function, function_records in sorted(grouped.items()):
         drawn = [item.legacy_labels for item in function_records if item.legacy_labels]
+
         write_unique_path_report(
             function=target_function,
             process_name=process_name,
@@ -1817,6 +1975,7 @@ async def make_value_flow_calls(
                 )
             ],
         )
+
         if collector is not None:
             collector.capture_call_graph(
                 graph=state.get("CALL_GRAPH"),
@@ -1824,23 +1983,30 @@ async def make_value_flow_calls(
                 target_function=target_function,
                 trace_paths=drawn,
             )
+
         try:
             make_graph(paths=drawn)
         except Exception as exc:
-            # Drawing is presentation only; never lose a resolved run over it.
+            # Graph drawing is only a visualization step.
+            # Do not fail the whole resolver if drawing breaks.
             print(f"Could not draw the graph for {target_function}: {exc}")
+
     print(
         f"Value-flow outputs written: {output_paths.facts} and {output_paths.paths} "
         f"({len(resolver.seeds)} target invocations; {len(records)} facts)"
     )
+
     print(f"Per-path resolution logs: {log_dir}")
 
+    # Persist run-level stats separately for audit/debugging.
     stats_path = process_results_dir(process_name) / "run_stats.json"
     stats_path.parent.mkdir(parents=True, exist_ok=True)
     stats_path.write_text(
         json.dumps(run_stats, ensure_ascii=False, indent=2), encoding="utf-8"
     )
 
+    # Legacy compatibility: downstream code expects each answer to include
+    # a Combined model and Stats model, even for valueflow results.
     empty_stats = Stats.model_validate(
         {
             "Tokens": {"Input_tokens": 0, "Output_tokens": 0, "Total_tokens": 0},
@@ -1850,8 +2016,10 @@ async def make_value_flow_calls(
             "Incorrect_details": [],
         }
     )
+
     for record in records:
         path_string = "->".join(record.legacy_labels)
+
         combined = Combined.model_validate(
             {
                 "call_number": record.call_number,
@@ -1874,7 +2042,9 @@ async def make_value_flow_calls(
                 },
             }
         )
+
         answers[record.seed.target_function].append((combined, empty_stats))
+
     return records
 
 
@@ -1890,89 +2060,170 @@ def trace_variable(
 ):
     STATE = State()
     project_path = Path(project_path)
-    pickle_dir = (
-        Path(__file__).resolve().parent / "pickle_data/project_structures_pickle"
-    )
-    if not pickle_dir.exists():
-        pickle_dir.mkdir(exist_ok=True, parents=True)
+
+    # region pickle caching
+
+    # Toggle this FALSE during debugging/testing, otherwise it might use same tree made when parser/targets were not set correctly
+    USE_PROJECT_STRUCTURE_PICKLE = True
+
+    pickle_dir = Path(__file__).resolve().parent / "pickle_data/project_structures_pickle"
+    pickle_dir.mkdir(exist_ok=True, parents=True)
 
     project_structure_path = pickle_dir / f"{STATE.get('PROJECT_NAME')}_include_v5.pkl"
+
+    PROJECT_STRUCTURE = None
     potential_main_files: list[str] | None = None
-    if not project_structure_path.exists():
+
+    if USE_PROJECT_STRUCTURE_PICKLE and project_structure_path.exists():
+        import pickle
+
+        with open(project_structure_path, "rb") as f:
+            PROJECT_STRUCTURE, potential_main_files = pickle.load(f)
+    else:
         print(
-            "PROJECT STRUCTURE NEEDS TO BE RESOLVED. NO PICKLE FILE. IT WILL TAKE TIME...."
+            "PROJECT STRUCTURE NEEDS TO BE RESOLVED. "
+            "NO PICKLE FILE OR PICKLE CACHE DISABLED. IT WILL TAKE TIME...."
         )
+
+        # This will make project structure and find all potention main files
+        # DEFINITION: Project structure means all the files involved in a project (maybe outside the src folder too)
+        # TODO: read this later fully and understand logic
+        # sample output
+        # PROJECT_STRUCTURE: 
+        # {'../COMMON/jac_dbdef.h': PosixPath('/home/seigyo/c_repo/c_repo/SoudenKeisei/SoudenKeisei/include/jac/../COMMON/jac_dbdef.h'),
+        #  'COMMON/Ffe.h': PosixPath('/home/seigyo/c_repo/c_repo/SoudenKeisei/SoudenKeisei/include/COMMON/Ffe.h'),
+        #  'COMMON/type_defc.h': PosixPath('/home/seigyo/c_repo/c_repo/SoudenKeisei/SoudenKeisei/include/COMMON/type_defc.h'),
+        #  'FILE/FFE_MNT.h': PosixPath('/home/seigyo/c_repo/c_repo/SoudenKeisei/SoudenKeisei/include/FILE/FFE_MNT.h'),
+        #  'FILE/KF_NAME.h': PosixPath('/home/seigyo/c_repo/c_repo/SoudenKeisei/SoudenKeisei/include/FILE/KF_NAME.h'),
+        #  'Mmi/Mmi.h': PosixPath('/home/seigyo/c_repo/c_repo/SoudenKeisei/SoudenKeisei/modern/include/Mmi/Mmi.h'),
+        #  'Mmi/MmiDateD.h': PosixPath('/home/seigyo/c_repo/c_repo/SoudenKeisei/SoudenKeisei/modern/include/Mmi/MmiDateD.h'),
+        #  'Scn/ScnCstmz.h': PosixPath('/home/seigyo/c_repo/c_repo/SoudenKeisei/SoudenKeisei/modern/include/Scn/ScnCstmz.h'),
+        #  'svm_ssc_req.c': PosixPath('/home/seigyo/c_repo/c_repo/SoudenKeisei/SoudenKeisei/gs-svm/src/libsvm/svm_ssc_req.c'),
+        #  'svm_usesw_get.c': PosixPath('/home/seigyo/c_repo/c_repo/SoudenKeisei/SoudenKeisei/gs-svm/src/libsvm/svm_usesw_get.c'),
+        #  'svm_warnhv_get.c': PosixPath('/home/seigyo/c_repo/c_repo/SoudenKeisei/SoudenKeisei/gs-svm/src/libsvm4/svm_warnhv_get.c'),
+        #  'svm_wbtn.c': PosixPath('/home/seigyo/c_repo/c_repo/SoudenKeisei/SoudenKeisei/gs-svm/src/libsvm/svm_wbtn.c'),
+        #  'svmanlys.h': PosixPath('/home/seigyo/c_repo/c_repo/SoudenKeisei/SoudenKeisei/gs-svm/src/libsvm4/svmanlys.h'),
+        #  'svmyeq.c': PosixPath('/home/seigyo/c_repo/c_repo/SoudenKeisei/SoudenKeisei/gs-svm/src/libsvm/svmyeq.c'),
+        #  'table/table.h': PosixPath('/home/seigyo/c_repo/c_repo/SoudenKeisei/SoudenKeisei/modern/include/sedai1/table/table.h'),
+        #  'tmm/tmm001_msg.h': PosixPath('/home/seigyo/c_repo/c_repo/SoudenKeisei/SoudenKeisei/include/tmm/tmm001_msg.h'),
+        #  'tmm/tmm002_event.h': PosixPath('/home/seigyo/c_repo/c_repo/SoudenKeisei/SoudenKeisei/include/tmm/tmm002_event.h'),
+        #  'tmm/tmm002_msg.h': PosixPath('/home/seigyo/c_repo/c_repo/SoudenKeisei/SoudenKeisei/include/tmm/tmm002_msg.h'),
+        #  'tmm/tmm003_event.h': PosixPath('/home/seigyo/c_repo/c_repo/SoudenKeisei/SoudenKeisei/include/tmm/tmm003_event.h'),
+        #  'tmm/tmm110d_event.h': PosixPath('/home/seigyo/c_repo/c_repo/SoudenKeisei/SoudenKeisei/include/tmm/tmm110d_event.h'),
+        #  'tmm/tmm840_event.h': PosixPath('/home/seigyo/c_repo/c_repo/SoudenKeisei/SoudenKeisei/include/tmm/tmm840_event.h'),
+        #  'tmm/tmm_msg.h': PosixPath('/home/seigyo/c_repo/c_repo/SoudenKeisei/SoudenKeisei/include/tmm/tmm_msg.h'),
+        #  'usr/usr.h': PosixPath('/home/seigyo/c_repo/c_repo/SoudenKeisei/SoudenKeisei/modern/include/usr/usr.h'),
+        #  'usr/usr_in.h': PosixPath('/home/seigyo/c_repo/c_repo/SoudenKeisei/SoudenKeisei/modern/include/usr/usr_in.h'),
+        #  'xrs/xrserr.h': PosixPath('/home/seigyo/c_repo/c_repo/SoudenKeisei/SoudenKeisei/modern/include/sedai1/xrs/xrserr.h')}
+
+        # potential_main_files:
+        # ['svm001.c', 'svm001_kansi.c', 'svm001_kbtmsg.c', 'svm001_svminit.c']
         PROJECT_STRUCTURE, potential_main_files = return_project_mapping(
-            show=False, project_path=project_path
+            show=False,
+            project_path=project_path,
         )
+
+        # stringify and make into dict
         PROJECT_STRUCTURE = dict(
             sorted(PROJECT_STRUCTURE.items(), key=lambda x: str(x[0]))
         )
-        STATE.set("PROJECT_STRUCTURE", PROJECT_STRUCTURE)
-        # with open(project_structure_path, "wb") as f:
-        #     pickle.dump((PROJECT_STRUCTURE, potential_main_files), f)
-    # else:
-    #     with open(project_structure_path, "rb") as f:
-    #         PROJECT_STRUCTURE, potential_main_files = pickle.load(f)  # already sored.
 
-        STATE.set("PROJECT_STRUCTURE", PROJECT_STRUCTURE)
+        # Save to pickle for later reuse (for prod)
+        if USE_PROJECT_STRUCTURE_PICKLE:
+            import pickle
+
+            with open(project_structure_path, "wb") as f:
+                pickle.dump((PROJECT_STRUCTURE, potential_main_files), f)
+
+    # endregion pickle caching
+
+    potential_main_files = potential_main_files or []
+
+    STATE.set("PROJECT_STRUCTURE", PROJECT_STRUCTURE)
     print("THE MAIN FILES ARE: ", potential_main_files)
-    # project_tree_path = pickle_dir/f'{STATE.get('PROJECT_NAME')}_tree.pkl'
+
+    # main tree sitter parsing
+    # output: dict file:(tree sitter tree, cleaned file contents)
+    # TODO: Anaylyze logic later
     trees = Preprocess().preprocess(
         project_structure=PROJECT_STRUCTURE
-    )  # str, tuple[Tree,bytes]
+    )
 
     STATE.set("TREES", trees)
-    # print(extract_includes(filepath=PROJECT_STRUCTURE['dio000d.c']))
-    # sys.exit()
+
+    # converts all values in PROJECT_STRUCTURE keys to strings
     PROJECT_STRUCTURE = {
         key: str(PROJECT_STRUCTURE[key]) for key in PROJECT_STRUCTURE.keys()
     }
-    # PROJECT_STRUCTURE = dict(sorted(PROJECT_STRUCTURE.items(),key=lambda x: str(x[0])))
-    # console.print(PROJECT_STRUCTURE)
+
     print("LENGTH OF PROJECT_STRUCTURE", len(PROJECT_STRUCTURE))
+
+    # this was set in main, from json data (see main function)
     FUNCTION_POINTER_ARGS = STATE.get("FUNCTION_POINTER_ARGS")
+
+    # Dict of all functions in a file
     FILE_FUNCTIONS = {}
 
+    # Actual project entry-point file, if found.
     main_file_name = None
+
+    # Files that define main() but are not the real detected entry point.
     bad_main_files = []
+
+    # Per-file macro definitions.
     macros = {}
+
+    # Per-file #include relationships.
     file_includes: dict[str, list] = {}
+
     for files in PROJECT_STRUCTURE.keys():
+        # Collect per-file macros and includes for later analysis.
         macros[files] = extract_all_macros(PROJECT_STRUCTURE[files])
         file_includes[files] = extract_includes(PROJECT_STRUCTURE[files])
+
+        # Headers do not contain project entry-point functions.
         if files.endswith(".h"):
             continue
 
-        file_path = PROJECT_STRUCTURE[files]
+        # Local function definitions found in this source file.
+        # TODO: analyze and clean these helper
         functions = get_local_function_definitions(
             code_bytes=trees[files][1]
-        )  # function_name:dict(info of this function.)
-        # if files == 'dio000d.c':
-        #     print('This is the files and functions for the dio000d.c',files,functions)
+        )
+
+        # Keep the real main file from the detected potential main files.
         if "main" in functions.keys() and any(files == x for x in potential_main_files):
             main_file_name = files
             print("Found main file", main_file_name)
+
+        # Mark extra/wrong main() files for removal.
         if "main" in functions and not any(files == x for x in potential_main_files):
             bad_main_files.append(files)
+
+        # Store functions found in this file.
         FILE_FUNCTIONS[files] = functions
 
+    # Remove wrong duplicate/test main files from the indexed project.
+    # TODO: Find out why this was done, it must happen often to have code for this
     for bad_files in bad_main_files:
         del FILE_FUNCTIONS[bad_files]
         del PROJECT_STRUCTURE[bad_files]
         del trees[bad_files]
-    STATE.set("FILE_FUNCTIONS", FILE_FUNCTIONS)
 
+    STATE.set("FILE_FUNCTIONS", FILE_FUNCTIONS)
     STATE.set("FILE_INCLUDES", file_includes)
     STATE.set("MACROS", macros)
-    # STATE.set('TREES',trees)
 
+    # TODO: analyze this, how is this diff from above? waht this contains etc
+    # TODO: We are not using the 3rd and 4th params, then why calc it? Or, further down the line its being made again and used, maybe use it and pass it to there 
     graph, registry, _, _ = build_complete_call_graph(
         project_structure=PROJECT_STRUCTURE,
         trees=trees,
         function_pointer_args=FUNCTION_POINTER_ARGS,
         file_functions=FILE_FUNCTIONS,
     )
+
+    # TODO: Do this later
     collector = VisualizerCollector(
         process_name=project_path.name,
         process_root=project_path,
@@ -1983,13 +2234,15 @@ def trace_variable(
         | set((STATE.get("FUNCTION_TYPES") or {}).keys()),
         run_id=STATE.get("TIME"),
     )
+
     collector.capture_call_graph(graph=graph, registry=registry)
     STATE.set("VISUALIZER_COLLECTOR", collector)
+
     graph_path = collector.write()
     STATE.set("VISUALIZER_GRAPH_PATH", graph_path)
     print(f"Complete source graph checkpoint written to {graph_path}")
 
-    # TODO: Bring it back:
+    # TODO: Temporarily disabled for speed, bring it back later for prod
     # summary_config = summary_config or SummaryConfig.from_env()
     # if summary_config.enabled:
     #     try:
@@ -2004,43 +2257,47 @@ def trace_variable(
     #                 function_data["summary_error"] = str(exc)
     #         collector.write()
 
+    # If its index only, it means we are only trying to capture source trees, not the unique target parameters, so return early here
+    # we already have saved the visualizer in the state
     if index_only:
         return {}
 
+    # This is subset of target functions json, it basically finds all the target funcs 
+    # that are actually present in the paths, then only gives the subset here
+    # the output shape is same as the json_data/mpf_data.json
     functions_identified = identify_funs_to_trace(
-        project_structure=PROJECT_STRUCTURE, trees=trees
-    )  # functions and
+        project_structure=PROJECT_STRUCTURE,
+        trees=trees,
+    )
+
     if functions_identified == {}:
         print(
             f"{BOLD}{RED}NO FUNCTIONS IDENTIFIED IN THE PROJECT {project_path.name}.{RESET}"
         )
         return {}
+
     console.print(
-        "-" * 10, "DETECTED FUNCTIONS NEEDS TO BE TRACED AND THEIR ARG. NUMS.", "-" * 10
+        "-" * 10,
+        "DETECTED FUNCTIONS NEEDS TO BE TRACED AND THEIR ARG. NUMS.",
+        "-" * 10,
     )
-
     console.print(functions_identified)
-    # sys.exit()
     console.print("-" * 60)
-    import time
 
-    answers: dict[str, list[tuple[BaseModel, BaseModel]]] = defaultdict(
-        list
-    )  # funct_name [(combinedModel,Stats)]
+    answers: dict[str, list[tuple[BaseModel, BaseModel]]] = defaultdict(list)
 
-    # print('dio000d.c' in PROJECT_STRUCTURE)
     print("This is the main file::", main_file_name)
-    # sys.exit()
-    data_csvs = []
+
+    # running new modern flow, reverse walk
     if resolver == "valueflow":
         asyncio.run(
             make_value_flow_calls(
-                graph=graph,
-                registry=registry,
-                trees=trees,
-                functions_identified=functions_identified,
-                answers=answers,
-                main_file_name=main_file_name,
+                graph=graph, # Callsite/FunctionNode custom graph
+                registry=registry, # list of all functions
+                trees=trees, # tree sitter trees
+                functions_identified=functions_identified, # target functiosn in trees
+                answers=answers, # to add answer inplace
+                main_file_name=main_file_name, # starting point
                 function_pointer_args=FUNCTION_POINTER_ARGS,
                 file_functions=FILE_FUNCTIONS,
                 project_structure=PROJECT_STRUCTURE,
@@ -2049,28 +2306,28 @@ def trace_variable(
                 llm_concurrency=valueflow_concurrency,
             )
         )
+
+    # Fallback to legacy code, resolving for all unique paths in main
     else:
         for function in functions_identified:
-            # The legacy path enumerator is intentionally retained as a run-level fallback.
+            # Legacy path enumerator retained as run-level fallback.
             STATE.set("CURRENT_PROCESSED_FUNCTION", function)
-            function_dataframes: list | None = asyncio.run(make_llm_calls_for_function(
-                function=function,
-                trees=trees,
-                functions_identified=functions_identified,
-                answers=answers,  # will be modified in place
-                main_file_name=main_file_name,
-                function_pointer_args=FUNCTION_POINTER_ARGS,
-                file_functions=FILE_FUNCTIONS,
-                project_structure=PROJECT_STRUCTURE,
-                project_path=project_path,
-            ))
-            if function_dataframes is not None:
-                data_csvs = [*data_csvs, *function_dataframes]
 
-    # Full result data can be very large for projects with many paths.
-    # console.print(data_csvs)
-    # save_dicts_to_csv(data_csvs)
+            asyncio.run(
+                make_llm_calls_for_function(
+                    function=function,
+                    trees=trees,
+                    functions_identified=functions_identified,
+                    answers=answers,
+                    main_file_name=main_file_name,
+                    function_pointer_args=FUNCTION_POINTER_ARGS,
+                    file_functions=FILE_FUNCTIONS,
+                    project_structure=PROJECT_STRUCTURE,
+                    project_path=project_path,
+                )
+            )
 
+    # After all the target parameters are resolved, it adds those connections back to the visualizer data
     collector = STATE.get("VISUALIZER_COLLECTOR")
     if collector is not None:
         collector.rehydrate_interactions(
@@ -2080,55 +2337,37 @@ def trace_variable(
                 for function_name, config in functions_identified.items()
             },
         )
+
         graph_path = collector.write()
         STATE.set("VISUALIZER_GRAPH_PATH", graph_path)
         print(f"Visualizer graph written to {graph_path}")
 
-    return answers  # full answer plus+ stats
+    return answers
 
+
+class Tee:
+    def __init__(self, *streams):
+        self.streams = streams
+
+    def write(self, data):
+        for s in self.streams:
+            s.write(data)
+
+    def flush(self):
+        for s in self.streams:
+            s.flush()
 
 # Run the tracer
 if __name__ == "__main__":
-    # c_folder_name = input("Enter c_folder name (in /src:)::")
-    # region LOGGING
-    import sys
-    from datetime import datetime
 
-    class Tee:
-        def __init__(self, *streams):
-            self.streams = streams
+    repo_root = Path(__file__).resolve().parent
 
-        def write(self, data):
-            for s in self.streams:
-                s.write(data)
-
-        def flush(self):
-            for s in self.streams:
-                s.flush()
-
-    # endregion
-
-    summaries = []
-    # parent_folder = 'results/detailed_tool_description_changed_prompt'
-    parent_folder = "logs/after_tool_modification"
-    # functions_to_trace = functions_to_trace()
-    from pathlib import Path
-
-    folder = Path(__file__).resolve().parent / f"{parent_folder}"
-    folder.mkdir(parents=True, exist_ok=True)
-    apl_path = "/home/seigyo/c_repo/c_repo/src/src_analysis/src"
-    rbt_path = "/home/seigyo/c_repo/c_repo/src/src_rbt/src"
-    src_wh = "/home/seigyo/c_repo/c_repo/src/src_wh/wh-dio/src"
-    list_project_paths = [apl_path, rbt_path, src_wh]
-
-    # Local, one-project mode. It avoids the legacy machine-specific batch
-    # paths below and lets the included fixture run out of the box.
-    import argparse
+    # region arg parser and config validation/setting
 
     argument_parser = argparse.ArgumentParser(
         description="Index one process or a reproducible group of processes."
     )
-    process_mode = argument_parser.add_mutually_exclusive_group()
+    process_mode = argument_parser.add_mutually_exclusive_group(required=True)
     process_mode.add_argument(
         "--project",
         type=Path,
@@ -2149,11 +2388,6 @@ if __name__ == "__main__":
         "--combine-runs",
         metavar="GROUP_NAME",
         help="Create a group from process snapshots produced by earlier commands.",
-    )
-    process_mode.add_argument(
-        "--all-test-scada",
-        action="store_true",
-        help="Compatibility alias for --process-folder test_scada/processes.",
     )
     argument_parser.add_argument(
         "--combine-processes",
@@ -2225,32 +2459,37 @@ if __name__ == "__main__":
     argument_parser.add_argument(
         "--valueflow-path-cap",
         type=int,
-        default=100,
+        default=10000,
         help="Maximum provenance paths written per fact; the true count is retained.",
     )
     argument_parser.add_argument(
         "--valueflow-concurrency",
         type=int,
-        default=1,
+        default=10,
         help="Concurrent value-flow model queries (default 1, so the run is watchable).",
     )
+
     command_args = argument_parser.parse_args()
+
     if command_args.llm_model:
         os.environ["TRACER_LLM_MODEL"] = command_args.llm_model
     if command_args.llm_base_url:
         os.environ["TRACER_LLM_BASE_URL"] = command_args.llm_base_url
     if command_args.llm_api_key:
         os.environ["TRACER_LLM_API_KEY"] = command_args.llm_api_key
-    repo_root = Path(__file__).resolve().parent
-    test_processes_root = repo_root / "test_scada" / "processes"
 
+    # to combine processes you need to combine runs too
     if command_args.combine_processes and not command_args.combine_runs:
         argument_parser.error("--combine-processes requires --combine-runs")
+
+    # validate group name (remove weird chars)
     if command_args.group_name:
         try:
             validate_group_name(command_args.group_name)
         except ValueError as exc:
             argument_parser.error(str(exc))
+
+    # TODO: understand this flow
     if command_args.combine_runs:
         try:
             group_path = write_group_manifest(
@@ -2261,6 +2500,7 @@ if __name__ == "__main__":
             )
         except ValueError as exc:
             raise SystemExit(str(exc)) from exc
+
         print(f"Combined process group written to {group_path}")
         print(
             "Open only this group with: "
@@ -2268,6 +2508,7 @@ if __name__ == "__main__":
         )
         sys.exit(0)
 
+    # setting for if we doing a (single  process)/(multiple processes)/(whole project with auto discovered processes)
     if command_args.project:
         projects_to_run = [command_args.project.resolve()]
         batch_mode = False
@@ -2276,207 +2517,145 @@ if __name__ == "__main__":
         batch_mode = True
     elif command_args.process_folder:
         try:
+            # This recursively finds all the "processes" (folders with code) that has a Makefile in it
+            # CRITICAL: dont give it a parent folder which has its own makefile to share, otherwise it would start processing it to as a "process"
+            # That path is not yet tested
+            # TODO: make it more robust
             projects_to_run = discover_processes(command_args.process_folder)
         except ValueError as exc:
             raise SystemExit(str(exc)) from exc
         batch_mode = True
-    elif command_args.all_test_scada:
-        try:
-            projects_to_run = discover_processes(test_processes_root)
-        except ValueError as exc:
-            raise SystemExit(str(exc)) from exc
-        batch_mode = True
-    elif not Path(src_wh).is_dir():
-        projects_to_run = [test_processes_root / "proc_waterworks"]
-        batch_mode = False
-    else:
-        projects_to_run = []
-        batch_mode = False
 
-    if (command_args.process_folder or command_args.all_test_scada) and not projects_to_run:
+    if command_args.process_folder and not projects_to_run:
         raise SystemExit("No Makefile process directories were found in the selected folder.")
 
-    if projects_to_run:
+    try:
+        projects_to_run = validate_processes(projects_to_run)
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
+
+    # TODO: Make it reuse stuff from above, llm endpoint, concurrency etc, rather than retaking configs for env etc
+    summary_config = SummaryConfig.from_env()
+
+    if command_args.summarize_functions:
+        summary_config.enabled = True
+    elif command_args.skip_function_summaries:
+        summary_config.enabled = False
+
+    if command_args.summary_model:
+        summary_config.model = command_args.summary_model
+    if command_args.summary_base_url:
+        summary_config.base_url = command_args.summary_base_url
+    if command_args.wiki_url:
+        summary_config.wiki_url = command_args.wiki_url
+    if command_args.wiki_placeholder:
+        summary_config.wiki_placeholder = True
+    if command_args.summary_concurrency:
+        summary_config.concurrency = max(1, command_args.summary_concurrency)
+
+    # endregion arg parser and config validation/setting
+
+    # region inits and runs for tracing one target
+
+    # TODO: Come back here and add what they mean contain properly
+    graph_paths: list[Path] = []
+    failures: list[dict] = []
+
+    # Fist init of app state
+    STATE = State()
+
+    for project_path in projects_to_run:
+
+        # First, we try to recursively find "json_data" directory, which contains the target functions 
+        # (TODO: Find what other thing it contains)
+        # I can see its getting target functions, target function pointers etc, but i need to understand what that means, there is also a function map for parsed explanations of functions
+        # i need to check what that is doing too
+        json_dir = next(
+            (
+                candidate / "json_data"
+                for candidate in (project_path, *project_path.parents)
+                if (candidate / "json_data").is_dir()
+            ),
+            repo_root / "json_data",
+        )
+
+        print(f"RUNNING FOR PROJECT {project_path.name}")
+
         try:
-            projects_to_run = validate_processes(projects_to_run)
+
+            # set tools in global state here
+            set_tool_def()
+
+            STATE = load_project_state(json_dir)
+            STATE.set("TIME", f"{datetime.now():%Y%m%d_%H%M%S}")
+            STATE.set("PROJECT_NAME", project_path.name)
+
+            summary = trace_variable(
+                project_path=project_path,
+                summary_config=summary_config,
+                index_only=command_args.index_only,
+                resolver=command_args.resolver,
+
+                # TODO: Find out what this cap actually does, i think its cap a on how many paths for a unique source to show in results?
+                valueflow_path_cap=max(1, command_args.valueflow_path_cap),
+                valueflow_concurrency=max(1, command_args.valueflow_concurrency),
+            )
+
+            console.print(summary)
+
+            graph_path = STATE.get("VISUALIZER_GRAPH_PATH")
+            if graph_path and Path(graph_path).is_file():
+                graph_paths.append(Path(graph_path))
+
+        except (Exception, SystemExit) as exc:
+            graph_path = STATE.get("VISUALIZER_GRAPH_PATH")
+            if graph_path and Path(graph_path).is_file() and Path(graph_path) not in graph_paths:
+                graph_paths.append(Path(graph_path))
+
+            failures.append(
+                {
+                    "process_name": project_path.name,
+                    "project_root": str(project_path),
+                    "error": str(exc),
+                }
+            )
+
+            if not command_args.continue_on_error:
+                raise
+
+            print(f"PROCESS FAILED; CONTINUING: {project_path.name}: {exc}")
+
+        finally:
+            STATE.reset()
+
+    if batch_mode or command_args.group_name:
+        if not graph_paths:
+            raise SystemExit("No graph snapshots were produced; group was not written.")
+
+        batch_stamp = f"{datetime.now():%Y%m%d_%H%M%S}"
+        group_name = command_args.group_name or f"batch-{batch_stamp}"
+
+        try:
+
+            # TODO: Check how manifest works and what it stores etc
+            group_path = write_group_manifest(
+                results_root(),
+                group_name,
+                graph_paths=graph_paths,
+                failures=failures,
+            )
         except ValueError as exc:
             raise SystemExit(str(exc)) from exc
-        summary_config = SummaryConfig.from_env()
-        if command_args.summarize_functions:
-            summary_config.enabled = True
-        elif command_args.skip_function_summaries:
-            summary_config.enabled = False
-        if command_args.summary_model:
-            summary_config.model = command_args.summary_model
-        if command_args.summary_base_url:
-            summary_config.base_url = command_args.summary_base_url
-        if command_args.wiki_url:
-            summary_config.wiki_url = command_args.wiki_url
-        if command_args.wiki_placeholder:
-            summary_config.wiki_placeholder = True
-        if command_args.summary_concurrency:
-            summary_config.concurrency = max(1, command_args.summary_concurrency)
-        graph_paths: list[Path] = []
-        failures: list[dict] = []
-        STATE = State()
-        for project_path in projects_to_run:
-            json_dir = next(
-                (
-                    candidate / "json_data"
-                    for candidate in (project_path, *project_path.parents)
-                    if (candidate / "json_data").is_dir()
-                ),
-                repo_root / "json_data",
-            )
-            print(f"RUNNING FOR PROJECT {project_path.name}")
-            try:
-                set_tool_def()
-                STATE = load_project_state(json_dir)
-                STATE.set("TIME", f"{datetime.now():%Y%m%d_%H%M%S}")
-                STATE.set("PROJECT_NAME", project_path.name)
-                summary = trace_variable(
-                    project_path=project_path,
-                    summary_config=summary_config,
-                    index_only=command_args.index_only,
-                    resolver=command_args.resolver,
-                    valueflow_path_cap=max(1, command_args.valueflow_path_cap),
-                    valueflow_concurrency=max(1, command_args.valueflow_concurrency),
-                )
-                console.print(summary)
-                graph_path = STATE.get("VISUALIZER_GRAPH_PATH")
-                if graph_path and Path(graph_path).is_file():
-                    graph_paths.append(Path(graph_path))
-            except (Exception, SystemExit) as exc:
-                graph_path = STATE.get("VISUALIZER_GRAPH_PATH")
-                if graph_path and Path(graph_path).is_file() and Path(graph_path) not in graph_paths:
-                    graph_paths.append(Path(graph_path))
-                failures.append(
-                    {
-                        "process_name": project_path.name,
-                        "project_root": str(project_path),
-                        "error": str(exc),
-                    }
-                )
-                if not command_args.continue_on_error:
-                    raise
-                print(f"PROCESS FAILED; CONTINUING: {project_path.name}: {exc}")
-            finally:
-                STATE.reset()
 
-        if batch_mode or command_args.group_name:
-            if not graph_paths:
-                raise SystemExit("No graph snapshots were produced; group was not written.")
-            batch_stamp = f"{datetime.now():%Y%m%d_%H%M%S}"
-            group_name = command_args.group_name or f"batch-{batch_stamp}"
-            try:
-                group_path = write_group_manifest(
-                    results_root(),
-                    group_name,
-                    graph_paths=graph_paths,
-                    failures=failures,
-                )
-            except ValueError as exc:
-                raise SystemExit(str(exc)) from exc
-            print(f"Combined process group written to {group_path}")
-            print(
-                "Open only this group with: "
-                f"python frontend/server.py --group {group_name}"
-            )
-        if failures:
-            raise SystemExit(f"{len(failures)} process(es) failed; successful snapshots were preserved.")
-        sys.exit(0)
-
-    to_exclude = {
-        # 'wh-dio':['libdio','libdio_ora','libDioKyusei','libDioTrace','libLocal','tools','dio000d','dio100d','dio110d','dio110d_nobori','dio120d','dio130d','dio140d','dio150d','dio160d','dio170d','dio175d','dio210d','dio210d_nobori'],
-        "wh-dio": [
-            "libdio",
-            "libdio_ora",
-            "libDioKyusei",
-            "libDioTrace",
-            "libLocal",
-            "tools",
-        ],
-        "src_analysis": ["libapl"],
-        "src_rbt": ["libRbt"],
-    }
-
-    # WHOLE,whole_index = pick(options=['True','False'],title=f'Want to process all projects one by one (Like apl projects, rbt projects)?\n True = YES \n False = NO\n\n',indicator='==>>',default_index=0)
-    # WHOLE = True if whole_index==0 else False
-    WHOLE = True
-    if not WHOLE:
-        parent_project, parent_index = pick(
-            options=[Path(path).resolve().parent.name for path in list_project_paths],
-            title="Pick the parent project",
-            indicator="==>>",
-            default_index=0,
+        print(f"Combined process group written to {group_path}")
+        print(
+            "Open only this group with: "
+            f"python frontend/server.py --group {group_name}"
         )
-        projects = [
-            p.name
-            for p in Path(list_project_paths[parent_index]).iterdir()
-            if p.is_dir()
-        ]
-        projects = list(filter(lambda x: x not in to_exclude[parent_project], projects))
 
-        project, _ = pick(
-            options=projects,
-            title="Pick the projects",
-            indicator="==>>",
-            default_index=0,
+    if failures:
+        raise SystemExit(
+            f"{len(failures)} process(es) failed; successful snapshots were preserved."
         )
-        project_path = Path(list_project_paths[parent_index]) / project
 
-        from tools.tools import set_tool_def
-
-        set_tool_def()
-        STATE = load_files()
-        parent_folder = "/home/seigyo/c_repo/c_repo/logs"
-        datetime_for_name = f"{datetime.now():%Y%m%d_%H%M%S}"
-        STATE.set("TIME", datetime_for_name)
-        logfile = f"{parent_folder}/{project}_{datetime_for_name}.txt"
-        log = open(logfile, "w", buffering=1)
-        sys.stdout = Tee(sys.__stdout__, log)
-        sys.stderr = Tee(sys.__stderr__, log)
-        # STATE.set('PROJECT_NAME','hehe')
-        STATE.set("PROJECT_NAME", project)
-
-        summary = trace_variable(project_path=project_path)  # list[ocombined,
-
-        console.print(summary)
-
-    else:
-        # parent_project,project_index = pick(options=[Path(path).resolve().parent.name for path in list_project_paths],title='Pick the parent project to; process all its child projects.',indicator='==>>',default_index=0)
-        parent_project, project_index = "wh-dio", 2
-        projects = [
-            p.name
-            for p in Path(list_project_paths[project_index]).iterdir()
-            if p.is_dir()
-        ]
-        already_done = ["dio000d", "dio800d", "dio810d", "dio815d", "dio860d"]
-        projects = list(filter(lambda x: x not in already_done, projects))
-        # projects = ['dio860d']
-        # projects = ['dio860d', 'dio220d','dio260d','dio260d_nobori','dio270d','dio310d','dio410d','dio210d','dio210d_nobori','dio110d','dio110d_nobori']
-        # projects = ['dio260d_nobori','dio270d','dio310d','dio410d','dio210d','dio210d_nobori','dio110d','dio110d_nobori','dio000d','dio100d','dio120d',
-        #             'dio130d','dio140d','dio150d','dio160d','dio170d','dio175d','dio220d','dio260d','dio600d','dio690d']
-        # projects = ['dio800d']
-        # projects = ['dio000d','dio110d','dio110d_nobori','dio120d','dio130d','dio']
-        # to_exclude = ['libdio','libdio_ora','libDioKyusei','libDioTrace','libLocal','tools']
-        projects = list(filter(lambda x: x not in to_exclude[parent_project], projects))
-        for project in reversed(projects):
-            print("RUNNING FOR PROJECT", project)
-            set_tool_def()
-            STATE = load_files()
-            console.print(STATE.__dict__.keys())
-            # project_path = Path(apl_path)/project if 'apl' in project else Path(rbt_path)/project if 'rbt' in project else Path(src_wh)/project
-            project_path = Path(list_project_paths[project_index]) / project
-            datetime_for_name = f"{datetime.now():%Y%m%d_%H%M%S}"
-            STATE.set("TIME", datetime_for_name)
-            # STATE.set('TIME','20260306_093155')
-            # logfile = f"{parent_folder}/{project}_{datetime_for_name}.txt"
-            # os.environ['PROJECT_NAME'] = project
-            STATE.set("PROJECT_NAME", project)
-            # STATE.set('PROJECT_NAME','hehe')
-
-            summary = trace_variable(project_path=project_path)  # list[ocombined,]
-            # destroy the state...
-            STATE.reset()
-            console.print(STATE.__dict__.keys())
+    sys.exit(0)

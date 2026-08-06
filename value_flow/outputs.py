@@ -6,6 +6,7 @@ import re
 import tempfile
 from collections import Counter
 from dataclasses import dataclass
+from itertools import product
 from pathlib import Path
 
 from output_paths import process_results_dir
@@ -84,8 +85,20 @@ def _display_call_number(value: str | None) -> str:
     return "NA" if value in {None, "", "-1", "-1.0"} else str(value)
 
 
+def _target_component(value: str) -> str:
+    """Render a C string literal as the identifier component it denotes."""
+    text = str(value).strip()
+    if len(text) >= 2 and text.startswith('"') and text.endswith('"'):
+        return text[1:-1]
+    return text
+
+
 def _legacy_rows(records: list[ResolvedSeed], process_name: str) -> list[dict]:
-    """Recombine per-argument facts into the old machine-readable row shape."""
+    """Write one row per target invocation and distinct argument-path tuple."""
+    # `records` are one source fact for one target argument. A target such as
+    # pmf_setsem(process, index) needs both configured arguments combined into
+    # one target name (for example, svm300d_0), while alternative source paths
+    # must stay as separate rows.
     grouped: dict[tuple, list[ResolvedSeed]] = {}
     for record in records:
         key = (
@@ -99,36 +112,34 @@ def _legacy_rows(records: list[ResolvedSeed], process_name: str) -> list[dict]:
 
     rows: list[dict] = []
     for group in grouped.values():
-        representative = group[0]
-        by_index: dict[int, list[ResolvedSeed]] = {}
+        choices_by_index: dict[int, list[tuple[ResolvedSeed, list[str]]]] = {}
         for record in group:
-            by_index.setdefault(record.arg_index, []).append(record)
-        ordered_indices = sorted(by_index)
-        choices = [by_index[index] for index in ordered_indices]
-        # This is a compatibility feed, not a path enumerator. Zip the value
-        # sets cyclically so every individual value reaches the visualizer in
-        # O(max(values-per-argument)) rows rather than a Cartesian product.
-        combinations = (
-            tuple(choice[offset % len(choice)] for choice in choices)
-            for offset in range(max(map(len, choices)))
-        )
-        for combination in combinations:
-            values = [item.fact.value for item in combination]
-            # Call-graph grammar, not value-flow query labels: the wiki/chat
-            # layer parses this column.
-            display_paths = [
-                "->".join(item.legacy_labels)
-                for item in combination
-                if item.legacy_labels
-            ]
+            # One record can have several provenance paths. They remain
+            # independent choices; cache reuse must not collapse them.
+            for labels in record.legacy_paths or [record.legacy_labels]:
+                choices_by_index.setdefault(record.arg_index, []).append(
+                    (record, labels)
+                )
+
+        ordered_indices = sorted(choices_by_index)
+        for combination in product(*(choices_by_index[index] for index in ordered_indices)):
+            representative = combination[0][0]
+            values = [item.fact.value for item, _ in combination]
+            target_value = (
+                "_".join(_target_component(value) for value in values)
+                if len(ordered_indices) > 1
+                else values[0]
+            )
+            display_paths = ["->".join(labels) for _, labels in combination]
+            path = " | ".join(dict.fromkeys(display_paths))
             site = representative.seed.site
             rows.append(
                 {
                     "process_name": process_name,
                     "function_name": representative.seed.target_function,
-                    "target_number->ans": ", ".join(values),
+                    "target_number->ans": target_value,
                     "call_number": _display_call_number(representative.call_number),
-                    "target_number->path_str": " | ".join(dict.fromkeys(display_paths)),
+                    "target_number->path_str": path,
                     "launch_via": representative.seed.launch_via,
                     "call_function": representative.seed.call_function,
                     "type": representative.operation,
@@ -224,6 +235,10 @@ def write_outputs(
     run_stats: dict | None = None,
 ) -> OutputPaths:
     """Write the fact, provenance-path, and legacy compatibility CSVs once."""
+    # Output has three levels. Do not confuse them while debugging:
+    #   facts.csv  = one resolved source value for one target argument
+    #   paths.csv  = every source-to-target route for that fact
+    #   <process>.csv = values combined per target invocation for old consumers
     process_dir = process_results_dir(process_name)
     fact_path = process_dir / "facts.csv"
     path_path = process_dir / "paths.csv"

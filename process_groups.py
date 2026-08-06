@@ -116,7 +116,10 @@ def validate_processes(projects: Iterable[Path]) -> list[Path]:
 
 
 def validate_group_name(group_name: str) -> str:
-    """Validate a group name before a potentially long analyzer batch starts."""
+    """
+    Validate a group name before a potentially long analyzer batch starts.
+    Group name must start with an alphanumeric character and contain only letters, numbers, dots, underscores, or hyphens
+    """
 
     if not _GROUP_NAME.fullmatch(group_name):
         raise ValueError(

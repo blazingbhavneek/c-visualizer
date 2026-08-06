@@ -19,7 +19,7 @@ def tool(func):
 
 
 def set_tool_def() -> None:
-    """It sets the tool definition in the state and also will populate the functions in the state."""
+    """It sets the tool definitions in the state and also will populate the functions in the state."""
     # returns a dict of dict{function_name: function}
     tools = [
         {

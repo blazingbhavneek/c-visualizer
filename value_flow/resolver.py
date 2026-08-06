@@ -34,42 +34,77 @@ _STRING_OR_CHAR = re.compile(
 
 @dataclass(slots=True)
 class Expression:
+    """One piece of C code that can supply a value to a function argument.
+
+    Example: in `open(&fcb, FILE_NO)`, the second Expression is `FILE_NO`.
+    It keeps both the readable text and the Tree-sitter node/location where the
+    text was found.
+    """
+
+    # Exact C text, such as `FILE_NO`, `42`, `value`, or `input->file_no`.
     text: str
+    # The Tree-sitter node for this text. It can be None for generated macro text.
     node: Any | None
+    # Short project file key and full disk path containing this expression.
     file_name: str
     file_path: str
+    # 1-based source line, used in CSV output and LLM context.
     line: int
 
 
 @dataclass(slots=True)
 class FunctionInfo:
+    """Indexed information about one function definition in the project.
+
+    This is what lets ParamQuery turn `value` inside `worker(int value)` into
+    argument 1 at every call to `worker(...)`.
+    """
+
+    # Stable call-graph ID, normally `[file.c]function_name`.
     function_id: str
+    # Existing call-graph record for the function (name, file, line range).
     node: FunctionNode
+    # Tree-sitter function_definition node and its original source bytes.
     ast_node: Any | None
     source: bytes
+    # Formal parameter names in declaration order: `int a, int b` -> [a, b].
     parameters: list[str]
+    # Tree-sitter nodes for those parameters, used to report parameter lines.
     parameter_nodes: list[Any]
 
 
 @dataclass(slots=True)
 class IndexedSite:
+    """One exact function call in the source code, enriched for value tracing.
+
+    Example: two `pmf_setsem(...)` calls on the same line are still different
+    IndexedSite objects because `start_byte` and `site_id` are different.
+    """
+
+    # Stable ID for this exact call: source file plus its starting byte offset.
     site_id: str
+    # Function containing the call, and the function/macro ultimately called.
     caller_id: str
     callee_id: str
     callee_name: str
+    # File and line where this call is written.
     file_name: str
     file_path: str
     line: int
+    # Exact byte range of the call in the source file.
     start_byte: int
     end_byte: int
+    # Tree-sitter call_expression node, original source bytes, and parsed args.
     ast_node: Any | None
     source: bytes
     arguments: list[Expression]
+    # Original, smaller CallSite from the call-graph builder.
     raw_call_site: CallSite
+    # Set when source calls a macro which expands to the real callee.
     macro_name: str | None = None
-    # True when a macro boundary was crossed but argument positions could not
-    # be mapped onto the expanded function. Reading a position here would be
-    # off by however many arguments the macro injects, so it must not be done.
+    # True when the macro may add/reorder arguments. In that case, argument 1
+    # in the source macro call may not be argument 1 in the expanded function.
+    # Do not trust `arguments[index]`; use the macro/LLM fallback instead.
     macro_args_unmapped: bool = False
 
     def argument(self, index: int) -> Expression | None:
@@ -80,19 +115,32 @@ class IndexedSite:
 
 @dataclass(frozen=True, slots=True)
 class CallerEdge:
+    """One caller -> callee link used when tracing a parameter backward."""
+
+    # IDs of the calling and called functions, plus the exact call that links them.
     caller_id: str
     callee_id: str
     site_id: str
+    # True for a callback edge made from registration metadata, not normal C syntax.
     synthetic_callback: bool = False
+    # Event/fork information carried by a callback edge for output metadata.
     launch_via: str = ""
     call_function: str = ""
 
 
 @dataclass(slots=True)
 class Seed:
+    """One configured target API call that the resolver must trace.
+
+    A target function can have many seeds: each written call such as
+    `pmf_setsem("svm300d", 0)` is a separate seed.
+    """
+
+    # The exact call and its JSON target configuration (indices, type, opens).
     site: IndexedSite
     target_function: str
     config: dict[str, Any]
+    # Extra process/event information used by the legacy CSV and visualizer.
     launch_via: str = "FORK"
     call_function: str = "main"
     function_source_file: str = ""
@@ -101,20 +149,36 @@ class Seed:
 
 @dataclass(slots=True)
 class ResolvedSeed:
+    """One source value found for one argument of one target call.
+
+    This is the main result object. One Seed can create several ResolvedSeed
+    objects when an argument has several possible values or several paths.
+    """
+
+    # Which target call and which configured target argument this result belongs to.
     seed: Seed
     arg_index: int
+    # The resolved argument value and the source file/line that supplied it.
     fact: Fact
+    # READF/WRITEF/etc. and the old call-number field used by output consumers.
     operation: str
     call_number: str | None
+    # All readable source -> target paths for this one fact. path_count can be
+    # larger because paths are capped by the command-line path_cap setting.
     paths: list[list[str]] = field(default_factory=list)
     path_count: int = 0
     paths_truncated: bool = False
     query_token: str = ""
     seconds: float = 0.0
-    # Same chain in the call-graph label grammar, for the legacy feed only.
+    # First path in the old call-graph label format, kept for older callers.
     legacy_labels: list[str] = field(default_factory=list)
+    # Every path in the old call-graph label format. The compatibility CSV uses
+    # this list so different paths are written as different rows.
+    legacy_paths: list[list[str]] = field(default_factory=list)
 
 
+# Optional callbacks supplied by project_aware.py. They call the LLM only when
+# normal syntax tracing cannot answer a small question.
 OneHopResolver = Callable[
     [IndexedSite, int, str], OneHopAnswer | None | Awaitable[OneHopAnswer | None]
 ]
@@ -126,6 +190,7 @@ HandleFallbackResolver = Callable[
 
 
 def _walk(node: Any | None) -> Iterable[Any]:
+    """Yield this Tree-sitter node and every child node below it."""
     if node is None:
         return
     stack = [node]
@@ -136,6 +201,11 @@ def _walk(node: Any | None) -> Iterable[Any]:
 
 
 def _extract_declarator_identifier(node: Any | None, source: bytes) -> str | None:
+    """Find the variable/function name inside a C declarator AST node.
+
+    C declarations have nested shapes (`int *name`, `int name[4]`), so callers
+    use this helper instead of assuming the name is always one direct child.
+    """
     if node is None:
         return None
     if node.type == "identifier":
@@ -160,7 +230,16 @@ def _extract_declarator_identifier(node: Any | None, source: bytes) -> str | Non
 
 
 class ValueFlowResolver:
-    """Resolve configured target arguments by walking value-carrying edges backward."""
+    """Resolve configured target arguments by walking value-carrying edges backward.
+
+    This class has two phases:
+
+    * Build an index of functions and concrete call sites from the project.
+    * Start at each configured target call and trace only the value needed by
+      that call back through assignments, parameters, opens, and callers.
+
+    It deliberately does not enumerate every path from main() to a target.
+    """
 
     def __init__(
         self,
@@ -199,6 +278,9 @@ class ValueFlowResolver:
         self.llm_concurrency = max(1, llm_concurrency)
         self.progress = progress
 
+        # INDEXES: these are built once from the incoming call graph/AST.  They
+        # let later resolution answer "who called this parameter?" and "which
+        # earlier call opened this handle?" without rescanning the project.
         self.functions: dict[str, FunctionInfo] = {}
         self.sites: dict[str, IndexedSite] = {}
         self.sites_by_caller: dict[str, list[IndexedSite]] = defaultdict(list)
@@ -207,6 +289,8 @@ class ValueFlowResolver:
         self.reachable: set[str] = set()
         self.seeds: list[Seed] = []
 
+        # RESOLUTION STATE: query token -> answer.  Caching a query saves work,
+        # but provenance still retains every path that reused the answer.
         self.results: dict[str, list[Fact]] = {}
         self.in_flight: dict[str, asyncio.Future[list[Fact]]] = {}
         self.provenance: dict[str, set[str]] = defaultdict(set)
@@ -233,7 +317,9 @@ class ValueFlowResolver:
         )
         self.cache_fingerprint = fingerprint.hexdigest()
 
-        self._build_function_index()
+        # Resolver setup order.  Read these methods in this order when
+        # debugging why a target was or was not traced.
+        self._build_function_index()   # function definitions + parameter names
         self._build_call_index()
         self._build_callback_edges()
         self._compute_reachability()
@@ -414,6 +500,9 @@ class ValueFlowResolver:
         return actual_arguments, False
 
     def _build_call_index(self) -> None:
+        # Convert the call graph's CallSite entries into IndexedSite entries.
+        # IndexedSite adds AST arguments, source bytes, a stable byte-based ID,
+        # and macro-expansion information needed during reverse tracing.
         for caller_id, call_sites in self.graph.items():
             caller = self.registry.get(caller_id)
             if caller is None:
@@ -496,6 +585,8 @@ class ValueFlowResolver:
                 self.forward_edges[site.caller_id].append(edge)
 
     def _compute_reachability(self) -> None:
+        # Targets outside the call graph reachable from the real main() are not
+        # processed. This keeps unrelated/dead project functions out of output.
         main_id = f"[{self.main_file_name}]main"
         if main_id not in self.registry:
             return
@@ -566,6 +657,8 @@ class ValueFlowResolver:
         )
 
     def _enumerate_seeds(self) -> None:
+        # A seed means one concrete configured target invocation, not merely a
+        # target function name. Two calls to mdm_open produce two separate seeds.
         for site in sorted(self.sites.values(), key=lambda item: item.site_id):
             if site.caller_id not in self.reachable:
                 continue
@@ -646,6 +739,8 @@ class ValueFlowResolver:
     async def resolve(
         self, query: Query, stack: frozenset[str] = frozenset()
     ) -> list[Fact]:
+        # Every reverse-tracing step is a Query. Its token is stable enough to
+        # cache and to share when several target paths reach the same subproblem.
         token = query.token()
         self._label_query(query)
         if token in stack:
@@ -688,6 +783,9 @@ class ValueFlowResolver:
     async def _resolve_uncached(
         self, query: Query, stack: frozenset[str]
     ) -> list[Fact]:
+        # Dispatch one reverse-tracing question to the matching resolver.
+        # ArgQuery and ParamQuery form the normal caller/callee value walk.
+        # HandleQuery and ReturnUseQuery are special resource-operation cases.
         if isinstance(query, ArgQuery):
             return await self._resolve_argument(query, stack)
         if isinstance(query, ParamQuery):
@@ -713,6 +811,8 @@ class ValueFlowResolver:
     async def _resolve_argument(
         self, query: ArgQuery, stack: frozenset[str]
     ) -> list[Fact]:
+        # Start at the exact target/caller invocation and select its Nth actual
+        # argument. Argument numbers are 1-based because JSON target configs are.
         site = self.sites.get(query.call_site_id)
         if site is None:
             return [self._unresolved_fact(query, "missing call site")]
@@ -774,6 +874,9 @@ class ValueFlowResolver:
         stack: frozenset[str],
         local_stack: set[str],
     ) -> list[Fact]:
+        # Resolution priority, from cheapest/most certain to least certain:
+        # literal -> macro -> parameter/caller -> local assignment -> LLM ->
+        # explicit external/unknown fact.  Each return is a possible source.
         raw = expression.text.strip()
         value = strip_outer_parens(raw)
         if self._literal(value):
@@ -871,6 +974,8 @@ class ValueFlowResolver:
     async def _resolve_parameter(
         self, query: ParamQuery, stack: frozenset[str]
     ) -> list[Fact]:
+        # The value used by `void f(int x)` may come from every reachable call
+        # to f(...). Turn the formal parameter back into each actual argument.
         info = self.functions.get(query.function_id)
         callers = [
             edge
@@ -974,6 +1079,9 @@ class ValueFlowResolver:
         return sorted(matches)
 
     def handle_query_for_seed(self, seed: Seed) -> HandleQuery | None:
+        # A target with dependent_functions (read/close) does not resolve its
+        # own argument as a value. Instead, find the earlier configured open
+        # that owns the same handle and resolve the open's value argument.
         dependencies = tuple(
             name
             for name in seed.config.get("dependent_functions", [])
@@ -994,6 +1102,9 @@ class ValueFlowResolver:
     async def _resolve_handle(
         self, query: HandleQuery, stack: frozenset[str]
     ) -> list[Fact]:
+        # Handle resolution order: same-function variable binding -> parameter
+        # binding through callers -> global/field binding -> LLM -> old nearest
+        # open fallback. The first successful level supplies the source facts.
         site = self.sites.get(query.call_site_id)
         dependencies = self._handle_dependencies.get(query.token(), ())
         if site is None or not dependencies:
@@ -1347,6 +1458,8 @@ class ValueFlowResolver:
         return self._deduplicate_records(records)
 
     async def _resolve_seed(self, seed: Seed) -> list[ResolvedSeed]:
+        # One seed is one target call site. It can yield several rows when its
+        # configured argument has several possible source values/paths.
         operation = seed.config.get("type") or "NO DATA"
         if operation == "WRITEF/READF":
             operation_facts = await self.resolve(ReturnUseQuery(seed.site.site_id))
@@ -1354,12 +1467,11 @@ class ValueFlowResolver:
         handle_query = self.handle_query_for_seed(seed)
         queries: list[tuple[int, Query]] = []
         if handle_query is not None:
-            dependencies = self._handle_dependencies[handle_query.token()]
-            for dependency in dependencies:
-                for index in (
-                    self.function_configs.get(dependency, {}).get("indices") or []
-                ):
-                    queries.append((int(index), handle_query))
+            # A handle query already discovers the concrete bound open call and
+            # resolves that open's configured value argument(s).  Scheduling it
+            # once per configured open-family member created duplicate records
+            # whenever several alternatives shared this consumer.
+            queries.append((handle_query.arg_index, handle_query))
         else:
             queries.extend(
                 (int(index), ArgQuery(seed.site.site_id, int(index)))
@@ -1410,6 +1522,7 @@ class ValueFlowResolver:
     ) -> ResolvedSeed:
         paths, path_count, truncated = self.paths_for_fact(fact, query)
         token = query.token()
+        legacy_paths = self.legacy_paths_for_fact(fact, token)
         chain = self.provenance_tokens(fact, token) or [token]
         return ResolvedSeed(
             seed=seed,
@@ -1424,11 +1537,14 @@ class ValueFlowResolver:
             seconds=sum(
                 self.timings.get(step, {}).get("seconds", 0.0) for step in chain
             ),
-            legacy_labels=self.legacy_path_labels(fact, token),
+            legacy_labels=legacy_paths[0] if legacy_paths else [],
+            legacy_paths=legacy_paths,
         )
 
     # ------------------------------------------------------------- provenance
     def _add_provenance(self, child: Query, parent: Query) -> None:
+        # Store source -> target direction: child answers a question needed by
+        # parent. Later this becomes the source-to-target path CSV/log output.
         self._label_query(child)
         self._label_query(parent)
         self.provenance[child.token()].add(parent.token())
@@ -1467,8 +1583,24 @@ class ValueFlowResolver:
     def paths_for_fact(
         self, fact: Fact, target: Query
     ) -> tuple[list[list[str]], int, bool]:
+        token_paths, count, truncated = self._provenance_token_paths(
+            fact, target.token()
+        )
+        return (
+            [
+                [self.query_labels.get(token, token) for token in path]
+                for path in token_paths
+            ],
+            count,
+            truncated,
+        )
+
+    def _provenance_token_paths(
+        self, fact: Fact, destination: str
+    ) -> tuple[list[list[str]], int, bool]:
+        # Starting at the query that found the source fact, walk forward through
+        # recorded dependencies until reaching the original target query.
         origin = fact.origin_query
-        destination = target.token()
         paths: list[list[str]] = []
         memo: dict[str, int] = {}
 
@@ -1492,7 +1624,7 @@ class ValueFlowResolver:
             if len(paths) >= self.path_cap:
                 return
             if current == destination:
-                paths.append([self.query_labels.get(token, token) for token in path])
+                paths.append(path)
                 return
             for parent in sorted(self.provenance.get(current, set())):
                 if parent in seen:
@@ -1506,7 +1638,7 @@ class ValueFlowResolver:
         collect(origin, [origin], {origin})
         if count == 0:
             count = 1
-            paths = [[self.query_labels.get(destination, destination)]]
+            paths = [[destination]]
         return paths, count, count > len(paths)
 
     def provenance_tokens(self, fact: Fact, destination: str) -> list[str]:
@@ -1533,8 +1665,17 @@ class ValueFlowResolver:
         ``[file:line]name`` labels produced by FunctionNode, exactly as the
         path enumerator did.
         """
+        paths = self.legacy_paths_for_fact(fact, destination)
+        return paths[0] if paths else []
+
+    def legacy_paths_for_fact(self, fact: Fact, destination: str) -> list[list[str]]:
+        """Render every materialized value-flow path as call-graph labels."""
+        token_paths, _, _ = self._provenance_token_paths(fact, destination)
+        return [self._legacy_labels_for_tokens(tokens) for tokens in token_paths]
+
+    def _legacy_labels_for_tokens(self, tokens: Iterable[str]) -> list[str]:
         labels: list[str] = []
-        for token in self.provenance_tokens(fact, destination) or [destination]:
+        for token in tokens:
             try:
                 parts = json.loads(token)
             except (TypeError, ValueError):
@@ -1782,6 +1923,12 @@ class ValueFlowResolver:
                 known = {tuple(path) for path in existing.paths}
                 existing.paths.extend(
                     path for path in record.paths if tuple(path) not in known
+                )
+                known_legacy = {tuple(path) for path in existing.legacy_paths}
+                existing.legacy_paths.extend(
+                    path
+                    for path in record.legacy_paths
+                    if tuple(path) not in known_legacy
                 )
                 existing.path_count += record.path_count
                 existing.paths_truncated = (

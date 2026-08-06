@@ -66,12 +66,6 @@ def build_complete_call_graph(
     file_functions: dict[str, dict[str, Any]] | None = None,
 ) -> tuple[dict, dict, dict, dict]:
     """Build the original analyzer graph once, before target-path filtering.
-
-    This adapter deliberately lives outside ``call_graph/call_graph.py`` so the
-    production call-graph implementation remains byte-for-byte identical to the
-    work baseline.  The original target tracer reuses the cached tree objects
-    and macros, while the visualizer receives the complete raw registry and all
-    call sites.
     """
     from call_graph.call_graph import CallGraphBuilder, build_call_trees
     from state.state import State
@@ -94,10 +88,85 @@ def build_complete_call_graph(
     registry = builder.node_registry
     tree_objects = build_call_trees(graph, registry)
     macros = builder.macros
+
+# sample output
+# graph
+            # '[svmyeq.c]svmyeq': [CallSite(callee=FunctionNode(name='memset',
+            #                                                    file_name='svm001.c',
+            #                                                    file_path='/home/seigyo/c_repo/c_repo/SoudenKeisei/SoudenKeisei/gs-svm/src/svm001/svm001.c',
+            #                                                    is_external=True,
+            #                                                    is_static=False,
+            #                                                    macro_expansion=None,
+            #                                                    start_line=-1,
+            #                                                    end_line=-1),
+            #                                line_number=34,
+            #                                callbacks=[],
+            #                                start_byte=1532,
+            #                                end_byte=1577),
+            #                       CallSite(callee=FunctionNode(name='mdm_addrec',
+            #                                                    file_name='svm001.c',
+            #                                                    file_path='/home/seigyo/c_repo/c_repo/SoudenKeisei/SoudenKeisei/gs-svm/src/svm001/svm001.c',
+            #                                                    is_external=True,
+            #                                                    is_static=False,
+            #                                                    macro_expansion=None,
+            #                                                    start_line=-1,
+            #                                                    end_line=-1),
+            #                                line_number=49,
+            #                                callbacks=[],
+            #                                start_byte=1962,
+            #                                end_byte=1999),
+            #                       CallSite(callee=FunctionNode(name='svm_errmsg',
+            #                                                    file_name='svm_errmsg.c',
+            #                                                    file_path='/home/seigyo/c_repo/c_repo/SoudenKeisei/SoudenKeisei/gs-svm/src/svm001/svm001_svminit.c',
+            #                                                    is_external=False,
+            #                                                    is_static=False,
+            #                                                    macro_expansion=None,
+            #                                                    start_line=16,
+            #                                                    end_line=114),
+            #                                line_number=56,
+            #                                callbacks=[],
+            #                                start_byte=2228,
+            #                                end_byte=2248),
+# registry
+#  'vprintf': FunctionNode(name='vprintf',
+#                          file_name='svm500_110704log.c',
+#                          file_path='/home/seigyo/c_repo/c_repo/SoudenKeisei/SoudenKeisei/gs-svm/src/libsvm4/svm500_110704log.c',
+#                          is_external=True,
+#                          is_static=False,
+#                          macro_expansion=None,
+#                          start_line=-1,
+#                          end_line=-1),
+#  'vsprintf': FunctionNode(name='vsprintf',
+#                           file_name='svm_printf6one.c',
+#                           file_path='/home/seigyo/c_repo/c_repo/SoudenKeisei/SoudenKeisei/gs-svm/src/libsvm/svm_printf6one.c',
+#                           is_external=True,
+#                           is_static=False,
+#                           macro_expansion=None,
+#                           start_line=-1,
+#                           end_line=-1)}
+# macros
+#  'tst_f3_ctl': ('TST_F3_CTL',
+#                 '/home/seigyo/c_repo/c_repo/SoudenKeisei/SoudenKeisei/include/FILE/tst_f3_ctl.h',
+#                 'tst_f3_ctl'),
+#  'tst_init_ch': ('TST_INIT_CH',
+#                  '/home/seigyo/c_repo/c_repo/SoudenKeisei/SoudenKeisei/include/FILE/tst_init_ch.h',
+#                  'tst_init_ch'),
+#  'tst_siken': ('TST_SIKEN',
+#                '/home/seigyo/c_repo/c_repo/SoudenKeisei/SoudenKeisei/include/FILE/tst_siken.h',
+#                'tst_siken'),
+#  'usr_print': ('usr_fname = __FILE__; \\\n'
+#                '\t\t\t\tusr_lineno = __LINE__; \\\n'
+#                '\t\t\t\tusr_print_in\t\t\t                           ',
+#                '/home/seigyo/c_repo/c_repo/SoudenKeisei/SoudenKeisei/modern/include/usr/usr_in.h',
+#                'usr_print')}
+
+    # TODO: Get the shape of tree_objects 
+
     state.set("CALL_GRAPH", graph)
     state.set("FUNCTION_REGISTRY", registry)
     state.set("TREE_OBJECTS", tree_objects)
     state.set("BUILDER_MACROS", macros)
+
     return graph, registry, tree_objects, macros
 
 
