@@ -1,6 +1,6 @@
 import { MessageSquareText } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
-import { fetchSource } from "../api.js";
+import { fetchFunctionDetail, fetchSource } from "../api.js";
 import { interactionDirection } from "../graph/model.js";
 import { useT } from "../i18n.jsx";
 import { Badge, Section } from "./ui.jsx";
@@ -47,6 +47,8 @@ const STR = {
     source403: "ソースはこのプロセスのルート外にある (403)。",
     source404: "ソースファイルを利用できない (404)。",
     sourceError: "ソースを読み込めなかった。",
+    loadingDetail: "関数の詳細を読込中…",
+    detailError: "関数の詳細を読み込めませんでした。{error}",
     daemonResource: "デーモン資源",
     resolved: "解決済み",
     unresolved: "未解決",
@@ -61,6 +63,8 @@ const STR = {
     noEntry: "エントリ関数なし — 平面はグラフのルートを使用",
     next: "次へ",
     nextHelp: "このノードを基点に呼び出しツリーの平面が立ち上がっています。ツリー内の関数をクリックすると詳細を確認できます。",
+    loadingPlane: "呼び出しツリーを読込中…",
+    planeError: "プロセスの平面を読み込めませんでした。{error}",
   },
   en: {
     inspector: "Inspector",
@@ -103,6 +107,8 @@ const STR = {
     source403: "Source lies outside this process root (403).",
     source404: "Source file not available (404).",
     sourceError: "Could not load source.",
+    loadingDetail: "Loading function detail…",
+    detailError: "Function detail could not be loaded. {error}",
     daemonResource: "Daemon resource",
     resolved: "resolved",
     unresolved: "unresolved",
@@ -117,6 +123,8 @@ const STR = {
     noEntry: "no entry function — plane uses graph roots",
     next: "Next",
     nextHelp: "Its call tree is now raised on a plane anchored to this node. Click any function in that tree to inspect it.",
+    loadingPlane: "Loading its call tree…",
+    planeError: "The process plane could not be loaded. {error}",
   },
 };
 
@@ -124,10 +132,10 @@ function fmt(template, n) {
   return template.replace("{n}", n);
 }
 
-export default function Inspector({ selection, index, runId, onAskFunction }) {
+export default function Inspector({ selection, processInfo, onAskFunction }) {
   const t = useT(STR);
   return (
-    <aside className="flex w-[26rem] shrink-0 flex-col border-l border-rule bg-panel">
+    <aside className="relative z-20 flex min-w-0 w-[26rem] shrink-0 flex-col border-l border-rule bg-panel">
       <header className="border-b border-rule px-5 py-4">
         <h1 className="text-sm font-semibold tracking-wide text-ink">{t.inspector}</h1>
         <p className="mt-0.5 text-xs text-ink-faint">{t.subtitle}</p>
@@ -136,16 +144,12 @@ export default function Inspector({ selection, index, runId, onAskFunction }) {
       <div className="min-h-0 flex-1 overflow-y-auto">
         {!selection && <EmptyState t={t} />}
         {selection?.type === "function" && (
-          <FunctionPanel
-            selection={selection}
-            index={index}
-            runId={runId}
-            onAskFunction={onAskFunction}
-            t={t}
-          />
+          <FunctionPanel selection={selection} processInfo={processInfo} onAskFunction={onAskFunction} t={t} />
         )}
         {selection?.type === "resource" && <ResourcePanel resource={selection.resource} t={t} />}
-        {selection?.type === "process" && <ProcessPanel process={selection.process} index={index} t={t} />}
+        {selection?.type === "process" && (
+          <ProcessPanel process={selection.process} info={processInfo} t={t} />
+        )}
       </div>
     </aside>
   );
@@ -164,12 +168,63 @@ function EmptyState({ t }) {
   );
 }
 
-function FunctionPanel({ selection, index, runId, onAskFunction, t }) {
+function FunctionPanel({ selection, processInfo, onAskFunction, t }) {
   const fn = selection.node.fn;
+  const processName = selection.processName;
+  const runId = processInfo?.runId || null;
+  const [detail, setDetail] = useState({ phase: runId ? "loading" : "none" });
   const [source, setSource] = useState({ phase: "idle" });
   const [showRaw, setShowRaw] = useState(false);
+
+  // One detail request per selection; a late response is discarded when the
+  // user has moved on (abort + effect cleanup).
+  useEffect(() => {
+    if (!runId) {
+      setDetail({ phase: "none" });
+      return undefined;
+    }
+    const controller = new AbortController();
+    setDetail({ phase: "loading" });
+    fetchFunctionDetail(processName, runId, fn.id, controller.signal)
+      .then((data) => !controller.signal.aborted && setDetail({ phase: "ready", data }))
+      .catch((error) => {
+        if (error.name !== "AbortError" && !controller.signal.aborted) {
+          setDetail({ phase: "error", error });
+        }
+      });
+    return () => controller.abort();
+  }, [fn.id, processName, runId]);
+
+  // The open plane's index is still in memory, so call structure is visible
+  // immediately; the server detail adds summaries and argument evidence.
+  const local = useMemo(() => {
+    const index = processInfo?.index;
+    if (!index) return null;
+    return {
+      outgoing: index.outgoing.get(fn.id) || [],
+      incoming: index.incoming.get(fn.id) || [],
+      interactions: index.interactionsByFunction.get(fn.id) || [],
+      resources: index.resources,
+      traces: index.traces.filter((trace) => (trace.labels || []).some((label) => String(label).includes(fn.name))),
+      nameOf: (id) => index.functions.get(id)?.name || id,
+    };
+  }, [processInfo, fn]);
+
+  const data = detail.phase === "ready" ? detail.data : null;
+  const fnFull = data?.function || fn;
+  const outgoing = data ? data.outgoing : local?.outgoing || [];
+  const incoming = data ? data.incoming : local?.incoming || [];
+  const interactions = data ? data.interactions : local?.interactions || [];
+  const resourceOf = (interaction) => {
+    if (interaction.resource && interaction.resource.kind !== undefined) return interaction.resource;
+    const map = data ? data.resources : local?.resources;
+    return map?.get(interaction.resource_id);
+  };
+  const nameOf = (id) => (data ? data.neighbors?.[id]?.name : local?.nameOf(id)) || id;
+  const traces = data ? data.traces : local?.traces || [];
+  const traceTotal = data ? data.trace_total : traces.length;
   const canFetchSource =
-    !!index && !fn.is_external && !fn.synthetic && !!fn.file && fn.start_line > 0;
+    !!runId && !fn.is_external && !fn.synthetic && !!fn.file && fn.start_line > 0;
 
   useEffect(() => {
     if (!canFetchSource || !runId) {
@@ -178,21 +233,13 @@ function FunctionPanel({ selection, index, runId, onAskFunction, t }) {
     }
     let cancelled = false;
     setSource({ phase: "loading" });
-    fetchSource(index.process.name, runId, fn.id)
+    fetchSource(processName, runId, fn.id)
       .then((payload) => !cancelled && setSource({ phase: "ready", payload }))
       .catch((error) => !cancelled && setSource({ phase: "error", error }));
     return () => {
       cancelled = true;
     };
-  }, [fn.id, index, runId, canFetchSource]);
-
-  const outgoing = index?.outgoing.get(fn.id) || [];
-  const incoming = index?.incoming.get(fn.id) || [];
-  const interactions = index?.interactionsByFunction.get(fn.id) || [];
-  const traces = useMemo(() => {
-    if (!index) return [];
-    return index.traces.filter((trace) => trace.labels.some((label) => label.includes(fn.name)));
-  }, [index, fn.name]);
+  }, [fn.id, processName, runId, canFetchSource]);
 
   return (
     <div>
@@ -209,11 +256,16 @@ function FunctionPanel({ selection, index, runId, onAskFunction, t }) {
             <Badge tone="rose">{selection.node.isolated ? t.noCall : t.noMainPath}</Badge>
           )}
           {fn.synthetic && <Badge>{t.synthetic}</Badge>}
-          <Badge>{fmt(t.calls, fn.call_count)}</Badge>
-          {fn.resource_interaction_count > 0 && (
-            <Badge tone="green">{fmt(t.interactions, fn.resource_interaction_count)}</Badge>
+          <Badge>{fmt(t.calls, fn.call_count ?? outgoing.length)}</Badge>
+          {(fn.resource_interaction_count ?? interactions.length) > 0 && (
+            <Badge tone="green">{fmt(t.interactions, fn.resource_interaction_count ?? interactions.length)}</Badge>
           )}
         </div>
+        {detail.phase === "error" && (
+          <p className="mt-2 text-xs text-amber-700 dark:text-amber-300">
+            {t.detailError.replace("{error}", detail.error?.message || "—")}
+          </p>
+        )}
         <button
           type="button"
           onClick={() => onAskFunction?.(fn.name)}
@@ -224,18 +276,20 @@ function FunctionPanel({ selection, index, runId, onAskFunction, t }) {
       </Section>
 
       <Section title={t.ai}>
-        {fn.summary ? (
-          <p className="text-sm leading-relaxed text-ink">{fn.summary}</p>
+        {detail.phase === "loading" ? (
+          <p className="text-xs text-ink-faint">{t.loadingDetail}</p>
+        ) : fnFull.summary ? (
+          <p className="text-sm leading-relaxed text-ink">{fnFull.summary}</p>
         ) : (
           <div className="rounded-md border border-dashed border-rule-strong bg-sunken p-3">
             <p className="text-xs leading-relaxed text-ink-muted">
               {t.noSummary}{" "}
-              <span className="font-mono">summary_status: {fn.summary_status || "—"}</span>
-              {fn.summary_error
-                ? ` — ${fn.summary_error}`
-                : ` — ${fn.summary_status === "library" || fn.is_external ? t.libraryBoundary : t.enableSummary}`}
+              <span className="font-mono">summary_status: {fnFull.summary_status || "—"}</span>
+              {fnFull.summary_error
+                ? ` — ${fnFull.summary_error}`
+                : ` — ${fnFull.summary_status === "library" || fn.is_external ? t.libraryBoundary : t.enableSummary}`}
             </p>
-            {fn.summary_hint && <p className="mt-2 border-t border-rule pt-2 text-xs text-ink-muted">{fn.summary_hint}</p>}
+            {fnFull.summary_hint && <p className="mt-2 border-t border-rule pt-2 text-xs text-ink-muted">{fnFull.summary_hint}</p>}
           </div>
         )}
       </Section>
@@ -246,9 +300,9 @@ function FunctionPanel({ selection, index, runId, onAskFunction, t }) {
           <ul className="space-y-1">
             {selection.node.viaCalls.map((call) => (
               <li key={call.id} className="flex items-baseline justify-between gap-2 text-xs">
-                <span className="font-mono text-ink-muted">{index?.functions.get(call.source)?.name || call.source}</span>
+                <span className="font-mono text-ink-muted">{nameOf(call.source)}</span>
                 <span className="shrink-0 font-mono text-[10px] text-ink-faint">
-                  {call.kind}{call.line != null && ` :${call.line}`}{call.via && ` via ${index?.functions.get(call.via)?.name || call.via}`}
+                  {call.kind}{call.line != null && ` :${call.line}`}{call.via && ` via ${nameOf(call.via)}`}
                 </span>
               </li>
             ))}
@@ -262,7 +316,7 @@ function FunctionPanel({ selection, index, runId, onAskFunction, t }) {
         ) : (
           <ul className="space-y-2">
             {interactions.map((interaction) => {
-              const resource = index.resources.get(interaction.resource_id);
+              const resource = resourceOf(interaction);
               const direction = interactionDirection(interaction);
               return (
                 <li key={interaction.id} className="rounded-md border border-rule bg-sunken p-2.5">
@@ -286,14 +340,13 @@ function FunctionPanel({ selection, index, runId, onAskFunction, t }) {
           </ul>
         )}
       </Section>
-
       <Section title={t.outgoing} count={outgoing.length || null}>
-        <CallList calls={outgoing} index={index} field="target" t={t} />
+        <CallList calls={outgoing} nameOf={nameOf} field="target" t={t} />
       </Section>
       <Section title={t.calledBy} count={incoming.length || null}>
-        <CallList calls={incoming} index={index} field="source" t={t} />
+        <CallList calls={incoming} nameOf={nameOf} field="source" t={t} />
       </Section>
-      <Section title={t.traces} count={traces.length || null}>
+      <Section title={t.traces} count={traceTotal || null}>
         {traces.length === 0 ? (
           <p className="text-xs text-ink-faint">{t.noTrace}</p>
         ) : (
@@ -304,7 +357,7 @@ function FunctionPanel({ selection, index, runId, onAskFunction, t }) {
                 <p className="mt-1 break-all font-mono text-[10px] leading-relaxed text-ink-muted">{trace.display_path}</p>
               </li>
             ))}
-            {traces.length > 12 && <li className="text-[11px] text-ink-faint">{fmt(t.more, traces.length - 12)}</li>}
+            {traceTotal > 12 && <li className="text-[11px] text-ink-faint">{fmt(t.more, traceTotal - 12)}</li>}
           </ul>
         )}
       </Section>
@@ -313,25 +366,22 @@ function FunctionPanel({ selection, index, runId, onAskFunction, t }) {
         <button type="button" onClick={() => setShowRaw((value) => !value)} className="text-[11px] text-ink-muted underline underline-offset-2 hover:text-ink">
           {showRaw ? t.hideRaw : t.showRaw}
         </button>
-        {showRaw && <pre className="mt-2 overflow-x-auto rounded-md border border-rule bg-inset p-3 font-mono text-[10px] leading-relaxed text-ink-muted">{JSON.stringify(fn, null, 2)}</pre>}
+        {showRaw && <pre className="mt-2 overflow-x-auto rounded-md border border-rule bg-inset p-3 font-mono text-[10px] leading-relaxed text-ink-muted">{JSON.stringify(fnFull, null, 2)}</pre>}
       </Section>
     </div>
   );
 }
 
-function CallList({ calls, index, field, t }) {
+function CallList({ calls, nameOf, field, t }) {
   if (calls.length === 0) return <p className="text-xs text-ink-faint">{t.none}</p>;
   return (
     <ul className="space-y-1">
-      {calls.map((call) => {
-        const other = index?.functions.get(call[field]);
-        return (
-          <li key={call.id} className="flex items-baseline justify-between gap-2 text-xs">
-            <span className="truncate font-mono text-ink-muted">{other?.name || call[field]}</span>
-            <span className="shrink-0 font-mono text-[10px] text-ink-faint">{call.kind}{call.line != null && ` :${call.line}`}</span>
-          </li>
-        );
-      })}
+      {calls.map((call) => (
+        <li key={call.id} className="flex items-baseline justify-between gap-2 text-xs">
+          <span className="truncate font-mono text-ink-muted">{nameOf(call[field])}</span>
+          <span className="shrink-0 font-mono text-[10px] text-ink-faint">{call.kind}{call.line != null && ` :${call.line}`}</span>
+        </li>
+      ))}
     </ul>
   );
 }
@@ -353,37 +403,45 @@ function SourceBlock({ state, canFetch, t }) {
 }
 
 function ResourcePanel({ resource, t }) {
+  const processes = resource.processes || [];
   return (
     <div>
       <Section title={t.daemonResource}>
         <p className="font-mono text-sm text-ink">{resource.kind} {resource.name}</p>
         <div className="mt-2.5 flex flex-wrap gap-1.5">
           <Badge tone={resource.resolved ? "green" : "rose"}>{resource.resolved ? t.resolved : t.unresolved}</Badge>
-          {resource.shared && <Badge tone="amber">{fmt(t.shared, resource.processes.size)}</Badge>}
+          {resource.shared && <Badge tone="amber">{fmt(t.shared, processes.length)}</Badge>}
         </div>
       </Section>
-      <Section title={t.touching} count={resource.processes.size}>
-        <ul className="space-y-1">{[...resource.processes].sort().map((name) => <li key={name} className="font-mono text-xs text-ink-muted">{name}</li>)}</ul>
+      <Section title={t.touching} count={processes.length}>
+        <ul className="space-y-1">{[...processes].sort().map((name) => <li key={name} className="font-mono text-xs text-ink-muted">{name}</li>)}</ul>
       </Section>
       <Section title={t.note}><p className="text-xs leading-relaxed text-ink-muted">{t.resourceNote}</p></Section>
     </div>
   );
 }
 
-function ProcessPanel({ process, index, t }) {
+function ProcessPanel({ process, info, t }) {
+  const state = info?.state;
   return (
     <div>
       <Section title={t.process}>
         <p className="font-mono text-sm text-ink">{process.name}</p>
-        <p className="mt-1 break-all font-mono text-[11px] text-ink-muted">{index?.process.root || ""}</p>
+        <p className="mt-1 break-all font-mono text-[11px] text-ink-muted">{state?.process?.root || ""}</p>
         <div className="mt-2.5 flex flex-wrap gap-1.5">
-          <Badge>{fmt(t.functions, process.functionCount)}</Badge>
-          <Badge>{fmt(t.resources, process.resourceCount)}</Badge>
-          <Badge tone="green">{fmt(t.interactions, process.interactionCount)}</Badge>
+          <Badge>{fmt(t.functions, process.functionCount ?? 0)}</Badge>
+          <Badge>{fmt(t.resources, process.resourceCount ?? 0)}</Badge>
+          <Badge tone="green">{fmt(t.interactions, process.interactionCount ?? 0)}</Badge>
         </div>
+        {state?.status === "loading" && <p className="mt-2 text-xs text-ink-faint">{t.loadingPlane}</p>}
+        {state?.status === "error" && (
+          <p className="mt-2 text-xs text-amber-700 dark:text-amber-300">
+            {t.planeError.replace("{error}", state.error || "—")}
+          </p>
+        )}
       </Section>
       <Section title={t.entry}>
-        <p className="font-mono text-xs text-ink-muted">{index?.entryId ? index.functions.get(index.entryId)?.name || index.entryId : t.noEntry}</p>
+        <p className="font-mono text-xs text-ink-muted">{state?.process?.entry_function || t.noEntry}</p>
       </Section>
       <Section title={t.next}><p className="text-xs leading-relaxed text-ink-muted">{t.nextHelp}</p></Section>
     </div>

@@ -486,7 +486,7 @@ def make_graph(
 if __name__ == "__main__":
     import pickle
 
-    with open(Path("/home/seigyo/c_repo/c_repo/dio000_path_str.pkl"), "rb") as f:
+    with open(Path("/home/seigyo/c_repo/bhavneek/c-visualizer/dio000_path_str.pkl"), "rb") as f:
         path_str = pickle.load(f)
 
     # pprint(path_str)

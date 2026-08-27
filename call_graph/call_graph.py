@@ -471,11 +471,19 @@ class CallGraphBuilder:
         return self.graph
 
     def get_entry_points(self) -> List[str]:
-        """Return registered main function nodes."""
+        """Return registered application and PMF lifecycle entry nodes."""
+        entry_names = {
+            "main",
+            "pmf_start_H",
+            "pmf_main_H",
+            "pmf_end_H",
+            "pmf_term_H",
+            "pmf_abort_H",
+        }
         return [
             node.unique_id
             for node in self.node_registry.values()
-            if node.name == "main"
+            if node.name in entry_names
         ]
 
 
@@ -661,6 +669,8 @@ def orchestrate(
     trees: dict,
     required_func: str,
     main_file_name: str,
+    entry_function_name: str = "main",
+    entry_points: list[tuple[str, str]] | None = None,
     function_pointer_args: dict = None,
     file_functions: dict[str, dict[str, Any]] = None,
     return_whole_tree: bool = False,
@@ -701,8 +711,32 @@ def orchestrate(
 
         print(len(builder.macros))
 
+    # Legacy path enumeration historically accepted one root.  Reuse that
+    # stable implementation once per lifecycle root and combine the paths so
+    # callback/launch metadata remains correct for each root.
+    distinct_roots = list(dict.fromkeys(entry_points or []))
+    if len(distinct_roots) > 1:
+        combined_paths = []
+        for root_file, root_function in distinct_roots:
+            single_result = orchestrate(
+                project_strcuture=project_strcuture,
+                trees=trees,
+                required_func=required_func,
+                main_file_name=root_file,
+                entry_function_name=root_function,
+                entry_points=None,
+                function_pointer_args=function_pointer_args,
+                file_functions=file_functions,
+                return_whole_tree=return_whole_tree,
+            )
+            if single_result:
+                macro_data, root_paths = single_result
+                combined_paths.extend(root_paths)
+        return (macro_data, combined_paths) if combined_paths else None
+
     paths_with_data: list[tuple[tuple[list[str], list[CallTreeNode] | None], dict]] = []
-    main_key = f"[{main_file_name}]main"
+    entry_function_name = entry_function_name or "main"
+    main_key = f"[{main_file_name}]{entry_function_name}"
 
     if main_key in tree_objects.keys():
         node = tree_objects[main_key]
@@ -732,7 +766,7 @@ def orchestrate(
             print("\n=== Paths Found ===")
 
             for ind, p in enumerate(paths):
-                print(f"Processing the path {ind + 1} in call_graph")
+                # print(f"Processing the path {ind + 1} in call_graph")
 
                 call_graph_determined: dict[str, Any] = {}
                 call_graph_determined["function_name"] = required_func
@@ -798,7 +832,7 @@ def orchestrate(
 
                     elif index == len(p) - 1:
                         call_graph_determined["launch_via"] = "FORK"
-                        call_graph_determined["call_function"] = "main"
+                        call_graph_determined["call_function"] = entry_function_name
 
                         first_block = re.match(BLOCK_REGEX, p[0]).group(1).split(":")
 
@@ -896,25 +930,25 @@ if __name__ == "__main__":
 
     PROJECT_STRUCTURE = {
         "apl_getmode.c": Path(
-            "/home/seigyo/c_repo/c_repo/src/src_analysis/src/libapl/apl_getmode.c"
+            "/home/seigyo/c_repo/bhavneek/c-visualizer/src/src_analysis/src/libapl/apl_getmode.c"
         ),
         "apl_in.h": Path(
-            "/home/seigyo/c_repo/c_repo/src/src_analysis/include/apl_in.h"
+            "/home/seigyo/c_repo/bhavneek/c-visualizer/src/src_analysis/include/apl_in.h"
         ),
         "main.c": Path(
-            "/home/seigyo/c_repo/c_repo/src/src_analysis/src/apl110d/main.c"
+            "/home/seigyo/c_repo/bhavneek/c-visualizer/src/src_analysis/src/apl110d/main.c"
         ),
         "mpf_com.h": Path(
-            "/home/seigyo/c_repo/c_repo/src/moove_header/mpf_com.h"
+            "/home/seigyo/c_repo/bhavneek/c-visualizer/src/moove_header/mpf_com.h"
         ),
         "mpf_mfs.h": Path(
-            "/home/seigyo/c_repo/c_repo/src/moove_header/mpf_mfs.h"
+            "/home/seigyo/c_repo/bhavneek/c-visualizer/src/moove_header/mpf_mfs.h"
         ),
         "mpf_mfs_err.h": Path(
-            "/home/seigyo/c_repo/c_repo/src/moove_header/mpf_mfs_err.h"
+            "/home/seigyo/c_repo/bhavneek/c-visualizer/src/moove_header/mpf_mfs_err.h"
         ),
         "pmf.h": Path(
-            "/home/seigyo/c_repo/c_repo/src/moove_header/pmf.h"
+            "/home/seigyo/c_repo/bhavneek/c-visualizer/src/moove_header/pmf.h"
         ),
     }
 

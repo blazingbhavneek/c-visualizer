@@ -351,7 +351,7 @@ export function layoutOverview(overview, { radius = 1500 } = {}) {
   // another mark's text. Labels sit below their node, so the vertical extent is
   // roughly the label height on top of the dot.
   for (const node of nodes) {
-    const isProcess = node.type === "process";
+    const isProcess = node.type === "process" || node.type === "library";
     const spec = isProcess ? LABEL_SPECS.process : LABEL_SPECS.resource;
     const lines = [node.name];
     const label = labelWorldSize(lines, spec);

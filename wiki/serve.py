@@ -258,7 +258,9 @@ class WikiHandlerMixin:
             return
 
         if path != "/api/ask/stream":
-            self._send_json({"error": "Not found."}, HTTPStatus.NOT_FOUND)
+            # Non-wiki POSTs (e.g. /api/overview) belong to the visualizer
+            # handler; defer to it instead of 404-ing.
+            super().do_POST()
             return
 
         if service is None:

@@ -13,12 +13,14 @@ import json
 import os
 import re
 import tempfile
+from concurrent.futures import ThreadPoolExecutor
 from collections import Counter
 from datetime import datetime, timezone
+from functools import partial
 from pathlib import Path
 from typing import Any
 
-from output_paths import results_root
+from output_paths import process_results_dir, results_root
 
 
 def get_visualizer_results_root() -> Path:
@@ -44,6 +46,8 @@ def _json_safe(value: Any) -> Any:
 
 def _resource_kind(operation: str) -> str:
     operation = (operation or "").upper()
+    if operation in {"QUEUEF"}:
+        return "queue"
     if operation.endswith("F") or operation in {"OPENF", "CLOSEF"}:
         return "file"
     if operation.endswith("Q") or operation in {"ENQ", "DEQ", "ENQFORK", "ENQSEM"}:
@@ -52,7 +56,7 @@ def _resource_kind(operation: str) -> str:
         return "event"
     if operation == "SEMAPHORE":
         return "semaphore"
-    if operation in {"FORK", "FORKP", "KILL"}:
+    if operation in {"FORK", "FORKP", "FORKF", "KILL"}:
         return "process"
     if operation == "MESSAGE":
         return "message"
@@ -93,7 +97,7 @@ def build_complete_call_graph(
 # graph
             # '[svmyeq.c]svmyeq': [CallSite(callee=FunctionNode(name='memset',
             #                                                    file_name='svm001.c',
-            #                                                    file_path='/home/seigyo/c_repo/c_repo/SoudenKeisei/SoudenKeisei/gs-svm/src/svm001/svm001.c',
+            #                                                    file_path='/home/seigyo/c_repo/bhavneek/c-visualizer/SoudenKeisei/SoudenKeisei/gs-svm/src/svm001/svm001.c',
             #                                                    is_external=True,
             #                                                    is_static=False,
             #                                                    macro_expansion=None,
@@ -105,7 +109,7 @@ def build_complete_call_graph(
             #                                end_byte=1577),
             #                       CallSite(callee=FunctionNode(name='mdm_addrec',
             #                                                    file_name='svm001.c',
-            #                                                    file_path='/home/seigyo/c_repo/c_repo/SoudenKeisei/SoudenKeisei/gs-svm/src/svm001/svm001.c',
+            #                                                    file_path='/home/seigyo/c_repo/bhavneek/c-visualizer/SoudenKeisei/SoudenKeisei/gs-svm/src/svm001/svm001.c',
             #                                                    is_external=True,
             #                                                    is_static=False,
             #                                                    macro_expansion=None,
@@ -117,7 +121,7 @@ def build_complete_call_graph(
             #                                end_byte=1999),
             #                       CallSite(callee=FunctionNode(name='svm_errmsg',
             #                                                    file_name='svm_errmsg.c',
-            #                                                    file_path='/home/seigyo/c_repo/c_repo/SoudenKeisei/SoudenKeisei/gs-svm/src/svm001/svm001_svminit.c',
+            #                                                    file_path='/home/seigyo/c_repo/bhavneek/c-visualizer/SoudenKeisei/SoudenKeisei/gs-svm/src/svm001/svm001_svminit.c',
             #                                                    is_external=False,
             #                                                    is_static=False,
             #                                                    macro_expansion=None,
@@ -130,7 +134,7 @@ def build_complete_call_graph(
 # registry
 #  'vprintf': FunctionNode(name='vprintf',
 #                          file_name='svm500_110704log.c',
-#                          file_path='/home/seigyo/c_repo/c_repo/SoudenKeisei/SoudenKeisei/gs-svm/src/libsvm4/svm500_110704log.c',
+#                          file_path='/home/seigyo/c_repo/bhavneek/c-visualizer/SoudenKeisei/SoudenKeisei/gs-svm/src/libsvm4/svm500_110704log.c',
 #                          is_external=True,
 #                          is_static=False,
 #                          macro_expansion=None,
@@ -138,7 +142,7 @@ def build_complete_call_graph(
 #                          end_line=-1),
 #  'vsprintf': FunctionNode(name='vsprintf',
 #                           file_name='svm_printf6one.c',
-#                           file_path='/home/seigyo/c_repo/c_repo/SoudenKeisei/SoudenKeisei/gs-svm/src/libsvm/svm_printf6one.c',
+#                           file_path='/home/seigyo/c_repo/bhavneek/c-visualizer/SoudenKeisei/SoudenKeisei/gs-svm/src/libsvm/svm_printf6one.c',
 #                           is_external=True,
 #                           is_static=False,
 #                           macro_expansion=None,
@@ -146,18 +150,18 @@ def build_complete_call_graph(
 #                           end_line=-1)}
 # macros
 #  'tst_f3_ctl': ('TST_F3_CTL',
-#                 '/home/seigyo/c_repo/c_repo/SoudenKeisei/SoudenKeisei/include/FILE/tst_f3_ctl.h',
+#                 '/home/seigyo/c_repo/bhavneek/c-visualizer/SoudenKeisei/SoudenKeisei/include/FILE/tst_f3_ctl.h',
 #                 'tst_f3_ctl'),
 #  'tst_init_ch': ('TST_INIT_CH',
-#                  '/home/seigyo/c_repo/c_repo/SoudenKeisei/SoudenKeisei/include/FILE/tst_init_ch.h',
+#                  '/home/seigyo/c_repo/bhavneek/c-visualizer/SoudenKeisei/SoudenKeisei/include/FILE/tst_init_ch.h',
 #                  'tst_init_ch'),
 #  'tst_siken': ('TST_SIKEN',
-#                '/home/seigyo/c_repo/c_repo/SoudenKeisei/SoudenKeisei/include/FILE/tst_siken.h',
+#                '/home/seigyo/c_repo/bhavneek/c-visualizer/SoudenKeisei/SoudenKeisei/include/FILE/tst_siken.h',
 #                'tst_siken'),
 #  'usr_print': ('usr_fname = __FILE__; \\\n'
 #                '\t\t\t\tusr_lineno = __LINE__; \\\n'
 #                '\t\t\t\tusr_print_in\t\t\t                           ',
-#                '/home/seigyo/c_repo/c_repo/SoudenKeisei/SoudenKeisei/modern/include/usr/usr_in.h',
+#                '/home/seigyo/c_repo/bhavneek/c-visualizer/SoudenKeisei/SoudenKeisei/modern/include/usr/usr_in.h',
 #                'usr_print')}
 
     # TODO: Get the shape of tree_objects 
@@ -174,17 +178,56 @@ def build_complete_file_functions(
     trees: dict[str, Any],
     file_functions: dict[str, dict[str, Any]],
 ) -> dict[str, dict[str, Any]]:
-    """Add definition ranges for headers without altering legacy analyzer state."""
-    from helpers.extract_functions_from_c import get_local_function_definitions
+    """Add definition ranges using the already-parsed Tree-sitter trees.
 
+    The legacy setup fills ``file_functions`` with libclang for source files.
+    Headers are intentionally absent there, so the old visualizer checkpoint
+    reparsed every missing header with libclang.  The call graph has already
+    parsed all of those files with Tree-sitter; reuse those trees instead of
+    starting another parser for thousands of headers.
+    """
     complete = {name: dict(definitions) for name, definitions in file_functions.items()}
-    for file_name, (_, source_bytes) in trees.items():
+    for file_name, (tree, source_bytes) in trees.items():
         if file_name not in complete:
-            complete[file_name] = get_local_function_definitions(
-                code_bytes=source_bytes,
-                file_name=file_name,
-            )
+            complete[file_name] = _tree_function_definitions(tree, source_bytes)
     return complete
+
+
+def _tree_function_definitions(tree: Any, source_bytes: bytes) -> dict[str, dict[str, Any]]:
+    """Extract the visualizer's range metadata without reparsing a file."""
+
+    def function_name(node: Any) -> str | None:
+        if node.type == "identifier":
+            return node.text.decode("latin-1", errors="replace")
+        for child in node.children:
+            if child.type in {
+                "function_declarator",
+                "pointer_declarator",
+                "parenthesized_declarator",
+                "identifier",
+            }:
+                name = function_name(child)
+                if name:
+                    return name
+        return None
+
+    definitions: dict[str, dict[str, Any]] = {}
+    stack = [tree.root_node]
+    while stack:
+        node = stack.pop()
+        if node.type == "function_definition":
+            declarator = node.child_by_field_name("declarator")
+            name = function_name(declarator) if declarator is not None else None
+            if name:
+                definitions[name] = {
+                    "name": name,
+                    "return_type": "",
+                    "line": node.start_point.row + 1,
+                    "start_line": node.start_point.row + 1,
+                    "end_line": node.end_point.row + 1,
+                }
+        stack.extend(reversed(node.children))
+    return definitions
 
 
 class VisualizerCollector:
@@ -200,6 +243,8 @@ class VisualizerCollector:
         project_structure: dict[str, str],
         file_functions: dict[str, dict[str, Any]],
         main_file_name: str | None,
+        entry_function_name: str | None = None,
+        entry_points: list[tuple[str, str]] | None = None,
         library_functions: set[str] | list[str] | None = None,
         run_id: str | None = None,
         results_root: Path | None = None,
@@ -209,6 +254,11 @@ class VisualizerCollector:
         self.project_structure = {name: str(path) for name, path in project_structure.items()}
         self.file_functions = file_functions
         self.main_file_name = main_file_name
+        self.entry_function_name = entry_function_name or "main"
+        self.entry_points = list(dict.fromkeys(
+            entry_points
+            or ([(main_file_name, self.entry_function_name)] if main_file_name else [])
+        ))
         self.library_functions = set(library_functions or [])
         self.run_id = run_id or datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
         self.results_root = results_root or get_visualizer_results_root()
@@ -220,6 +270,7 @@ class VisualizerCollector:
         self.interactions: dict[str, dict[str, Any]] = {}
         self.traces: dict[str, dict[str, Any]] = {}
         self._ids_by_name: dict[str, set[str]] = {}
+        self._fact_origins: dict[tuple[str, str, str, str], list[dict[str, Any]]] = {}
         self._run_dir: Path | None = None
         self._manifest_recorded = False
         self.source_files = self._capture_source_files()
@@ -233,29 +284,39 @@ class VisualizerCollector:
         if makefile.is_file():
             inputs[str(makefile.resolve())] = makefile
 
-        source_files = []
         process_root = Path(self.process_root).resolve()
-        for resolved_path, path in sorted(inputs.items()):
-            try:
-                content = path.read_text(encoding="latin-1", errors="replace")
-            except OSError:
-                continue
-            try:
-                relative_path = str(Path(resolved_path).relative_to(process_root))
-            except ValueError:
-                relative_path = None
-            source_files.append(
-                {
-                    "id": _stable_id("source", resolved_path),
-                    "path": resolved_path,
-                    "relative_path": relative_path,
-                    "file_name": path.name,
-                    "language": "make" if path.name.lower() == "makefile" else path.suffix.lstrip("."),
-                    "sha256": hashlib.sha256(content.encode("latin-1", errors="replace")).hexdigest(),
-                    "content": content,
-                }
+        items = sorted(inputs.items())
+        workers = min(4, max(1, len(items)))
+        with ThreadPoolExecutor(
+            max_workers=workers, thread_name_prefix="visualizer-sources"
+        ) as executor:
+            source_files = executor.map(
+                partial(self._capture_source_file, process_root), items
             )
-        return source_files
+            return [source_file for source_file in source_files if source_file is not None]
+
+    @staticmethod
+    def _capture_source_file(
+        process_root: Path, item: tuple[str, Path]
+    ) -> dict[str, Any] | None:
+        resolved_path, path = item
+        try:
+            content = path.read_text(encoding="latin-1", errors="replace")
+        except OSError:
+            return None
+        try:
+            relative_path = str(Path(resolved_path).relative_to(process_root))
+        except ValueError:
+            relative_path = None
+        return {
+            "id": _stable_id("source", resolved_path),
+            "path": resolved_path,
+            "relative_path": relative_path,
+            "file_name": path.name,
+            "language": "make" if path.name.lower() == "makefile" else path.suffix.lstrip("."),
+            "sha256": hashlib.sha256(content.encode("latin-1", errors="replace")).hexdigest(),
+            "content": content,
+        }
 
     def _source_for_node(self, node: Any) -> tuple[str | None, str | None]:
         if getattr(node, "is_external", False):
@@ -445,6 +506,31 @@ class VisualizerCollector:
                 candidates.append(call["source"])
         return candidates[0] if candidates else None
 
+    def _load_fact_origins(self) -> None:
+        """Load value-flow origins when this run has a facts.csv artifact."""
+        facts_path = process_results_dir(self.process_name) / "facts.csv"
+        if not facts_path.is_file():
+            return
+        try:
+            with facts_path.open("r", encoding="utf-8-sig", newline="") as handle:
+                for row in csv.DictReader(handle):
+                    key = (
+                        row.get("function_name", ""),
+                        row.get("target_site_file", ""),
+                        str(row.get("target_site_line", "")),
+                        str(row.get("arg_index", "")),
+                    )
+                    self._fact_origins.setdefault(key, []).append(
+                        {
+                            "source_file": row.get("source_file", ""),
+                            "source_line": row.get("source_line", ""),
+                            "source_expr": row.get("source_expr", ""),
+                            "origin_kind": row.get("origin_kind", ""),
+                        }
+                    )
+        except (OSError, csv.Error):
+            self._fact_origins = {}
+
     def record_combined(self, combined: dict[str, Any], argument_indices: list[int] | None) -> None:
         """Record one existing Combined result as function-to-resource evidence."""
         combined = _json_safe(combined)
@@ -492,6 +578,12 @@ class VisualizerCollector:
                 binding["argument_index"],
                 target.get("path_str", ""),
             )
+            origin_key = (
+                target_api,
+                str(source.get("path", "")),
+                str(source.get("line_number", "")),
+                str(binding["argument_index"]),
+            )
             self.interactions[interaction_id] = {
                 "id": interaction_id,
                 "function_id": caller_id,
@@ -504,6 +596,7 @@ class VisualizerCollector:
                 "path": target.get("path_str"),
                 "source": source,
                 "function_source": combined.get("function_name_src"),
+                "value_origins": self._fact_origins.get(origin_key, []),
             }
 
     def rehydrate_interactions(
@@ -522,6 +615,7 @@ class VisualizerCollector:
         if not csv_path.is_file():
             return 0
 
+        self._load_fact_origins()
         initial_count = len(self.interactions)
         with csv_path.open("r", encoding="utf-8-sig", newline="") as handle:
             for row in csv.DictReader(handle):
@@ -588,11 +682,28 @@ class VisualizerCollector:
         """Checkpoint this run; repeated writes update only this run's snapshot."""
         self._function_summary_fallbacks()
         process_id = _stable_id("process", self.process_name, self.process_root)
-        main_id = None
-        for function_id, function in self.functions.items():
-            if function["name"] == "main" and not function["is_external"]:
-                main_id = function_id
-                break
+        entry_records = []
+        for file_name, function_name in self.entry_points:
+            for function_id, function in self.functions.items():
+                if (
+                    function["name"] == function_name
+                    and not function["is_external"]
+                    and (
+                        function.get("file_name") == file_name
+                        or function.get("file")
+                        == str(self.project_structure.get(file_name, ""))
+                    )
+                ):
+                    entry_records.append(
+                        {
+                            "file": file_name,
+                            "function": function_name,
+                            "id": function_id,
+                        }
+                    )
+                    break
+
+        primary_entry = entry_records[0] if entry_records else None
 
         snapshot = {
             "schema_version": self.schema_version,
@@ -602,8 +713,10 @@ class VisualizerCollector:
                 "id": process_id,
                 "name": self.process_name,
                 "root": self.process_root,
-                "main_file": self.main_file_name,
-                "entry_function_id": main_id,
+                "main_file": primary_entry["file"] if primary_entry else self.main_file_name,
+                "entry_function": primary_entry["function"] if primary_entry else None,
+                "entry_function_id": primary_entry["id"] if primary_entry else None,
+                "entry_points": entry_records,
             },
             "functions": sorted(self.functions.values(), key=lambda item: (item["name"], item["id"])),
             "calls": sorted(self.calls.values(), key=lambda item: item["id"]),

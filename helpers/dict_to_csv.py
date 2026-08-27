@@ -6,6 +6,7 @@ from pathlib import Path
 import pandas as pd
 
 from state.state import State
+from output_paths import results_root
 
 
 def save_dict_csv(
@@ -21,7 +22,7 @@ def save_dict_csv(
     """
     project_state = State()
     if path_of_csv is None and save:
-        results_dir = Path("/home/seigyo/c_repo/c_repo/results/csv_results")
+        results_dir = results_root()
         results_dir.mkdir(exist_ok=True, parents=True)
         path_of_csv = results_dir / f"{project_state.get('PROJECT_NAME')}.csv"
     data_list = [data_dict] if isinstance(data_dict, dict) else data_dict

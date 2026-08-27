@@ -1,29 +1,28 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { fetchGraph, fetchRuns, wikiStatus } from "./api.js";
+import { fetchOverview, fetchRuns, wikiStatus } from "./api.js";
 import ChatPanel from "./components/ChatPanel.jsx";
 import GraphView from "./components/GraphView.jsx";
 import TopBar from "./components/TopBar.jsx";
-import { indexSnapshot, SCHEMA_VERSION } from "./graph/model.js";
 import useAsk from "./hooks/useAsk.js";
 import { useT } from "./i18n.jsx";
 
 const STR = {
   ja: {
     scanning: "スナップショットを検索中…",
-    loading: "グラフのスナップショットを読込中…",
+    loading: "プロセス／資源の概要を読込中…",
     empty: "スナップショットがない。解析パイプラインを実行してから再読込してください。",
     apiError: "API に接続できない: {error}",
-    loadError: "スナップショットを読み込めなかった。{details}",
-    unsupportedAll: "すべてのスナップショットが未対応のスキーマバージョンを使用している。",
+    loadError: "概要を読み込めなかった。{details}",
+    unsupportedAll: "選択されたスナップショットのすべてが未対応のスキーマバージョンを使用している。",
     askFunction: "`{name}` 関数の役割と呼び出し経路を説明して",
   },
   en: {
     scanning: "Scanning snapshots…",
-    loading: "Loading graph snapshots…",
+    loading: "Loading the process/resource overview…",
     empty: "No snapshots found. Run the analysis pipeline, then reload.",
     apiError: "Could not reach the API: {error}",
-    loadError: "No snapshot could be loaded. {details}",
-    unsupportedAll: "Every snapshot uses an unsupported schema version.",
+    loadError: "The overview could not be loaded. {details}",
+    unsupportedAll: "Every selected snapshot uses an unsupported schema version.",
     askFunction: "Explain the role and invocation paths of `{name}`",
   },
 };
@@ -60,7 +59,7 @@ export default function App() {
   const [loadState, setLoadState] = useState({ phase: "loading", code: "scanning" });
   const [runs, setRuns] = useState([]);
   const [selectedRuns, setSelectedRuns] = useState(new Map());
-  const [indexes, setIndexes] = useState([]);
+  const [overview, setOverview] = useState(null);
   const [unsupported, setUnsupported] = useState([]);
   const [wiki, setWiki] = useState(null);
   const [wikiError, setWikiError] = useState(null);
@@ -68,10 +67,10 @@ export default function App() {
   const askState = useAsk(selectedRuns);
 
   useEffect(() => {
-    let cancelled = false;
-    fetchRuns()
+    const controller = new AbortController();
+    fetchRuns(controller.signal)
       .then((payload) => {
-        if (cancelled) return;
+        if (controller.signal.aborted) return;
         const list = payload.runs || [];
         setRuns(list);
         if (list.length === 0) {
@@ -81,57 +80,45 @@ export default function App() {
         setSelectedRuns(chooseRuns(list));
       })
       .catch((error) => {
-        if (!cancelled) setLoadState({ phase: "error", code: "api", detail: error.message });
+        if (error.name !== "AbortError" && !controller.signal.aborted) {
+          setLoadState({ phase: "error", code: "api", detail: error.message });
+        }
       });
-    return () => {
-      cancelled = true;
-    };
+    return () => controller.abort();
   }, []);
 
+  // Startup request path: catalog + overview.  No process graph is loaded
+  // here; a ground click fetches one process at a time.
   useEffect(() => {
     if (selectedRuns.size === 0) return undefined;
-    let cancelled = false;
+    const controller = new AbortController();
     setLoadState({ phase: "loading", code: "loading" });
-
-    Promise.all(
-      [...selectedRuns.entries()].map(([processName, runId]) =>
-        fetchGraph(processName, runId)
-          .then((snapshot) => ({ processName, snapshot }))
-          .catch((error) => ({ processName, error })),
-      ),
-    ).then((results) => {
-      if (cancelled) return;
-      const loaded = [];
-      const badVersion = [];
-      const failed = [];
-      for (const result of results) {
-        if (result.error) {
-          failed.push(`${result.processName}: ${result.error.message}`);
-          continue;
+    fetchOverview([...selectedRuns.entries()], controller.signal)
+      .then((payload) => {
+        if (controller.signal.aborted) return;
+        const bad = payload.unsupported || [];
+        setUnsupported(
+          bad.map((item) => `${item.process_name} (schema_version ${item.schema_version})`),
+        );
+        if (!payload.processes?.length) {
+          setLoadState({
+            phase: "error",
+            code: bad.length ? "unsupported" : "empty",
+            detail: bad
+              .map((item) => `${item.process_name} (schema_version ${item.schema_version})`)
+              .join(", "),
+          });
+          return;
         }
-        if (result.snapshot.schema_version !== SCHEMA_VERSION) {
-          badVersion.push(`${result.processName} (schema_version ${result.snapshot.schema_version})`);
-          continue;
+        setOverview(payload);
+        setLoadState({ phase: "ready", code: "ready" });
+      })
+      .catch((error) => {
+        if (error.name !== "AbortError" && !controller.signal.aborted) {
+          setLoadState({ phase: "error", code: "load", detail: error.message });
         }
-        loaded.push(indexSnapshot(result.snapshot));
-      }
-      setUnsupported(badVersion);
-      if (loaded.length === 0) {
-        setLoadState({
-          phase: "error",
-          code: failed.length ? "load" : "unsupported",
-          detail: failed.join("; "),
-        });
-        return;
-      }
-      loaded.sort((a, b) => a.process.name.localeCompare(b.process.name));
-      setIndexes(loaded);
-      setLoadState({ phase: "ready", code: "ready" });
-    });
-
-    return () => {
-      cancelled = true;
-    };
+      });
+    return () => controller.abort();
   }, [selectedRuns]);
 
   useEffect(() => {
@@ -169,11 +156,14 @@ export default function App() {
     return { phase: loadState.phase, message };
   }, [loadState, t]);
 
-  const revealFunctions = useCallback((functionIds, edgeKeys = []) => {
-    if (!functionIds?.length) return;
-    setView("graph");
-    setRevealTarget({ functionIds, edgeKeys, nonce: Date.now() + Math.random() });
-  }, []);
+  const revealFunctions = useCallback(
+    (functionIds, edgeKeys = [], processName = null) => {
+      if (!functionIds?.length) return;
+      setView("graph");
+      setRevealTarget({ functionIds, edgeKeys, processName, nonce: Date.now() + Math.random() });
+    },
+    [],
+  );
 
   const askFunction = useCallback(
     (name) => {
@@ -214,7 +204,7 @@ export default function App() {
           onSelectRun={(processName, runId) =>
             setSelectedRuns((previous) => new Map(previous).set(processName, runId))
           }
-          indexes={indexes}
+          overview={overview}
           unsupported={unsupported}
           revealTarget={revealTarget}
           onAskFunction={askFunction}

@@ -26,25 +26,33 @@ function pathTarget(path) {
   return { functionIds, edgeKeys };
 }
 
+function citedProcess(evidence, functionId) {
+  const item = evidence?.cited?.find((entry) => entry.id === functionId);
+  return item?.process || item?.processes?.[0] || null;
+}
+
 export default function AnswerMarkdown({ text, evidence, onNavigate, onReveal, onShowGraph }) {
   const t = useT(STR);
 
   const revealCitation = (citation) => {
     if (citation.kind === "function") {
-      onReveal?.([citation.id]);
+      onReveal?.([citation.id], [], citedProcess(evidence, citation.id));
       return;
     }
     if (citation.kind === "path") {
       const path = evidence?.paths?.find((item) => item.id === citation.id);
       const target = pathTarget(path);
-      if (target.functionIds.length) onReveal?.(target.functionIds, target.edgeKeys);
+      if (target.functionIds.length) {
+        onReveal?.(target.functionIds, target.edgeKeys, path?.process || null);
+      }
       else onShowGraph?.();
       return;
     }
     if (citation.kind === "resource") {
       const resource = evidence?.resources?.find((item) => item.key === citation.id);
       const ids = (resource?.functions || []).map((fn) => fn.id).filter(Boolean);
-      if (ids.length) onReveal?.(ids);
+      const process = resource?.functions?.[0]?.process || resource?.processes?.[0] || null;
+      if (ids.length) onReveal?.(ids, [], process);
       else onShowGraph?.();
     }
   };

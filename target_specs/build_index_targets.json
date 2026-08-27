@@ -1,0 +1,209 @@
+{
+  "schema": "c-visualizer/target-spec",
+  "schema_version": 1,
+  "version": "build-index-registry-1.1",
+  "source_registry": "forkproc_checker/valueflow/registry.py (REGISTRY_VERSION 1.1)",
+  "note": "Compatibility copy of the 33 build-index targets. 'type', 'launch', 'indices', 'get_upper', 'dependent_functions', 'handle_index', 'close_functions' are consumed by the c-visualizer resolvers; 'discovery' is comparison-only metadata consumed by the discovery-index adapter.",
+  "lock_map": {
+    "MPF_MFS_READLOCK": "READ",
+    "MPF_MFS_WRITELOCK": "WRITE",
+    "MPF_MFS_FWRITELOCK": "FWRITE"
+  },
+  "targets": {
+    "mpf_mfs_openm_H": {
+      "type": "OPENMF", "launch": "FORK", "indices": [2], "get_upper": true,
+      "handle_index": 1, "dependent_functions": [],
+      "discovery": { "resource": "mfs_file", "arg_operations": { "2": "OPEN_LOCK" }, "lock_arg": 4 }
+    },
+    "mpf_mfs_open_H": {
+      "type": "OPENMF", "launch": "FORK", "indices": [2], "get_upper": true,
+      "handle_index": 1, "dependent_functions": [],
+      "discovery": { "resource": "mfs_file", "arg_operations": { "2": "OPEN_LOCK" }, "lock_arg": 5 }
+    },
+    "mpf_mfs_openm": {
+      "type": "OPENMF", "launch": "FORK", "indices": [3], "get_upper": true,
+      "handle_index": 1, "dependent_functions": [],
+      "discovery": { "resource": "mfs_file", "arg_operations": { "3": "OPEN_LOCK" }, "lock_arg": 5 }
+    },
+    "mpf_mfs_open": {
+      "type": "OPENMF", "launch": "FORK", "indices": [3], "get_upper": true,
+      "handle_index": 1, "dependent_functions": [],
+      "discovery": { "resource": "mfs_file", "arg_operations": { "3": "OPEN_LOCK" }, "lock_arg": 6 }
+    },
+
+    "mpf_mfs_clearfile": {
+      "type": "CLEARF", "launch": "FORK", "indices": [1], "get_upper": true,
+      "dependent_functions": [],
+      "discovery": { "resource": "mfs_file", "arg_operations": { "1": "CLEAR" } }
+    },
+    "mpf_mfs_clearcc": {
+      "type": "CLEARF", "launch": "FORK", "indices": [1], "get_upper": true,
+      "dependent_functions": [],
+      "discovery": { "resource": "mfs_file", "arg_operations": { "1": "CLEAR" } }
+    },
+
+    "mpf_mfs_copyfile": {
+      "type": "COPYF", "launch": "FORK", "indices": [2, 6], "get_upper": true,
+      "dependent_functions": [],
+      "discovery": { "resource": "mfs_file", "arg_operations": { "2": "COPYFILE_FROM", "6": "COPYFILE_TO" } }
+    },
+    "mpf_mfs_copyfile_H": {
+      "type": "COPYF", "launch": "FORK", "indices": [2, 6], "get_upper": true,
+      "dependent_functions": [],
+      "discovery": { "resource": "mfs_file", "arg_operations": { "2": "COPYFILE_FROM", "6": "COPYFILE_TO" } }
+    },
+    "mpf_mfs_copyrec": {
+      "type": "COPYF", "launch": "FORK", "indices": [2, 8], "get_upper": true,
+      "dependent_functions": [],
+      "discovery": { "resource": "mfs_file", "arg_operations": { "2": "COPYREC_FROM", "8": "COPYREC_TO" } }
+    },
+    "mpf_mfs_copyrec_H": {
+      "type": "COPYF", "launch": "FORK", "indices": [2, 8], "get_upper": true,
+      "dependent_functions": [],
+      "discovery": { "resource": "mfs_file", "arg_operations": { "2": "COPYREC_FROM", "8": "COPYREC_TO" } }
+    },
+
+    "mpf_mfs_getrec": {
+      "type": "RECF", "launch": "FORK", "indices": [], "get_upper": true,
+      "handle_index": 1,
+      "dependent_functions": ["mpf_mfs_open_H", "mpf_mfs_openm_H", "mpf_mfs_open", "mpf_mfs_openm"],
+      "close_functions": ["mpf_mfs_close", "mpf_mfs_closeall"],
+      "discovery": { "resource": "mfs_file", "arg_operations": { "1": "GETREC" } }
+    },
+    "mpf_mfs_getrec_D": {
+      "type": "RECF", "launch": "FORK", "indices": [], "get_upper": true,
+      "handle_index": 1,
+      "dependent_functions": ["mpf_mfs_open_H", "mpf_mfs_openm_H", "mpf_mfs_open", "mpf_mfs_openm"],
+      "close_functions": ["mpf_mfs_close", "mpf_mfs_closeall"],
+      "discovery": { "resource": "mfs_file", "arg_operations": { "1": "GETREC_D" } }
+    },
+    "mpf_mfs_getrecm": {
+      "type": "RECF", "launch": "FORK", "indices": [], "get_upper": true,
+      "handle_index": 1,
+      "dependent_functions": ["mpf_mfs_open_H", "mpf_mfs_openm_H", "mpf_mfs_open", "mpf_mfs_openm"],
+      "close_functions": ["mpf_mfs_close", "mpf_mfs_closeall"],
+      "discovery": { "resource": "mfs_file", "arg_operations": { "1": "GETREC" } }
+    },
+    "mpf_mfs_updaterec": {
+      "type": "RECF", "launch": "FORK", "indices": [], "get_upper": true,
+      "handle_index": 1,
+      "dependent_functions": ["mpf_mfs_open_H", "mpf_mfs_openm_H", "mpf_mfs_open", "mpf_mfs_openm"],
+      "close_functions": ["mpf_mfs_close", "mpf_mfs_closeall"],
+      "discovery": { "resource": "mfs_file", "arg_operations": { "1": "UPDATEREC" } }
+    },
+    "mpf_mfs_updaterec_D": {
+      "type": "RECF", "launch": "FORK", "indices": [], "get_upper": true,
+      "handle_index": 1,
+      "dependent_functions": ["mpf_mfs_open_H", "mpf_mfs_openm_H", "mpf_mfs_open", "mpf_mfs_openm"],
+      "close_functions": ["mpf_mfs_close", "mpf_mfs_closeall"],
+      "discovery": { "resource": "mfs_file", "arg_operations": { "1": "UPDATEREC_D" } }
+    },
+    "mpf_mfs_updaterecm": {
+      "type": "RECF", "launch": "FORK", "indices": [], "get_upper": true,
+      "handle_index": 1,
+      "dependent_functions": ["mpf_mfs_open_H", "mpf_mfs_openm_H", "mpf_mfs_open", "mpf_mfs_openm"],
+      "close_functions": ["mpf_mfs_close", "mpf_mfs_closeall"],
+      "discovery": { "resource": "mfs_file", "arg_operations": { "1": "UPDATEREC" } }
+    },
+    "mpf_mfs_readrec": {
+      "type": "RECF", "launch": "FORK", "indices": [], "get_upper": true,
+      "handle_index": 1,
+      "dependent_functions": ["mpf_mfs_open_H", "mpf_mfs_openm_H", "mpf_mfs_open", "mpf_mfs_openm"],
+      "close_functions": ["mpf_mfs_close", "mpf_mfs_closeall"],
+      "discovery": { "resource": "mfs_file", "arg_operations": { "1": "READREC" } }
+    },
+    "mpf_mfs_readrecm": {
+      "type": "RECF", "launch": "FORK", "indices": [], "get_upper": true,
+      "handle_index": 1,
+      "dependent_functions": ["mpf_mfs_open_H", "mpf_mfs_openm_H", "mpf_mfs_open", "mpf_mfs_openm"],
+      "close_functions": ["mpf_mfs_close", "mpf_mfs_closeall"],
+      "discovery": { "resource": "mfs_file", "arg_operations": { "1": "READREC" } }
+    },
+    "mpf_mfs_readrecn": {
+      "type": "RECF", "launch": "FORK", "indices": [], "get_upper": true,
+      "handle_index": 1,
+      "dependent_functions": ["mpf_mfs_open_H", "mpf_mfs_openm_H", "mpf_mfs_open", "mpf_mfs_openm"],
+      "close_functions": ["mpf_mfs_close", "mpf_mfs_closeall"],
+      "discovery": { "resource": "mfs_file", "arg_operations": { "1": "READREC" } }
+    },
+    "mpf_mfs_writerec": {
+      "type": "RECF", "launch": "FORK", "indices": [], "get_upper": true,
+      "handle_index": 1,
+      "dependent_functions": ["mpf_mfs_open_H", "mpf_mfs_openm_H", "mpf_mfs_open", "mpf_mfs_openm"],
+      "close_functions": ["mpf_mfs_close", "mpf_mfs_closeall"],
+      "discovery": { "resource": "mfs_file", "arg_operations": { "1": "WRITEREC" } }
+    },
+    "mpf_mfs_writerecm": {
+      "type": "RECF", "launch": "FORK", "indices": [], "get_upper": true,
+      "handle_index": 1,
+      "dependent_functions": ["mpf_mfs_open_H", "mpf_mfs_openm_H", "mpf_mfs_open", "mpf_mfs_openm"],
+      "close_functions": ["mpf_mfs_close", "mpf_mfs_closeall"],
+      "discovery": { "resource": "mfs_file", "arg_operations": { "1": "WRITEREC" } }
+    },
+    "mpf_mfs_writerecn": {
+      "type": "RECF", "launch": "FORK", "indices": [], "get_upper": true,
+      "handle_index": 1,
+      "dependent_functions": ["mpf_mfs_open_H", "mpf_mfs_openm_H", "mpf_mfs_open", "mpf_mfs_openm"],
+      "close_functions": ["mpf_mfs_close", "mpf_mfs_closeall"],
+      "discovery": { "resource": "mfs_file", "arg_operations": { "1": "WRITEREC" } }
+    },
+
+    "mpf_mfs_addque_H": {
+      "type": "QUEUEF", "launch": "FORK", "indices": [1], "get_upper": true,
+      "dependent_functions": [],
+      "discovery": { "resource": "mfs_queue", "arg_operations": { "1": "ADDQUE" } }
+    },
+    "mpf_mfs_addque": {
+      "type": "QUEUEF", "launch": "FORK", "indices": [2], "get_upper": true,
+      "dependent_functions": [],
+      "discovery": { "resource": "mfs_queue", "arg_operations": { "2": "ADDQUE" } }
+    },
+    "mpf_mfs_delque_H": {
+      "type": "QUEUEF", "launch": "FORK", "indices": [1], "get_upper": true,
+      "dependent_functions": [],
+      "discovery": { "resource": "mfs_queue", "arg_operations": { "1": "DELQUE" } }
+    },
+    "mpf_mfs_delque": {
+      "type": "QUEUEF", "launch": "FORK", "indices": [2], "get_upper": true,
+      "dependent_functions": [],
+      "discovery": { "resource": "mfs_queue", "arg_operations": { "2": "DELQUE" } }
+    },
+
+    "pmf_forkproc_H": {
+      "type": "FORKF", "launch": "FORK", "indices": [1], "get_upper": true,
+      "dependent_functions": [],
+      "discovery": { "resource": "forkproc", "arg_operations": { "1": "FORKPROC" } }
+    },
+    "pmf_forkproc_setonsub_H": {
+      "type": "FORKF", "launch": "FORK", "indices": [1], "get_upper": true,
+      "dependent_functions": [],
+      "discovery": { "resource": "forkproc", "arg_operations": { "1": "FORKPROC" } }
+    },
+    "pmf_forkprocdup_H": {
+      "type": "FORKF", "launch": "FORK", "indices": [1], "get_upper": true,
+      "dependent_functions": [],
+      "discovery": { "resource": "forkproc", "arg_operations": { "1": "FORKPROC" } }
+    },
+    "pmf_forkprocbs_H": {
+      "type": "FORKF", "launch": "FORK", "indices": [1], "get_upper": true,
+      "dependent_functions": [],
+      "discovery": { "resource": "forkproc", "arg_operations": { "1": "FORKPROC" } }
+    },
+    "pmf_forkprocbs_setonsub_H": {
+      "type": "FORKF", "launch": "FORK", "indices": [1], "get_upper": true,
+      "dependent_functions": [],
+      "discovery": { "resource": "forkproc", "arg_operations": { "1": "FORKPROC" } }
+    },
+
+    "mpf_mfs_close": {
+      "type": "CLOSEF", "launch": "FORK", "indices": [], "get_upper": true,
+      "handle_index": 1, "dependent_functions": [],
+      "discovery": { "resource": "none" }
+    },
+    "mpf_mfs_closeall": {
+      "type": "CLOSEF", "launch": "FORK", "indices": [], "get_upper": true,
+      "handle_index": 1, "dependent_functions": [],
+      "discovery": { "resource": "none" }
+    }
+  }
+}

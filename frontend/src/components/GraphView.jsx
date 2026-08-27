@@ -1,25 +1,46 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { deriveOverview } from "../graph/model.js";
+import { fetchLibrary, fetchProcess } from "../api.js";
+import { indexSnapshot } from "../graph/model.js";
 import { layoutOverview } from "../graph/layout.js";
 import { prepareProcess } from "../graph/prepare.js";
 import SceneManager from "../scene/SceneManager.js";
 import CanvasOverlay from "./CanvasOverlay.jsx";
 import Inspector from "./Inspector.jsx";
 
+const PROCESS_SEP = "\u0000";
+
+const runKeyOf = (processName, runId) => `${processName}${PROCESS_SEP}${runId}`;
+const libraryKeyOf = (name) => `library${PROCESS_SEP}${name}`;
+
+/**
+ * Lazy graph view.
+ *
+ * The ground plane comes entirely from the server overview (one compact
+ * request).  Clicking a process fetches exactly that process's structural
+ * bundle; function details and source follow the same on-demand rule.  Bundles
+ * live only while their plane is open: when SceneManager closes a plane
+ * (explicitly or by FIFO eviction) the bundle, its prepared tree/DAG and any
+ * pending request for it are released here.
+ */
 export default function GraphView({
   active,
   status,
   runs,
   selectedRuns,
   onSelectRun,
-  indexes,
+  overview,
   unsupported,
   revealTarget,
   onAskFunction,
 }) {
   const containerRef = useRef(null);
   const sceneRef = useRef(null);
-  const preparedCache = useRef(new Map());
+  const indexesRef = useRef(new Map()); // key -> indexSnapshot(bundle)
+  const requestsRef = useRef(new Map()); // key -> {promise, controller}
+  const preparedRef = useRef(new Map()); // `${key}|${mode}|${iso}` -> prepared plane
+  const planeKeysRef = useRef(new Map()); // processName -> key of its loaded bundle
+  const rebuildingRef = useRef(false);
+  const [planeStates, setPlaneStates] = useState({}); // key -> {status, process, runId, error}
   const [openPlanes, setOpenPlanes] = useState([]);
   const [selection, setSelection] = useState(null);
   const [edgeVisibility, setEdgeVisibility] = useState({});
@@ -27,29 +48,38 @@ export default function GraphView({
   const [layoutMode, setLayoutMode] = useState("tree");
   const [showIsolated, setShowIsolated] = useState(false);
 
-  const overview = useMemo(() => (indexes.length ? deriveOverview(indexes) : null), [indexes]);
-  const overviewLayout = useMemo(() => (overview ? layoutOverview(overview) : null), [overview]);
+  // Normalize the wire overview for the scene: resourceAlias is a Map there.
+  const sceneOverview = useMemo(() => {
+    if (!overview) return null;
+    return {
+      processes: overview.processes,
+      resources: overview.resources,
+      edges: overview.edges,
+      resourceAlias: new Map(Object.entries(overview.resource_aliases || {})),
+    };
+  }, [overview]);
+
+  const overviewLayout = useMemo(
+    () => (sceneOverview ? layoutOverview(sceneOverview) : null),
+    [sceneOverview],
+  );
+
   const processIndexById = useMemo(() => {
     const map = new Map();
-    indexes.forEach((index, position) => map.set(index.process.name, position));
+    (sceneOverview?.processes || []).forEach((node, position) => map.set(node.name, position));
     return map;
-  }, [indexes]);
-  const processByFunctionId = useMemo(() => {
-    const map = new Map();
-    for (const index of indexes) {
-      for (const id of index.functions.keys()) map.set(id, index.process.name);
-    }
-    return map;
-  }, [indexes]);
+  }, [sceneOverview]);
 
-  /**
-   * Function names that some loaded process actually calls. A never-called
-   * function is hidden on its own plane, but reappears once another open
-   * process turns out to use that name.
-   */
-  const sharedNames = useMemo(() => {
+  const selectionKey = overview?.selection_key || null;
+
+  const setPlaneState = useCallback((key, patch) => {
+    setPlaneStates((previous) => ({ ...previous, [key]: { ...previous[key], ...patch } }));
+  }, []);
+
+  /** Function names that some already-loaded plane actually calls. */
+  const sharedNames = useCallback(() => {
     const names = new Set();
-    for (const index of indexes) {
+    for (const index of indexesRef.current.values()) {
       for (const call of index.calls) {
         const source = index.functions.get(call.source);
         const target = index.functions.get(call.target);
@@ -58,24 +88,99 @@ export default function GraphView({
       }
     }
     return names;
-  }, [indexes]);
+  }, []);
 
-  const preparedFor = useCallback(
-    (processName) => {
-      if (!processName) return null;
-      const key = `${processName}|${layoutMode}|${showIsolated ? 1 : 0}`;
-      if (!preparedCache.current.has(key)) {
-        const index = indexes.find((entry) => entry.process.name === processName);
-        if (!index) return null;
-        preparedCache.current.set(
-          key,
-          prepareProcess(index, { mode: layoutMode, showIsolated, sharedNames }),
-        );
-      }
-      return preparedCache.current.get(key);
+  const prepareForIndex = useCallback(
+    (key, index) => {
+      const cacheKey = `${key}|${layoutMode}|${showIsolated ? 1 : 0}`;
+      const cached = preparedRef.current.get(cacheKey);
+      if (cached) return cached;
+      const prepared = prepareProcess(index, {
+        mode: layoutMode,
+        showIsolated,
+        sharedNames: sharedNames(),
+      });
+      if (prepared) preparedRef.current.set(cacheKey, prepared);
+      return prepared;
     },
-    [indexes, layoutMode, showIsolated, sharedNames],
+    [layoutMode, showIsolated, sharedNames],
   );
+
+  /** Fetch (or reuse) the structural bundle for one process/library plane. */
+  const ensureBundle = useCallback(
+    (name, { isLibrary = false, runId = null } = {}) => {
+      const key = isLibrary ? libraryKeyOf(name) : runKeyOf(name, runId);
+      const existingIndex = indexesRef.current.get(key);
+      if (existingIndex) {
+        return Promise.resolve({ key, index: existingIndex, controller: null });
+      }
+      const existing = requestsRef.current.get(key);
+      if (existing) {
+        return existing.promise.then((index) => ({ key, index, controller: existing.controller }));
+      }
+      const controller = new AbortController();
+      const request = (isLibrary
+        ? fetchLibrary(name, selectionKey, controller.signal)
+        : fetchProcess(name, runId, controller.signal)
+      )
+        .then((bundle) => {
+          const index = indexSnapshot(bundle);
+          indexesRef.current.set(key, index);
+          setPlaneState(key, { status: "ready", process: bundle.process, runId: bundle.process.run_id || runId });
+          return index;
+        })
+        .catch((error) => {
+          if (error.name !== "AbortError") {
+            setPlaneState(key, { status: "error", error: error.message });
+          }
+          throw error;
+        })
+        .finally(() => {
+          requestsRef.current.delete(key);
+        });
+      requestsRef.current.set(key, { promise: request, controller });
+      return request.then((index) => ({ key, index, controller }));
+    },
+    [selectionKey, setPlaneState],
+  );
+
+  /** Synchronous release of everything belonging to one (process, run) plane. */
+  const releaseKey = useCallback(
+    (key) => {
+      const pending = requestsRef.current.get(key);
+      if (pending) {
+        pending.controller.abort();
+        requestsRef.current.delete(key);
+      }
+      indexesRef.current.delete(key);
+      for (const cacheKey of [...preparedRef.current.keys()]) {
+        if (cacheKey.startsWith(`${key}|`)) preparedRef.current.delete(cacheKey);
+      }
+      // The compact process header is kept (it is tiny) so the Inspector can
+      // still describe the process; the bundle itself is gone.
+      setPlaneStates((previous) => {
+        if (!(key in previous)) return previous;
+        const next = { ...previous };
+        const kept = next[key];
+        next[key] = kept.status === "ready" ? { status: "ready", process: kept.process, runId: kept.runId } : next[key];
+        return next;
+      });
+      setSelection((current) => {
+        const name = current?.processName || current?.process?.name;
+        if (!name) return current;
+        const mapped = planeKeysRef.current.get(name);
+        const isSelectionsPlane =
+          (mapped && mapped === key) || key === libraryKeyOf(name) || key.startsWith(`${name}${PROCESS_SEP}`);
+        return isSelectionsPlane ? null : current;
+      });
+    },
+    [setPlaneStates],
+  );
+
+  const releaseRef = useRef(releaseKey);
+  useEffect(() => {
+    releaseRef.current = releaseKey;
+  }, [releaseKey]);
 
   const handleSelect = useCallback(
     (pick) => {
@@ -83,13 +188,30 @@ export default function GraphView({
         setSelection(null);
         return;
       }
-      if (pick.type === "process") {
-        const prepared = preparedFor(pick.process.name);
-        if (prepared) sceneRef.current?.openProcess(prepared, processIndexById);
+      if (pick.type !== "process") {
+        setSelection(pick);
+        return;
       }
       setSelection(pick);
+      const name = pick.process.name;
+      const isLibrary = pick.process.type === "library";
+      const runId = isLibrary ? null : selectedRuns.get(name);
+      if (!isLibrary && !runId) return;
+      const scene = sceneRef.current;
+      if (scene?.planes.has(name)) return; // already raised
+      const key = isLibrary ? libraryKeyOf(name) : runKeyOf(name, runId);
+      planeKeysRef.current.set(name, key);
+      setPlaneState(key, { status: "loading" });
+      ensureBundle(name, { isLibrary, runId })
+        .then(({ index, controller }) => {
+          // A closed/evicted plane must not be repopulated by a late response.
+          if (controller?.signal.aborted || planeKeysRef.current.get(name) !== key) return;
+          const prepared = prepareForIndex(key, index);
+          if (prepared && sceneRef.current) sceneRef.current.openProcess(prepared, processIndexById);
+        })
+        .catch(() => {});
     },
-    [preparedFor, processIndexById],
+    [ensureBundle, prepareForIndex, processIndexById, selectedRuns, setPlaneState],
   );
 
   const handleSelectRef = useRef(handleSelect);
@@ -101,22 +223,26 @@ export default function GraphView({
     if (!containerRef.current || sceneRef.current) return undefined;
     sceneRef.current = new SceneManager(containerRef.current, {
       onSelect: (pick) => handleSelectRef.current(pick),
-      onPlanesChanged: setOpenPlanes,
+      onPlanesChanged: (openNames) => {
+        if (!rebuildingRef.current) {
+          for (const [name, key] of [...planeKeysRef.current]) {
+            if (!openNames.includes(name)) {
+              planeKeysRef.current.delete(name);
+              releaseRef.current(key);
+            }
+          }
+        }
+        setOpenPlanes(openNames);
+      },
     });
-    setEdgeVisibility({ ...sceneRef.current.edgeVisibility });
     return () => {
       sceneRef.current?.dispose();
       sceneRef.current = null;
     };
   }, []);
 
-  useEffect(() => {
-    preparedCache.current.clear();
-  }, [indexes]);
-
-  // Switching the plane shape (or revealing never-called functions) rebuilds
-  // whatever is already raised, so the toggle acts on what the user is looking
-  // at instead of only on the next process they open.
+  // Switching the plane shape rebuilds whatever is already raised from the
+  // still-loaded bundles; the toggle acts on what the user is looking at.
   const rebuiltOnce = useRef(false);
   useEffect(() => {
     const scene = sceneRef.current;
@@ -125,54 +251,92 @@ export default function GraphView({
       rebuiltOnce.current = true;
       return;
     }
+    preparedRef.current.clear();
     const open = [...scene.planes.keys()];
-    for (const processName of open) scene.closeProcess(processName);
-    for (const processName of open) {
-      const prepared = preparedFor(processName);
-      if (prepared) scene.openProcess(prepared, processIndexById);
+    if (open.length === 0) return;
+    rebuildingRef.current = true;
+    try {
+      for (const name of open) scene.closeProcess(name);
+      for (const name of open) {
+        const key = planeKeysRef.current.get(name);
+        const index = key && indexesRef.current.get(key);
+        if (!index) continue;
+        const prepared = prepareForIndex(key, index);
+        if (prepared) scene.openProcess(prepared, processIndexById);
+      }
+    } finally {
+      rebuildingRef.current = false;
     }
-    // Only the two toggles: reacting to `preparedFor` identity would reopen
-    // planes on every unrelated re-render.
-  }, [layoutMode, showIsolated]);
+  }, [layoutMode, showIsolated, prepareForIndex, processIndexById]);
 
+  // A new overview means a new selection: release every plane and its bundle,
+  // then raise the ground. Closed processes are refetched only on click.
   useEffect(() => {
-    if (!sceneRef.current || !overview || !overviewLayout) return;
-    sceneRef.current.setOverview(overview, overviewLayout);
-    sceneRef.current.setHighlights({});
-    setOpenPlanes([]);
+    const scene = sceneRef.current;
+    if (!scene || !sceneOverview || !overviewLayout) return;
+    scene.collapseAll();
+    scene.setOverview(sceneOverview, overviewLayout);
+    scene.setHighlights({});
     setSelection(null);
-  }, [overview, overviewLayout]);
+    setPlaneStates((previous) => {
+      const next = {};
+      for (const [key, state] of Object.entries(previous)) {
+        if (state.status === "ready") next[key] = { status: "ready", process: state.process, runId: state.runId };
+      }
+      return next;
+    });
+  }, [sceneOverview, overviewLayout]);
 
+  // Chat citation reveal: fetch exactly the cited process's plane, then
+  // highlight.  It must not force every process graph to load.
   useEffect(() => {
     const scene = sceneRef.current;
     const target = revealTarget;
-    if (!scene || !target?.functionIds?.length) return;
+    if (!scene || !target?.functionIds?.length || !sceneOverview) return undefined;
+    const name = target.processName;
+    const runId = name && selectedRuns.get(name);
+    if (!name || !runId) return undefined;
+    let cancelled = false;
+    const key = runKeyOf(name, runId);
+    ensureBundle(name, { runId })
+      .then(({ index, controller }) => {
+        if (cancelled || controller?.signal.aborted) return;
+        if (!scene.planes.has(name) || scene.planes.size > 1) scene.collapseAll();
+        if (!scene.planes.has(name)) {
+          const prepared = prepareForIndex(key, index);
+          if (!prepared) return;
+          planeKeysRef.current.set(name, key);
+          scene.openProcess(prepared, processIndexById);
+        }
+        scene.focusPlane(name);
+        scene.setHighlights({
+          answerIds: new Set(target.functionIds),
+          answerEdgeKeys: new Set(target.edgeKeys || []),
+        });
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [revealTarget, sceneOverview, selectedRuns, ensureBundle, prepareForIndex, processIndexById]);
 
-    const primary = target.functionIds[0];
-    const processName = processByFunctionId.get(primary);
-    const prepared = processName && preparedFor(processName);
-    if (!prepared) return;
-
-    // Reset first. Revealing a citation is a jump to one place, not an
-    // addition to whatever the user was already looking at — without this a
-    // second reveal leaves the previous process open and the two planes drop
-    // into the facing layout, which is not what "show me this function" means.
-    if (!scene.planes.has(processName) || scene.planes.size > 1) {
-      scene.collapseAll();
-    }
-    if (!scene.planes.has(processName)) scene.openProcess(prepared, processIndexById);
-    scene.focusPlane(processName);
-    scene.setHighlights({
-      answerIds: new Set(target.functionIds),
-      answerEdgeKeys: new Set(target.edgeKeys || []),
-    });
-  }, [revealTarget, processByFunctionId, processIndexById, preparedFor]);
-
-  const selectedIndex = useMemo(() => {
+  // Inspector context for the currently selected element.
+  const selectionContext = useMemo(() => {
     if (!selection) return null;
     const name = selection.processName || selection.process?.name;
-    return indexes.find((entry) => entry.process.name === name) || null;
-  }, [selection, indexes]);
+    if (!name || !sceneOverview) return null;
+    const isLibrary = sceneOverview.processes.find((node) => node.name === name)?.type === "library";
+    const key = isLibrary ? libraryKeyOf(name) : runKeyOf(name, selectedRuns.get(name));
+    const state = planeStates[key];
+    return {
+      name,
+      isLibrary,
+      node: sceneOverview.processes.find((node) => node.name === name) || null,
+      state,
+      index: indexesRef.current.get(key) || null,
+      runId: state?.runId || (isLibrary ? null : selectedRuns.get(name) || null),
+    };
+  }, [selection, sceneOverview, selectedRuns, planeStates]);
 
   return (
     <div
@@ -181,7 +345,7 @@ export default function GraphView({
         active ? "z-10 opacity-100" : "pointer-events-none z-0 opacity-0"
       }`}
     >
-      <div className="relative min-w-0 flex-1">
+      <div className="relative z-0 min-w-0 w-0 flex-1 overflow-hidden">
         <div ref={containerRef} className="absolute inset-0" />
         <CanvasOverlay
           status={status}
@@ -217,12 +381,7 @@ export default function GraphView({
         />
       </div>
 
-      <Inspector
-        selection={selection}
-        index={selectedIndex}
-        runId={selectedIndex ? selectedRuns.get(selectedIndex.process.name) : null}
-        onAskFunction={onAskFunction}
-      />
+      <Inspector selection={selection} processInfo={selectionContext} onAskFunction={onAskFunction} />
     </div>
   );
 }

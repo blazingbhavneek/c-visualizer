@@ -101,6 +101,11 @@ class Combined(aiDetermined):
         "LOADQ",
         "CLEARQ",
         "CLOSEF",
+        # build-index registry family names (target_specs/build_index_targets.json)
+        "OPENMF",
+        "RECF",
+        "QUEUEF",
+        "FORKF",
         "NOT_FILE_OR_QUEUE_OP",
         "EVENT",
         "MESSAGE",

@@ -63,6 +63,39 @@ call trees. To display only that pinned system:
 .venv/bin/python frontend/server.py --group production-line
 ```
 
+Folder/list runs also produce a whole-repository build-index-shaped directory
+when `--source-root` is supplied (or when `--process-folder` itself is the
+repository root). The per-process `index/` directories remain available for
+resolver-by-resolver inspection; the aggregate directory is
+`<results-root>/index/` and contains the canonical structural indexes plus
+the union of successful c-visualizer discoveries:
+
+```bash
+VISUALIZER_RESULTS_ROOT=/tmp/chukyu-cvisualizer/results \
+.venv/bin/python project_aware.py \
+  --process-folder /home/chukyu \
+  --targets target_specs/build_index_targets.json \
+  --source-root /home/chukyu \
+  --resolver valueflow \
+  --skip-function-summaries \
+  --continue-on-error
+```
+
+This writes `results/index/` with the 16 JSON artifacts produced by
+`forkproc_checker/build_index.py`, `discovery_facts.csv`, aggregate metadata,
+and the rebuilt `graph.json`. The structural scan runs with `--no-valueflow`
+so the discovery records in this directory are the c-visualizer resolver's
+records, not a second value-flow merge. Compare the aggregate directly with
+the regex reference:
+
+```bash
+.venv/bin/python tools/compare_discovery.py \
+  --cvisualizer-index /tmp/chukyu-cvisualizer/results/index \
+  --build-index /home/seigyo/c-parse/source_research_tool-linux/forkproc_checker/index_chukyu_no_llm \
+  --source-root /home/chukyu \
+  --all-reference
+```
+
 `--index-only` is useful for checking complete source/function coverage, but it
 intentionally stops before target-variable tracing and therefore will not add
 daemon-resource interactions. Omit it for the real multi-process interaction

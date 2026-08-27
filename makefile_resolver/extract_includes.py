@@ -145,7 +145,7 @@ def _find_include(
         return candidate
 
     # 2 — walk the -I include directories
-    include_dirs.append(Path("/home/seigyo/c_repo/c_repo/src/moove_header"))
+    include_dirs.append(Path("/home/seigyo/c_repo/bhavneek/c-visualizer/src/moove_header"))
     for path in include_dirs:
         c_and_h_files = [
             file
@@ -185,7 +185,7 @@ def resolve(
     """
     # print(f"DEBUG: include_dirs received = {include_dirs}, type = {type(include_dirs)}")
 
-    include_dirs.append(Path("/home/seigyo/c_repo/c_repo/src/moove_header"))
+    include_dirs.append(Path("/home/seigyo/c_repo/bhavneek/c-visualizer/src/moove_header"))
     # pprint(include_dirs)
     index = IncludeIndex(include_dirs=include_dirs)
     # ── bookkeeping ──────────────────────────────────────────

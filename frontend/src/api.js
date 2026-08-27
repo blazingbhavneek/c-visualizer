@@ -1,8 +1,8 @@
 const jsonHeaders = { Accept: "application/json" };
 const postJsonHeaders = { ...jsonHeaders, "Content-Type": "application/json" };
 
-async function getJson(url) {
-  const response = await fetch(url, { headers: jsonHeaders, cache: "no-store" });
+async function getJson(url, signal) {
+  const response = await fetch(url, { headers: jsonHeaders, cache: "no-store", signal });
   const body = await response.json().catch(() => null);
   if (!response.ok) {
     const error = new Error(body?.error || `Request failed (${response.status})`);
@@ -13,29 +13,51 @@ async function getJson(url) {
   return body;
 }
 
-export function fetchRuns() {
-  return getJson("/api/runs");
+export function fetchRuns(signal) {
+  return getJson("/api/runs", signal);
 }
 
-export function fetchGraph(processName, runId) {
+/**
+ * Compact ground-plane data for one run selection. This is the ONLY request
+ * that touches every process; process planes load lazily afterwards.
+ */
+export function fetchOverview(selection, signal) {
+  return postJson("/api/overview", { selection }, signal);
+}
+
+/** One process's structural bundle: functions (metadata only), calls, resources, interaction links. */
+export function fetchProcess(processName, runId, signal) {
   const query = new URLSearchParams({ process: processName, run: runId });
-  return getJson(`/api/graph?${query}`);
+  return getJson(`/api/process?${query}`, signal);
 }
 
-export function fetchSource(processName, runId, functionId) {
+/** Everything the Inspector needs for one selected function. */
+export function fetchFunctionDetail(processName, runId, functionId, signal) {
+  const query = new URLSearchParams({ process: processName, run: runId, function: functionId });
+  return getJson(`/api/function?${query}`, signal);
+}
+
+/** A synthetic library plane for one shared library component. */
+export function fetchLibrary(component, selectionKey, signal) {
+  const query = new URLSearchParams({ component, selection: selectionKey });
+  return getJson(`/api/library?${query}`, signal);
+}
+
+export function fetchSource(processName, runId, functionId, signal) {
   const query = new URLSearchParams({
     process: processName,
     run: runId,
     function: functionId,
   });
-  return getJson(`/api/source?${query}`);
+  return getJson(`/api/source?${query}`, signal);
 }
 
-async function postJson(url, payload) {
+async function postJson(url, payload, signal) {
   const response = await fetch(url, {
     method: "POST",
     headers: postJsonHeaders,
     body: JSON.stringify(payload),
+    signal,
   });
   const body = await response.json().catch(() => null);
   if (!response.ok) {

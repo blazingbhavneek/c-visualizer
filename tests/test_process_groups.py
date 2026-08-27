@@ -7,6 +7,7 @@ from frontend.server import VisualizerHandler
 from process_groups import (
     discover_processes,
     load_group_manifest,
+    process_output_names,
     scan_graph_runs,
     select_process_runs,
     validate_processes,
@@ -71,6 +72,40 @@ class ProcessGroupTests(unittest.TestCase):
             discovered = discover_processes(root)
             self.assertEqual(discovered, [first.resolve(), second.resolve()])
             self.assertEqual(validate_processes(discovered), discovered)
+
+    def test_duplicate_process_names_are_path_qualified_for_outputs(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir) / "chukyu"
+            first = root / "t-dxi" / "src" / "dxi510d"
+            second = first / "dxi510d"
+            for process in (first, second):
+                process.mkdir(parents=True, exist_ok=True)
+                (process / "Makefile").write_text("SRCS = main.c\n", encoding="utf-8")
+
+            paths = validate_processes([first, second])
+            names = process_output_names(paths, root=root)
+
+            self.assertEqual(names[first.resolve()], "t-dxi__src__dxi510d")
+            self.assertEqual(
+                names[second.resolve()], "t-dxi__src__dxi510d__dxi510d"
+            )
+
+    def test_target_override_allows_missing_optional_project_metadata(self):
+        from process_groups import load_project_state
+        from state.state import State
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            json_dir = root / "json_data"
+            json_dir.mkdir()
+            spec = Path(__file__).resolve().parents[1] / "target_specs" / "build_index_targets.json"
+            try:
+                state = load_project_state(json_dir, targets_path=spec)
+                self.assertEqual(state.get("FUNCTION_POINTER_ARGS"), {})
+                self.assertEqual(state.get("FUNCTION_MAP"), {})
+                self.assertEqual(len(state.get("FUNCTION_TYPES")), 33)
+            finally:
+                State().reset()
 
     def test_existing_run_policy_prefers_latest_snapshot_with_interactions(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -173,6 +208,127 @@ class ProcessGroupTests(unittest.TestCase):
                 [(run["process_name"], run["run_id"]) for run in runs],
                 [("producer", "kept")],
             )
+
+
+class TargetOverrideTests(unittest.TestCase):
+    """--targets override loading: valid specs load, broken specs fail hard."""
+
+    REPO = Path(__file__).resolve().parents[1]
+    CANONICAL_SPEC = REPO / "target_specs" / "build_index_targets.json"
+
+    def _json_dir(self, root: Path) -> Path:
+        json_dir = root / "proj" / "json_data"
+        json_dir.mkdir(parents=True)
+        (json_dir / "function_callback_info.json").write_text("{}", encoding="utf-8")
+        (json_dir / "combined_data.json").write_text("{}", encoding="utf-8")
+        return json_dir
+
+    def test_invalid_targets_override_fails_before_discovery(self):
+        from process_groups import load_project_state
+        from state.state import State
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            json_dir = self._json_dir(root)
+            spec = json.loads(self.CANONICAL_SPEC.read_text(encoding="utf-8"))
+            del spec["targets"]["mpf_mfs_addque"]  # silently shrunk registry
+            bad = root / "bad_targets.json"
+            bad.write_text(json.dumps(spec), encoding="utf-8")
+            try:
+                with self.assertRaises(ValueError) as ctx:
+                    load_project_state(json_dir, targets_path=bad)
+            finally:
+                State().reset()
+        self.assertIn("mpf_mfs_addque", str(ctx.exception))
+        self.assertIn("refusing to start a discovery run", str(ctx.exception))
+
+    def test_valid_targets_override_loads_spec_and_types(self):
+        from process_groups import load_project_state
+        from state.state import State
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            json_dir = self._json_dir(root)
+            try:
+                state = load_project_state(
+                    json_dir, targets_path=self.CANONICAL_SPEC
+                )
+                spec = state.get("TARGET_SPEC")
+                self.assertEqual(len(spec["targets"]), 33)
+                self.assertEqual(state.get("FUNCTION_TYPES"), spec["targets"])
+                self.assertEqual(state.get("FUNCTION_POINTER_ARGS"), {})
+                self.assertEqual(state.get("FUNCTION_MAP"), {})
+            finally:
+                State().reset()
+
+    def test_library_signatures_enrich_function_map_without_losing_docs(self):
+        from process_groups import load_project_state
+        from state.state import State
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            json_dir = self._json_dir(root)
+            (json_dir / "combined_data.json").write_text(
+                json.dumps(
+                    {
+                        "pmf_addevent": {
+                            "description": "registered event callback",
+                            "parameters": [{"name": "eventno"}],
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (json_dir / "function_registry.json").write_text(
+                json.dumps(
+                    {
+                        "mpf_mfs_open": {
+                            "prototype": "int mpf_mfs_open(MPF_MFS_FCB *, char *, int, int, ssize_t, int)",
+                            "parameters": [],
+                        },
+                        "pmf_addevent": {
+                            "prototype": "int pmf_addevent(int, void (*)(), size_t)",
+                            "parameters": [],
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (json_dir / "function_callback_info.json").write_text(
+                json.dumps(
+                    {
+                        "pmf_addevent": {
+                            "prototype": "int pmf_addevent(int, void (*)(PMF_EVNHEAD *, void *), size_t)",
+                            "func_argument": [2],
+                            "total_args": 3,
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            try:
+                state = load_project_state(json_dir, targets_path=self.CANONICAL_SPEC)
+                function_map = state.get("FUNCTION_MAP")
+
+                self.assertEqual(
+                    function_map["pmf_addevent"]["description"],
+                    "registered event callback",
+                )
+                self.assertEqual(
+                    function_map["pmf_addevent"]["prototype"],
+                    "int pmf_addevent(int, void (*)(PMF_EVNHEAD *, void *), size_t)",
+                )
+                self.assertEqual(function_map["pmf_addevent"]["total_args"], 3)
+                self.assertEqual(
+                    function_map["mpf_mfs_open"]["prototype"],
+                    "int mpf_mfs_open(MPF_MFS_FCB *, char *, int, int, ssize_t, int)",
+                )
+                self.assertEqual(
+                    state.get("FUNCTION_SIGNATURES")["mpf_mfs_open"]["prototype"],
+                    "int mpf_mfs_open(MPF_MFS_FCB *, char *, int, int, ssize_t, int)",
+                )
+            finally:
+                State().reset()
 
 
 if __name__ == "__main__":

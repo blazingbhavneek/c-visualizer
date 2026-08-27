@@ -17,6 +17,8 @@
  * attachment all work on either without knowing which they were given.
  */
 
+import { isLibraryFunction } from "./model.js";
+
 const uidFor = (functionId) => `d:${functionId}`;
 
 export function buildProcessDag(index) {
@@ -54,6 +56,10 @@ export function buildProcessDag(index) {
     }
     outgoing.set(id, byTarget);
     for (const targetId of byTarget.keys()) {
+      if (isLibraryFunction(index, index.functions.get(targetId))) {
+        node(index.functions.get(targetId));
+        continue;
+      }
       if (nodes.has(targetId)) continue;
       node(index.functions.get(targetId));
       queue.push(targetId);

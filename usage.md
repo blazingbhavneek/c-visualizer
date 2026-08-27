@@ -7,12 +7,12 @@ Run commands from the repository root with Bash.
 Edit this block once, then paste it into your terminal:
 
 ```bash
-PROCESS_ROOT=/home/seigyo/c_repo/c_repo/SoudenKeisei/SoudenKeisei/gs-svm/src
+PROCESS_ROOT=/home/seigyo/c_repo/bhavneek/c-visualizer/SoudenKeisei/SoudenKeisei/gs-svm/src
 MODEL_BASE_URL=http://10.160.144.101:51029/v1
 MODEL_NAME=gemma-4-31B
 MODEL_API_KEY=EMPTY
 WIKI_URL=http://10.160.152.38:51025/agent/llm-wiki/wiki_moove/api/ask
-CONCURRENCY=4
+CONCURRENCY=10
 
 export TRACER_LLM_PROVIDER=openai
 export TRACER_LLM_BASE_URL="$MODEL_BASE_URL"

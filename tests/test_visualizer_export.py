@@ -6,11 +6,33 @@ from pathlib import Path
 from unittest.mock import patch
 
 from call_graph.data_classes import CallSite, FunctionNode
+from helpers.Preprocess.preprocess import Preprocess
 from state.state import State
-from visualizer_export import VisualizerCollector, build_complete_call_graph
+from visualizer_export import (
+    VisualizerCollector,
+    build_complete_call_graph,
+    build_complete_file_functions,
+)
 
 
 class VisualizerCollectorTests(unittest.TestCase):
+    def test_complete_file_functions_reuses_parsed_header_tree(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            header = Path(temp_dir) / "api.h"
+            header.write_text(
+                "static int header_api(int value) { return value + 1; }\n",
+                encoding="latin-1",
+            )
+            trees = Preprocess().preprocess(project_structure={"api.h": header})
+
+            definitions = build_complete_file_functions(trees, {})
+
+            self.assertEqual(
+                definitions["api.h"]["header_api"]["start_line"],
+                1,
+            )
+            self.assertEqual(definitions["api.h"]["header_api"]["end_line"], 1)
+
     def test_adapter_caches_the_original_builder_outputs_without_filtering(self):
         main = FunctionNode("main", "main.c", "/project/main.c")
         isolated = FunctionNode("isolated", "main.c", "/project/main.c")
@@ -185,6 +207,79 @@ class VisualizerCollectorTests(unittest.TestCase):
             )
             self.assertTrue(
                 all(item["function_id"] == collector._function_id(main) for item in collector.interactions.values())
+            )
+
+    def test_exports_nonstandard_entry_function(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir) / "process"
+            root.mkdir()
+            source_path = root / "entry.c"
+            source_path.write_text(
+                "int pmf_main_H(void) { return 0; }\n", encoding="latin-1"
+            )
+            entry = FunctionNode(
+                "pmf_main_H", "entry.c", str(source_path), start_line=1, end_line=1
+            )
+            collector = VisualizerCollector(
+                process_name="process",
+                process_root=root,
+                project_structure={"entry.c": str(source_path)},
+                file_functions={
+                    "entry.c": {"pmf_main_H": {"start_line": 1, "end_line": 1}}
+                },
+                main_file_name="entry.c",
+                entry_function_name="pmf_main_H",
+                results_root=Path(temp_dir) / "results",
+            )
+            collector.capture_call_graph(graph={}, registry={entry.unique_id: entry})
+
+            snapshot = json.loads(collector.write().read_text(encoding="utf-8"))
+
+            self.assertEqual(snapshot["process"]["entry_function"], "pmf_main_H")
+            self.assertEqual(
+                snapshot["process"]["entry_function_id"], collector._function_id(entry)
+            )
+
+    def test_exports_all_lifecycle_entry_points(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir) / "process"
+            root.mkdir()
+            source_path = root / "entry.c"
+            source_path.write_text(
+                "int pmf_main_H(void) { return 0; }\n"
+                "int pmf_end_H(void) { return 0; }\n",
+                encoding="latin-1",
+            )
+            main = FunctionNode(
+                "pmf_main_H", "entry.c", str(source_path), start_line=1, end_line=1
+            )
+            end = FunctionNode(
+                "pmf_end_H", "entry.c", str(source_path), start_line=2, end_line=2
+            )
+            collector = VisualizerCollector(
+                process_name="process",
+                process_root=root,
+                project_structure={"entry.c": str(source_path)},
+                file_functions={
+                    "entry.c": {
+                        "pmf_main_H": {"start_line": 1, "end_line": 1},
+                        "pmf_end_H": {"start_line": 2, "end_line": 2},
+                    }
+                },
+                main_file_name="entry.c",
+                entry_function_name="pmf_main_H",
+                entry_points=[("entry.c", "pmf_main_H"), ("entry.c", "pmf_end_H")],
+                results_root=Path(temp_dir) / "results",
+            )
+            collector.capture_call_graph(
+                graph={}, registry={main.unique_id: main, end.unique_id: end}
+            )
+
+            snapshot = json.loads(collector.write().read_text(encoding="utf-8"))
+
+            self.assertEqual(
+                [(item["function"], item["file"]) for item in snapshot["process"]["entry_points"]],
+                [("pmf_main_H", "entry.c"), ("pmf_end_H", "entry.c")],
             )
 
 

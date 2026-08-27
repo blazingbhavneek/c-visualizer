@@ -2,6 +2,7 @@
 
 import asyncio
 import gc
+import hashlib
 import json
 import multiprocessing
 import os
@@ -11,6 +12,8 @@ import subprocess
 import sys
 import time
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
+from functools import partial
 from parser.parser_files import parseFiles
 from pathlib import Path
 from pprint import pprint
@@ -38,7 +41,11 @@ from tree_sitter_custom import language
 from call_graph.call_graph import orchestrate
 from call_graph.data_classes import CallTreeNode, custom_tree
 from call_graph.gen_graph import make_graph
-from client.llm import OllamaClient
+from client.llm import (
+    OllamaClient,
+    TRACER_DEFAULT_BASE_URL,
+    TRACER_DEFAULT_MODEL,
+)
 from helpers.dict_to_csv import (
     save_dict_csv,
 )  # will save the generated dictionary (containing the model's output..)
@@ -64,9 +71,19 @@ from models import (
     outputModelOneHop,
 )
 from output_paths import process_results_dir, results_root, target_results_dir
+from discovery_index import (
+    build_target_site_inventory,
+    legacy_answers_to_facts,
+    rel_to_source_root,
+    resolve_source_root,
+    valueflow_records_to_facts,
+    write_discovery_index,
+)
+from aggregate_index import build_aggregate_index
 from process_groups import (
     discover_processes,
     load_project_state,
+    process_output_names,
     validate_group_name,
     validate_processes,
     write_group_manifest,
@@ -93,6 +110,20 @@ from datetime import datetime
 from pathlib import Path
 
 # endregion Imports
+
+
+# These are externally-invoked process lifecycle callbacks.  They have no
+# necessarily visible caller in application source, so each locally defined
+# one is a reachability root.  Keep ``main`` and ``pmf_main_H`` first for
+# primary-entry compatibility in legacy output.
+ENTRY_FUNCTION_NAMES = (
+    "main",
+    "pmf_main_H",
+    "pmf_start_H",
+    "pmf_end_H",
+    "pmf_term_H",
+    "pmf_abort_H",
+)
 
 
 # region Global vars
@@ -697,8 +728,8 @@ def llm_endpoint_status(timeout: float = 10.0) -> tuple[bool, str]:
     """
     from openai import OpenAI
 
-    base_url = os.environ.get("TRACER_LLM_BASE_URL", "http://175.28.230.22:54062/v1")
-    model = os.environ.get("TRACER_LLM_MODEL", "gemma-4-31B")
+    base_url = os.environ.get("TRACER_LLM_BASE_URL", TRACER_DEFAULT_BASE_URL)
+    model = os.environ.get("TRACER_LLM_MODEL", TRACER_DEFAULT_MODEL)
     try:
         client = OpenAI(
             api_key=os.environ.get("TRACER_LLM_API_KEY", "EMPTY"),
@@ -749,7 +780,7 @@ def write_unique_path_report(
     return path_report
 
 
-def run_with_retry(func, args=(), timeout=180, retries=2):
+def run_with_retry(func, args=(), timeout=300, retries=2):
     if not isinstance(args, (tuple, list)):
         args = (args,)
 
@@ -818,6 +849,8 @@ async def make_llm_calls_for_function(
     file_functions,
     project_structure,
     project_path,
+    entry_function_name: str = "main",
+    entry_points: list[tuple[str, str]] | None = None,
 ) -> (
     list | None
 ):  # will return list of dataframes containing all data to be saved in csv.
@@ -848,27 +881,26 @@ async def make_llm_calls_for_function(
     )  # filtering out the dependent function based on what are in the project.
     check_other_functions = bool(dependent_functions) and (
         dependent_functions[0] != function
-    )  # assuming that after filtering we are left only with one function
-    dependent_function_indices = None
-    dependent_function_get_upper = None
+    )  # True when this target resolves through a configured open family.
     if check_other_functions:
-        dependent_function_indices = functions_identified.get(
-            dependent_functions[0]
-        ).get("indices")
-        dependent_function_get_upper = functions_identified.get(
-            dependent_functions[0]
-        ).get("get_upper")
+        # A record API is configured against the WHOLE open family (all four
+        # mpf_mfs_open* APIs).  Every configured open is inspected per path
+        # further down; this print keeps the full dependency list auditable
+        # instead of assuming a single dependent function.
         print(
-            "DEPENDENT_FUNCTION_INDICES",
-            dependent_function_indices,
-            "GET_UPPER",
-            dependent_function_get_upper,
+            "DEPENDENT FUNCTIONS (all configured opens):",
+            [
+                (open_name, functions_identified.get(open_name, {}).get("indices"))
+                for open_name in dependent_functions
+            ],
         )
     # return None
-    stats_json_path = Path(
-        f"/home/seigyo/c_repo/c_repo/results/csv_results/stats/{STATE.get('PROJECT_NAME')}_STATS.json"
-    )
-    (stats_json_path.parent / "stats").mkdir(parents=True, exist_ok=True)
+    # Keep the legacy per-function token checkpoint beside the other outputs.
+    # The old absolute path made the legacy resolver impossible to run from a
+    # clean checkout (and prevented the offline parity test from exercising
+    # the real legacy entry point).
+    stats_json_path = results_root() / "stats" / f"{STATE.get('PROJECT_NAME')}_STATS.json"
+    stats_json_path.parent.mkdir(parents=True, exist_ok=True)
     # endregion
 
     # region INTIALIZING EMPTY TOKEN VARIABLES
@@ -921,6 +953,8 @@ async def make_llm_calls_for_function(
         trees=trees,
         required_func=function,
         main_file_name=main_file_name,
+        entry_function_name=entry_function_name,
+        entry_points=entry_points,
         function_pointer_args=function_pointer_args,
         file_functions=file_functions,
         return_whole_tree=check_other_functions,  # this will tell if path_nodes will be returned or not.
@@ -1023,7 +1057,7 @@ async def make_llm_calls_for_function(
     ]
     write_unique_path_report(
         function=function,
-        process_name=Path(project_path).name,
+        process_name=str(STATE.get("PROJECT_NAME") or Path(project_path).name),
         all_paths_rows=all_paths_rows,
         invocation_rows=invocation_rows,
     )
@@ -1049,7 +1083,7 @@ async def make_llm_calls_for_function(
     # endregion
 
     async def run_llm_requests(requests):
-        semaphore = asyncio.Semaphore(20)
+        semaphore = asyncio.Semaphore(1)
 
         async def run_request(key, args):
             async with semaphore:
@@ -1064,7 +1098,7 @@ async def make_llm_calls_for_function(
         return dict(await asyncio.gather(*(run_request(*request) for request in requests)))
 
     async def run_llm_pairs(path_requests):
-        semaphore = asyncio.Semaphore(20)
+        semaphore = asyncio.Semaphore(1)
 
         async def run_pair(index, primary_args, dependent_args):
             async with semaphore:
@@ -1076,7 +1110,8 @@ async def make_llm_calls_for_function(
                     )
                     dependent_result = (
                         await asyncio.to_thread(run_with_retry, llm_calls, dependent_args)
-                        if not primary_args or primary_result
+                        if dependent_args is not None
+                        and (not primary_args or primary_result)
                         else None
                     )
                     return index, (primary_result, dependent_result)
@@ -1086,20 +1121,52 @@ async def make_llm_calls_for_function(
 
         return dict(await asyncio.gather(*(run_pair(*request) for request in path_requests)))
 
-    if len(path_nodes) > 0:
+    if check_other_functions and len(path_nodes) > 0:
 
         # region GETTING DEPENDENT FUNCTION PATH FROM EACH FUNCTION PATH (APPLYING DFS IN IT AND GETTING LAST PATH)
-        paths_to_dependent: list[list[str]] = []
-        print_or_return_possible_paths_trees(
-            paths=path_nodes,
-            dependent_function=dependent_functions[0],
-            result_path_list=paths_to_dependent,
-        )  # returns the tree made from the nodes.
+        # A target may be configured against a whole open family (all four
+        # mpf_mfs_open* APIs).  Inspect every configured open: for each path,
+        # the first open (in configuration order) that the path actually
+        # contains is the one the LLM resolves.  This replaces the historical
+        # single-dependent assumption without changing what one path costs
+        # (still at most one dependent LLM call per path).
+        dependent_paths_by_open: dict[str, list[list[str]]] = {}
+        for open_name in dependent_functions:
+            open_paths: list[list[str]] = []
+            print_or_return_possible_paths_trees(
+                paths=path_nodes,
+                dependent_function=open_name,
+                result_path_list=open_paths,
+            )  # returns the tree made from the nodes.
+            dependent_paths_by_open[open_name] = open_paths
+
+        selected_open: list[str | None] = []
+        for position in range(len(path_nodes)):
+            selected_open.append(
+                next(
+                    (
+                        open_name
+                        for open_name in dependent_functions
+                        if dependent_paths_by_open.get(open_name, [])[position]
+                    ),
+                    None,
+                )
+            )
+        paths_to_dependent = [
+            dependent_paths_by_open[open_name][position]
+            if (open_name := selected_open[position]) is not None
+            else []
+            for position in range(len(path_nodes))
+        ]
+        found_opens = sorted({open_name for open_name in selected_open if open_name})
         # set the paths to dependent in this function ...
         #  endregion
 
         # region PARSING FOR DEPENDENT FUNCTION
-        print(f"PARSING FOR DEPENDENT FUNCTION -> {dependent_functions[0]}")
+        print(
+            "PARSING FOR DEPENDENT FUNCTION -> "
+            + (", ".join(found_opens) if found_opens else "(none found on any path)")
+        )
         dependent_function_parser = parseFiles(
             project_structure=project_structure,
             paths=paths_to_dependent,
@@ -1127,18 +1194,21 @@ async def make_llm_calls_for_function(
             new_path_str = "->".join(
                 re.sub(r"\[([^\[\]]*)\]", "", node) for node in new_path
             )
-            path_requests.append((
-                index,
-                primary_args,
+            open_name = selected_open[index - 1]
+            open_config = functions_identified.get(open_name, {}) if open_name else {}
+            dependent_args = (
                 (
                     project_structure,
-                    dependent_functions[0],
-                    dependent_function_indices,
+                    open_name,
+                    open_config.get("indices"),
                     context_new,
                     new_path_str,
-                    dependent_function_get_upper,
-                ),
-            ))
+                    open_config.get("get_upper"),
+                )
+                if open_name is not None and open_config.get("indices")
+                else None
+            )
+            path_requests.append((index, primary_args, dependent_args))
         llm_results = await run_llm_pairs(path_requests)
 
         for index, (path, context) in enumerate(contexts, start=1):
@@ -1167,11 +1237,12 @@ async def make_llm_calls_for_function(
             ):
                 call_graph_data = {
                     **call_graph_data,
-                    "process_name": Path(project_path).name,
+                    "process_name": str(STATE.get("PROJECT_NAME") or Path(project_path).name),
                 }
                 print(" STEP - 1 DETERMINING THE CALL_TYPE")
 
-                ans = llm_results[index][0]
+                _pair = llm_results.get(index)
+                ans = _pair[0] if _pair else None
                 if ans:
                     validated_model, stats = ans
                 else:
@@ -1220,14 +1291,14 @@ async def make_llm_calls_for_function(
                     **call_graph_data,
                     "type": output_string,
                     "call_number": call_number,
-                    "process_name": Path(project_path).name,
+                    "process_name": str(STATE.get("PROJECT_NAME") or Path(project_path).name),
                 }  # determined the type.
             # endregion
             else:
                 # region WHEN FUNCTION_TYPE IS ALREADY DECIDED (ONLY CALL_GRAPH DATA CHANGES)
                 call_graph_data = {
                     **call_graph_data,
-                    "process_name": Path(project_path).name,
+                    "process_name": str(STATE.get("PROJECT_NAME") or Path(project_path).name),
                     "type": STATE.get("FUNCTION_TYPES")
                     .get(function, {})
                     .get("type", "NO DATA"),  # here type is fixed.
@@ -1242,7 +1313,8 @@ async def make_llm_calls_for_function(
             new_path_str = "->".join(
                 map(lambda x: re.sub(block_regex, "", x), new_path)
             )
-            ans = llm_results[index][1]
+            _pair = llm_results.get(index)
+            ans = _pair[1] if _pair else None
 
             if ans:
                 validated_model, stats = ans
@@ -1341,7 +1413,9 @@ async def make_llm_calls_for_function(
     else:
         requests = []
         for index, (path, context) in enumerate(contexts, start=1):
-            if index < PATH_TO_START_WITH or ("pmf" in function and len(list_indices) == 0):
+            # Targets with no configured argument to trace (pmf launch-only
+            # APIs, close APIs) need no LLM call at all.
+            if index < PATH_TO_START_WITH or not list_indices:
                 continue
             path_str = "->".join(
                 re.sub(r"\[([^\[\]]*)\]", "", node) for node in path
@@ -1362,7 +1436,7 @@ async def make_llm_calls_for_function(
             type_of_func = STATE.get("FUNCTION_TYPES").get(function).get("type")
             call_graph_data = {
                 **call_graph_data,
-                "process_name": Path(project_path).name,
+                "process_name": str(STATE.get("PROJECT_NAME") or Path(project_path).name),
                 "type": type_of_func if type_of_func else "NO DATA",
             }
 
@@ -1381,9 +1455,9 @@ async def make_llm_calls_for_function(
             # Per-path source context can be very large.
             # print(highlight(context, CLexer(), TerminalFormatter()))
             print("-" * 56)
-            if (
-                "pmf" in function and len(list_indices) == 0
-            ):  # in case of pmf functions and no list_indices.
+            # in case of targets with no configured argument to trace
+            # (pmf launch-only APIs, close APIs): no LLM call needed..
+            if not list_indices:
                 # then we don't need to call llm..
                 launch = STATE.get("FUNCTION_TYPES").get(function).get("launch")
                 final_combined_data = {
@@ -1417,7 +1491,7 @@ async def make_llm_calls_for_function(
                 )
                 print(f"DONE WITH PATH {index}")
                 continue
-            ans = llm_results[("primary", index)]
+            ans = llm_results.get(("primary", index))
             if ans:
                 validated_model, stats = ans
             else:
@@ -1523,12 +1597,14 @@ async def make_value_flow_calls(
     functions_identified: dict[str, dict[str, any]],
     answers: dict[str, list[tuple[BaseModel, BaseModel]]],
     main_file_name: str,
+    entry_function_name: str = "main",
+    entry_points: list[tuple[str, str]] | None = None,
     function_pointer_args: dict,
     file_functions: dict,
     project_structure: dict[str, str],
     project_path: Path,
     path_cap: int = 100,
-    llm_concurrency: int = 20,
+    llm_concurrency: int = 10,
 ) -> list:
     """
     Run the value-flow resolver for every detected target API call in this process.
@@ -1550,7 +1626,7 @@ async def make_value_flow_calls(
     # Important: this is not the old main-to-target path enumerator.  The
     # resolver follows only edges that carry the selected value.
     state = State()
-    process_name = project_path.name
+    process_name = str(state.get("PROJECT_NAME") or project_path.name)
 
     # parseFiles still needs the original file bytes when it prepares an LLM
     # prompt. Tree-sitter trees are already inside `trees`; keep only bytes here.
@@ -1608,6 +1684,21 @@ async def make_value_flow_calls(
             }
         )
 
+    # Dedicated executor pools keep CPU-side prompt construction and the
+    # blocking model waits out of the default asyncio thread pool.  Without
+    # this split, a prompt build queued in the shared pool can sit behind
+    # threads blocked in run_with_retry's process.join(timeout), and model
+    # waits can sit behind prompt builds.  Both pools are shut down in the
+    # finally block that guards resolver.run() below.
+    loop = asyncio.get_running_loop()
+    context_workers = min(4, max(1, os.cpu_count() or 1))
+    context_executor = ThreadPoolExecutor(
+        max_workers=context_workers, thread_name_prefix="valueflow-context"
+    )
+    llm_executor = ThreadPoolExecutor(
+        max_workers=max(1, llm_concurrency), thread_name_prefix="valueflow-llm"
+    )
+
     def context_for(site: IndexedSite, *, get_upper: bool) -> tuple[list[str], str]:
         """
         Build a small call-path context around one call site.
@@ -1643,6 +1734,20 @@ async def make_value_flow_calls(
         _, context = parser.parse_for_path(path, get_upper=get_upper)
         return path, context
 
+    async def run_context(
+        site: IndexedSite, *, get_upper: bool
+    ) -> tuple[list[str], str]:
+        """
+        Run the synchronous context_for() builder on the dedicated CPU pool.
+
+        Prompt construction does Tree-sitter work and source slicing.  Running
+        it off the event loop lets other seeds make CPU progress while model
+        processes are still running, without touching the LLM wait pool.
+        """
+        return await loop.run_in_executor(
+            context_executor, partial(context_for, site, get_upper=get_upper)
+        )
+
     async def resolve_one_hop(
         site: IndexedSite, argument_number: int, expression: str
     ) -> OneHopAnswer | None:
@@ -1653,7 +1758,7 @@ async def make_value_flow_calls(
         """
         # The resolver reaches this callback only after its cheap syntax rules
         # could not explain the expression (literal/macro/local assignment/etc).
-        path, context = context_for(site, get_upper=True)
+        path, context = await run_context(site, get_upper=True)
 
         if not path:
             return None
@@ -1666,7 +1771,8 @@ async def make_value_flow_calls(
         # First try the strict one-hop prompt/schema.  It answers only this
         # one expression: VALUE, PARAM, EXTERNAL, or UNRESOLVED.
         # It is designed for small local expression resolution.
-        result = await asyncio.to_thread(
+        result = await loop.run_in_executor(
+            llm_executor,
             run_with_retry,
             llm_calls_one_hop,
             (
@@ -1691,7 +1797,8 @@ async def make_value_flow_calls(
 
         # If the strict one-hop parser fails, retry using the older prompt.
         # This keeps valueflow compatible with cases the newer schema rejects.
-        fallback = await asyncio.to_thread(
+        fallback = await loop.run_in_executor(
+            llm_executor,
             run_with_retry,
             llm_calls,
             (
@@ -1748,7 +1855,7 @@ async def make_value_flow_calls(
         """
         # This is separate from argument tracing: it asks whether a returned
         # pointer/result is later used as a READF or WRITEF resource.
-        path, context = context_for(site, get_upper=False)
+        path, context = await run_context(site, get_upper=False)
 
         if not path:
             return None
@@ -1758,7 +1865,8 @@ async def make_value_flow_calls(
             f"{function_name}"
         )
 
-        result = await asyncio.to_thread(
+        result = await loop.run_in_executor(
+            llm_executor,
             run_with_retry,
             llm_calls,
             (
@@ -1792,14 +1900,15 @@ async def make_value_flow_calls(
         """
         # Normal handle matching is syntactic: find the earlier open using the
         # same fcb/handle variable. This callback is only the last fallback.
-        path, context = context_for(site, get_upper=True)
+        path, context = await run_context(site, get_upper=True)
 
         if not path:
             return None
 
         dependency_text = ", ".join(dependencies)
 
-        result = await asyncio.to_thread(
+        result = await loop.run_in_executor(
+            llm_executor,
             run_with_retry,
             llm_calls_one_hop,
             (
@@ -1863,34 +1972,45 @@ async def make_value_flow_calls(
 
     # Hand the prepared project index and the three optional LLM callbacks to
     # the actual value resolver. From this point, resolver.run() owns tracing.
-    resolver = ValueFlowResolver(
-        graph=graph,
-        registry=registry,
-        trees=trees,
-        project_structure=project_structure,
-        main_file_name=main_file_name,
-        function_configs=valueflow_configs,
-        macros=state.get("BUILDER_MACROS") or {},
-        file_macros=state.get("MACROS") or {},
-        one_hop_resolver=resolve_one_hop if llm_ready else None,
-        return_use_resolver=resolve_return_use if llm_ready else None,
-        handle_llm_resolver=resolve_handle_with_llm if llm_ready else None,
-        cache_path=cache_path,
-        path_cap=path_cap,
-        llm_concurrency=llm_concurrency,
-        progress=report_seed,
-    )
+    try:
+        resolver = ValueFlowResolver(
+            graph=graph,
+            registry=registry,
+            trees=trees,
+            project_structure=project_structure,
+            main_file_name=main_file_name,
+            entry_function_name=entry_function_name,
+            entry_points=entry_points,
+            function_configs=valueflow_configs,
+            macros=state.get("BUILDER_MACROS") or {},
+            file_macros=state.get("MACROS") or {},
+            one_hop_resolver=resolve_one_hop if llm_ready else None,
+            return_use_resolver=resolve_return_use if llm_ready else None,
+            handle_llm_resolver=resolve_handle_with_llm if llm_ready else None,
+            cache_path=cache_path,
+            path_cap=path_cap,
+            llm_concurrency=llm_concurrency,
+            progress=report_seed,
+        )
 
-    print(
-        f"Resolving {len(resolver.seeds)} target invocation(s) "
-        f"with LLM concurrency {llm_concurrency}"
-    )
+        print(
+            f"Resolving {len(resolver.seeds)} target invocation(s) "
+            f"with LLM concurrency {llm_concurrency}"
+        )
 
-    started_at = time.perf_counter()
+        started_at = time.perf_counter()
 
-    # Main resolver execution.
-    # Produces fact records: target call + resolved value + paths/evidence.
-    records = await resolver.run()
+        # Main resolver execution.
+        # Produces fact records: target call + resolved value + paths/evidence.
+        records = await resolver.run()
+    finally:
+        # Release both pools even when indexing or resolution raises.  No
+        # work is submitted after this point.  cancel_futures drops queued
+        # (never-started) work; wait=True still lets already-running
+        # run_with_retry calls exit through their existing retry/timeout
+        # child-process logic, and the original exception propagates.
+        context_executor.shutdown(wait=True, cancel_futures=True)
+        llm_executor.shutdown(wait=True, cancel_futures=True)
 
     run_stats = {
         "resolver": "valueflow",
@@ -2056,20 +2176,42 @@ def trace_variable(
     index_only: bool = False,
     resolver: Literal["legacy", "valueflow"] = "legacy",
     valueflow_path_cap: int = 100,
-    valueflow_concurrency: int = 20,
+    valueflow_concurrency: int = 10,
+    source_root: Path | None = None,
 ):
     STATE = State()
     project_path = Path(project_path)
+    process_name = str(STATE.get("PROJECT_NAME") or project_path.name)
+    trace_started_at = time.perf_counter()
+    summary_seconds = 0.0
 
     # region pickle caching
 
-    # Toggle this FALSE during debugging/testing, otherwise it might use same tree made when parser/targets were not set correctly
-    USE_PROJECT_STRUCTURE_PICKLE = True
+    # Reuse the historical project-structure cache by default, but allow
+    # deterministic fixture/integration runs to opt out.  The cache is keyed
+    # by project name for legacy compatibility, so two temporary projects with
+    # the same name must be able to request a fresh mapping.
+    USE_PROJECT_STRUCTURE_PICKLE = os.environ.get(
+        "VISUALIZER_USE_PROJECT_STRUCTURE_PICKLE", "1"
+    ).lower() not in {"0", "false", "no"}
 
-    pickle_dir = Path(__file__).resolve().parent / "pickle_data/project_structures_pickle"
+    configured_cache_root = os.environ.get("PROJECT_STRUCTURE_CACHE_ROOT")
+    pickle_dir = (
+        Path(configured_cache_root).expanduser()
+        if configured_cache_root
+        else Path(__file__).resolve().parent / "pickle_data/project_structures_pickle"
+    )
     pickle_dir.mkdir(exist_ok=True, parents=True)
 
-    project_structure_path = pickle_dir / f"{STATE.get('PROJECT_NAME')}_include_v5.pkl"
+    # Project names repeat across temporary fixtures and across different
+    # source trees.  Include the resolved project path so a cache can never
+    # silently point discovery at another checkout with the same name.
+    project_key = hashlib.sha256(
+        str(project_path.resolve()).encode("utf-8")
+    ).hexdigest()[:16]
+    project_structure_path = pickle_dir / (
+        f"{project_path.name}_{project_key}_include_v5.pkl"
+    )
 
     PROJECT_STRUCTURE = None
     potential_main_files: list[str] | None = None
@@ -2090,31 +2232,31 @@ def trace_variable(
         # TODO: read this later fully and understand logic
         # sample output
         # PROJECT_STRUCTURE: 
-        # {'../COMMON/jac_dbdef.h': PosixPath('/home/seigyo/c_repo/c_repo/SoudenKeisei/SoudenKeisei/include/jac/../COMMON/jac_dbdef.h'),
-        #  'COMMON/Ffe.h': PosixPath('/home/seigyo/c_repo/c_repo/SoudenKeisei/SoudenKeisei/include/COMMON/Ffe.h'),
-        #  'COMMON/type_defc.h': PosixPath('/home/seigyo/c_repo/c_repo/SoudenKeisei/SoudenKeisei/include/COMMON/type_defc.h'),
-        #  'FILE/FFE_MNT.h': PosixPath('/home/seigyo/c_repo/c_repo/SoudenKeisei/SoudenKeisei/include/FILE/FFE_MNT.h'),
-        #  'FILE/KF_NAME.h': PosixPath('/home/seigyo/c_repo/c_repo/SoudenKeisei/SoudenKeisei/include/FILE/KF_NAME.h'),
-        #  'Mmi/Mmi.h': PosixPath('/home/seigyo/c_repo/c_repo/SoudenKeisei/SoudenKeisei/modern/include/Mmi/Mmi.h'),
-        #  'Mmi/MmiDateD.h': PosixPath('/home/seigyo/c_repo/c_repo/SoudenKeisei/SoudenKeisei/modern/include/Mmi/MmiDateD.h'),
-        #  'Scn/ScnCstmz.h': PosixPath('/home/seigyo/c_repo/c_repo/SoudenKeisei/SoudenKeisei/modern/include/Scn/ScnCstmz.h'),
-        #  'svm_ssc_req.c': PosixPath('/home/seigyo/c_repo/c_repo/SoudenKeisei/SoudenKeisei/gs-svm/src/libsvm/svm_ssc_req.c'),
-        #  'svm_usesw_get.c': PosixPath('/home/seigyo/c_repo/c_repo/SoudenKeisei/SoudenKeisei/gs-svm/src/libsvm/svm_usesw_get.c'),
-        #  'svm_warnhv_get.c': PosixPath('/home/seigyo/c_repo/c_repo/SoudenKeisei/SoudenKeisei/gs-svm/src/libsvm4/svm_warnhv_get.c'),
-        #  'svm_wbtn.c': PosixPath('/home/seigyo/c_repo/c_repo/SoudenKeisei/SoudenKeisei/gs-svm/src/libsvm/svm_wbtn.c'),
-        #  'svmanlys.h': PosixPath('/home/seigyo/c_repo/c_repo/SoudenKeisei/SoudenKeisei/gs-svm/src/libsvm4/svmanlys.h'),
-        #  'svmyeq.c': PosixPath('/home/seigyo/c_repo/c_repo/SoudenKeisei/SoudenKeisei/gs-svm/src/libsvm/svmyeq.c'),
-        #  'table/table.h': PosixPath('/home/seigyo/c_repo/c_repo/SoudenKeisei/SoudenKeisei/modern/include/sedai1/table/table.h'),
-        #  'tmm/tmm001_msg.h': PosixPath('/home/seigyo/c_repo/c_repo/SoudenKeisei/SoudenKeisei/include/tmm/tmm001_msg.h'),
-        #  'tmm/tmm002_event.h': PosixPath('/home/seigyo/c_repo/c_repo/SoudenKeisei/SoudenKeisei/include/tmm/tmm002_event.h'),
-        #  'tmm/tmm002_msg.h': PosixPath('/home/seigyo/c_repo/c_repo/SoudenKeisei/SoudenKeisei/include/tmm/tmm002_msg.h'),
-        #  'tmm/tmm003_event.h': PosixPath('/home/seigyo/c_repo/c_repo/SoudenKeisei/SoudenKeisei/include/tmm/tmm003_event.h'),
-        #  'tmm/tmm110d_event.h': PosixPath('/home/seigyo/c_repo/c_repo/SoudenKeisei/SoudenKeisei/include/tmm/tmm110d_event.h'),
-        #  'tmm/tmm840_event.h': PosixPath('/home/seigyo/c_repo/c_repo/SoudenKeisei/SoudenKeisei/include/tmm/tmm840_event.h'),
-        #  'tmm/tmm_msg.h': PosixPath('/home/seigyo/c_repo/c_repo/SoudenKeisei/SoudenKeisei/include/tmm/tmm_msg.h'),
-        #  'usr/usr.h': PosixPath('/home/seigyo/c_repo/c_repo/SoudenKeisei/SoudenKeisei/modern/include/usr/usr.h'),
-        #  'usr/usr_in.h': PosixPath('/home/seigyo/c_repo/c_repo/SoudenKeisei/SoudenKeisei/modern/include/usr/usr_in.h'),
-        #  'xrs/xrserr.h': PosixPath('/home/seigyo/c_repo/c_repo/SoudenKeisei/SoudenKeisei/modern/include/sedai1/xrs/xrserr.h')}
+        # {'../COMMON/jac_dbdef.h': PosixPath('/home/seigyo/c_repo/bhavneek/c-visualizer/SoudenKeisei/SoudenKeisei/include/jac/../COMMON/jac_dbdef.h'),
+        #  'COMMON/Ffe.h': PosixPath('/home/seigyo/c_repo/bhavneek/c-visualizer/SoudenKeisei/SoudenKeisei/include/COMMON/Ffe.h'),
+        #  'COMMON/type_defc.h': PosixPath('/home/seigyo/c_repo/bhavneek/c-visualizer/SoudenKeisei/SoudenKeisei/include/COMMON/type_defc.h'),
+        #  'FILE/FFE_MNT.h': PosixPath('/home/seigyo/c_repo/bhavneek/c-visualizer/SoudenKeisei/SoudenKeisei/include/FILE/FFE_MNT.h'),
+        #  'FILE/KF_NAME.h': PosixPath('/home/seigyo/c_repo/bhavneek/c-visualizer/SoudenKeisei/SoudenKeisei/include/FILE/KF_NAME.h'),
+        #  'Mmi/Mmi.h': PosixPath('/home/seigyo/c_repo/bhavneek/c-visualizer/SoudenKeisei/SoudenKeisei/modern/include/Mmi/Mmi.h'),
+        #  'Mmi/MmiDateD.h': PosixPath('/home/seigyo/c_repo/bhavneek/c-visualizer/SoudenKeisei/SoudenKeisei/modern/include/Mmi/MmiDateD.h'),
+        #  'Scn/ScnCstmz.h': PosixPath('/home/seigyo/c_repo/bhavneek/c-visualizer/SoudenKeisei/SoudenKeisei/modern/include/Scn/ScnCstmz.h'),
+        #  'svm_ssc_req.c': PosixPath('/home/seigyo/c_repo/bhavneek/c-visualizer/SoudenKeisei/SoudenKeisei/gs-svm/src/libsvm/svm_ssc_req.c'),
+        #  'svm_usesw_get.c': PosixPath('/home/seigyo/c_repo/bhavneek/c-visualizer/SoudenKeisei/SoudenKeisei/gs-svm/src/libsvm/svm_usesw_get.c'),
+        #  'svm_warnhv_get.c': PosixPath('/home/seigyo/c_repo/bhavneek/c-visualizer/SoudenKeisei/SoudenKeisei/gs-svm/src/libsvm4/svm_warnhv_get.c'),
+        #  'svm_wbtn.c': PosixPath('/home/seigyo/c_repo/bhavneek/c-visualizer/SoudenKeisei/SoudenKeisei/gs-svm/src/libsvm/svm_wbtn.c'),
+        #  'svmanlys.h': PosixPath('/home/seigyo/c_repo/bhavneek/c-visualizer/SoudenKeisei/SoudenKeisei/gs-svm/src/libsvm4/svmanlys.h'),
+        #  'svmyeq.c': PosixPath('/home/seigyo/c_repo/bhavneek/c-visualizer/SoudenKeisei/SoudenKeisei/gs-svm/src/libsvm/svmyeq.c'),
+        #  'table/table.h': PosixPath('/home/seigyo/c_repo/bhavneek/c-visualizer/SoudenKeisei/SoudenKeisei/modern/include/sedai1/table/table.h'),
+        #  'tmm/tmm001_msg.h': PosixPath('/home/seigyo/c_repo/bhavneek/c-visualizer/SoudenKeisei/SoudenKeisei/include/tmm/tmm001_msg.h'),
+        #  'tmm/tmm002_event.h': PosixPath('/home/seigyo/c_repo/bhavneek/c-visualizer/SoudenKeisei/SoudenKeisei/include/tmm/tmm002_event.h'),
+        #  'tmm/tmm002_msg.h': PosixPath('/home/seigyo/c_repo/bhavneek/c-visualizer/SoudenKeisei/SoudenKeisei/include/tmm/tmm002_msg.h'),
+        #  'tmm/tmm003_event.h': PosixPath('/home/seigyo/c_repo/bhavneek/c-visualizer/SoudenKeisei/SoudenKeisei/include/tmm/tmm003_event.h'),
+        #  'tmm/tmm110d_event.h': PosixPath('/home/seigyo/c_repo/bhavneek/c-visualizer/SoudenKeisei/SoudenKeisei/include/tmm/tmm110d_event.h'),
+        #  'tmm/tmm840_event.h': PosixPath('/home/seigyo/c_repo/bhavneek/c-visualizer/SoudenKeisei/SoudenKeisei/include/tmm/tmm840_event.h'),
+        #  'tmm/tmm_msg.h': PosixPath('/home/seigyo/c_repo/bhavneek/c-visualizer/SoudenKeisei/SoudenKeisei/include/tmm/tmm_msg.h'),
+        #  'usr/usr.h': PosixPath('/home/seigyo/c_repo/bhavneek/c-visualizer/SoudenKeisei/SoudenKeisei/modern/include/usr/usr.h'),
+        #  'usr/usr_in.h': PosixPath('/home/seigyo/c_repo/bhavneek/c-visualizer/SoudenKeisei/SoudenKeisei/modern/include/usr/usr_in.h'),
+        #  'xrs/xrserr.h': PosixPath('/home/seigyo/c_repo/bhavneek/c-visualizer/SoudenKeisei/SoudenKeisei/modern/include/sedai1/xrs/xrserr.h')}
 
         # potential_main_files:
         # ['svm001.c', 'svm001_kansi.c', 'svm001_kbtmsg.c', 'svm001_svminit.c']
@@ -2164,8 +2306,12 @@ def trace_variable(
     # Dict of all functions in a file
     FILE_FUNCTIONS = {}
 
-    # Actual project entry-point file, if found.
+    # Actual project entry-point file/function, if found.  A process can have
+    # several middleware-invoked lifecycle roots; the primary pair remains
+    # for compatibility with older output fields.
     main_file_name = None
+    entry_function_name = None
+    entry_points: list[tuple[str, str]] = []
 
     # Files that define main() but are not the real detected entry point.
     bad_main_files = []
@@ -2191,13 +2337,22 @@ def trace_variable(
             code_bytes=trees[files][1]
         )
 
-        # Keep the real main file from the detected potential main files.
-        if "main" in functions.keys() and any(files == x for x in potential_main_files):
-            main_file_name = files
-            print("Found main file", main_file_name)
+        entry_candidates = [name for name in ENTRY_FUNCTION_NAMES if name in functions]
+        is_process_source = any(files == x for x in potential_main_files)
 
-        # Mark extra/wrong main() files for removal.
-        if "main" in functions and not any(files == x for x in potential_main_files):
+        # Every lifecycle callback implemented by the process is a root.  The
+        # Makefile-derived source list prevents shared-library definitions
+        # from becoming roots for every consumer process.
+        if is_process_source:
+            for entry_name in entry_candidates:
+                entry_points.append((files, entry_name))
+
+        # Preserve the historical duplicate-main cleanup, but do not delete a
+        # library merely because it defines a lifecycle callback name.
+        if (
+            any(name in {"main", "pmf_main_H"} for name in entry_candidates)
+            and not is_process_source
+        ):
             bad_main_files.append(files)
 
         # Store functions found in this file.
@@ -2210,9 +2365,15 @@ def trace_variable(
         del PROJECT_STRUCTURE[bad_files]
         del trees[bad_files]
 
+    # Select a stable primary entry for legacy fields and display metadata.
+    if entry_points:
+        main_file_name, entry_function_name = entry_points[0]
+        print("Found entry roots", entry_points)
+
     STATE.set("FILE_FUNCTIONS", FILE_FUNCTIONS)
     STATE.set("FILE_INCLUDES", file_includes)
     STATE.set("MACROS", macros)
+    STATE.set("ENTRY_POINTS", entry_points)
 
     # TODO: analyze this, how is this diff from above? waht this contains etc
     # TODO: We are not using the 3rd and 4th params, then why calc it? Or, further down the line its being made again and used, maybe use it and pass it to there 
@@ -2222,40 +2383,53 @@ def trace_variable(
         function_pointer_args=FUNCTION_POINTER_ARGS,
         file_functions=FILE_FUNCTIONS,
     )
+    print(f"CALL GRAPH READY ({len(graph)} callers, {len(registry)} functions)")
 
     # TODO: Do this later
+    print("BUILDING VISUALIZER CHECKPOINT")
+    print("VISUALIZER: indexing complete file functions")
+    complete_file_functions = build_complete_file_functions(trees, FILE_FUNCTIONS)
+    print("VISUALIZER: capturing source snapshot")
     collector = VisualizerCollector(
-        process_name=project_path.name,
+        process_name=process_name,
         process_root=project_path,
         project_structure=PROJECT_STRUCTURE,
-        file_functions=build_complete_file_functions(trees, FILE_FUNCTIONS),
+        file_functions=complete_file_functions,
         main_file_name=main_file_name,
+        entry_function_name=entry_function_name,
+        entry_points=entry_points,
         library_functions=set((STATE.get("FUNCTION_MAP") or {}).keys())
         | set((STATE.get("FUNCTION_TYPES") or {}).keys()),
         run_id=STATE.get("TIME"),
     )
 
+    print("VISUALIZER: capturing call graph")
     collector.capture_call_graph(graph=graph, registry=registry)
     STATE.set("VISUALIZER_COLLECTOR", collector)
 
+    print("VISUALIZER: writing checkpoint")
     graph_path = collector.write()
     STATE.set("VISUALIZER_GRAPH_PATH", graph_path)
     print(f"Complete source graph checkpoint written to {graph_path}")
 
     # TODO: Temporarily disabled for speed, bring it back later for prod
-    # summary_config = summary_config or SummaryConfig.from_env()
-    # if summary_config.enabled:
-    #     try:
-    #         summary_report = asyncio.run(summarize_collector(collector, summary_config))
-    #         print(f"Bottom-up function summaries: {summary_report}")
-    #     except Exception as exc:
-    #         print(f"Function summarization unavailable: {exc}")
-    #         for function_data in collector.functions.values():
-    #             if not function_data.get("is_external") and not function_data.get(
-    #                 "summary"
-    #             ):
-    #                 function_data["summary_error"] = str(exc)
-    #         collector.write()
+    summary_config = summary_config or SummaryConfig.from_env()
+    if summary_config.enabled:
+        print("STARTING FUNCTION SUMMARIES")
+        summary_started_at = time.perf_counter()
+        try:
+            summary_report = asyncio.run(summarize_collector(collector, summary_config))
+            print(f"Bottom-up function summaries: {summary_report}")
+        except Exception as exc:
+            print(f"Function summarization unavailable: {exc}")
+            for function_data in collector.functions.values():
+                if not function_data.get("is_external") and not function_data.get(
+                    "summary"
+                    ):
+                        function_data["summary_error"] = str(exc)
+            collector.write()
+        finally:
+            summary_seconds = time.perf_counter() - summary_started_at
 
     # If its index only, it means we are only trying to capture source trees, not the unique target parameters, so return early here
     # we already have saved the visualizer in the state
@@ -2265,15 +2439,78 @@ def trace_variable(
     # This is subset of target functions json, it basically finds all the target funcs 
     # that are actually present in the paths, then only gives the subset here
     # the output shape is same as the json_data/mpf_data.json
+    print("IDENTIFYING TARGET FUNCTIONS")
     functions_identified = identify_funs_to_trace(
         project_structure=PROJECT_STRUCTURE,
         trees=trees,
     )
 
+    # ---------------------------------------------------------------
+    # Discovery-index setup (shared by both resolvers, plan.md phase 2/3):
+    # one exact target call-site inventory built from the parsed trees,
+    # plus the compatible index/ artifacts written after tracing.  The
+    # inventory and evidence are written even when a resolver fails.
+    # ---------------------------------------------------------------
+    discovery_spec = STATE.get("TARGET_SPEC")
+    if discovery_spec is None:
+        # Project-local mpf_data.json runs (fixtures) keep working; without
+        # discovery metadata the adapter emits evidence-only output.
+        discovery_spec = {
+            "targets": STATE.get("FUNCTION_TYPES") or {},
+            "version": "mpf_data-local",
+            "digest": "",
+        }
+    resolved_source_root = resolve_source_root(project_path, source_root)
+    target_sites = build_target_site_inventory(
+        trees=trees,
+        functions_identified=functions_identified,
+        spec=discovery_spec,
+        project_structure=PROJECT_STRUCTURE,
+        source_root=resolved_source_root,
+        process_root=project_path,
+        macros=STATE.get("BUILDER_MACROS") or {},
+    )
+    print(
+        f"TARGET CALL-SITE INVENTORY: {len(target_sites)} discovery argument "
+        f"site(s) under {resolved_source_root}"
+    )
+
+    file_function_counts: dict[str, int] = {}
+    for _file, definitions in FILE_FUNCTIONS.items():
+        if definitions:
+            rel = rel_to_source_root(
+                PROJECT_STRUCTURE.get(_file, _file), resolved_source_root
+            )
+            file_function_counts[rel] = len(definitions)
+
+    def _write_discovery_index(collected_facts: list) -> None:
+        try:
+            write_discovery_index(
+                output_dir=process_results_dir(process_name) / "index",
+                process_name=process_name,
+                source_root=resolved_source_root,
+                process_root=project_path,
+                target_registry_version=str(discovery_spec.get("version", "")),
+                target_registry_digest=str(discovery_spec.get("digest", "")),
+                target_sites=target_sites,
+                facts=collected_facts,
+                resolver=resolver,
+                run_id=STATE.get("TIME"),
+                file_function_counts=file_function_counts,
+            )
+            print(
+                f"Discovery index written to "
+                f"{process_results_dir(process_name) / 'index'}"
+            )
+        except Exception as index_exc:
+            # A discovery-index failure must not hide the resolver result.
+            print(f"Failed to write discovery index: {index_exc}")
+
     if functions_identified == {}:
         print(
-            f"{BOLD}{RED}NO FUNCTIONS IDENTIFIED IN THE PROJECT {project_path.name}.{RESET}"
+            f"{BOLD}{RED}NO FUNCTIONS IDENTIFIED IN THE PROJECT {process_name}.{RESET}"
         )
+        _write_discovery_index([])
         return {}
 
     console.print(
@@ -2289,43 +2526,71 @@ def trace_variable(
     print("This is the main file::", main_file_name)
 
     # running new modern flow, reverse walk
-    if resolver == "valueflow":
-        asyncio.run(
-            make_value_flow_calls(
-                graph=graph, # Callsite/FunctionNode custom graph
-                registry=registry, # list of all functions
-                trees=trees, # tree sitter trees
-                functions_identified=functions_identified, # target functiosn in trees
-                answers=answers, # to add answer inplace
-                main_file_name=main_file_name, # starting point
-                function_pointer_args=FUNCTION_POINTER_ARGS,
-                file_functions=FILE_FUNCTIONS,
-                project_structure=PROJECT_STRUCTURE,
-                project_path=project_path,
-                path_cap=valueflow_path_cap,
-                llm_concurrency=valueflow_concurrency,
-            )
-        )
-
-    # Fallback to legacy code, resolving for all unique paths in main
-    else:
-        for function in functions_identified:
-            # Legacy path enumerator retained as run-level fallback.
-            STATE.set("CURRENT_PROCESSED_FUNCTION", function)
-
-            asyncio.run(
-                make_llm_calls_for_function(
-                    function=function,
-                    trees=trees,
-                    functions_identified=functions_identified,
-                    answers=answers,
-                    main_file_name=main_file_name,
+    discovery_facts: list = []
+    try:
+        if resolver == "valueflow":
+            print("STARTING VALUE-FLOW RESOLUTION")
+            records = asyncio.run(
+                make_value_flow_calls(
+                    graph=graph, # Callsite/FunctionNode custom graph
+                    registry=registry, # list of all functions
+                    trees=trees, # tree sitter trees
+                    functions_identified=functions_identified, # target functiosn in trees
+                    answers=answers, # to add answer inplace
+                    main_file_name=main_file_name, # starting point
+                    entry_function_name=entry_function_name or "main",
+                    entry_points=entry_points,
                     function_pointer_args=FUNCTION_POINTER_ARGS,
                     file_functions=FILE_FUNCTIONS,
                     project_structure=PROJECT_STRUCTURE,
                     project_path=project_path,
+                    path_cap=valueflow_path_cap,
+                    llm_concurrency=valueflow_concurrency,
                 )
             )
+            discovery_facts = valueflow_records_to_facts(
+                records,
+                target_sites,
+                discovery_spec,
+                resolved_source_root,
+                project_path,
+            )
+
+        # Fallback to legacy code, resolving for all unique paths in main
+        else:
+            for function in functions_identified:
+                # Legacy path enumerator retained as run-level fallback.
+                STATE.set("CURRENT_PROCESSED_FUNCTION", function)
+
+                asyncio.run(
+                    make_llm_calls_for_function(
+                        function=function,
+                        trees=trees,
+                        functions_identified=functions_identified,
+                        answers=answers,
+                        main_file_name=main_file_name,
+                        entry_function_name=entry_function_name or "main",
+                        entry_points=entry_points,
+                        function_pointer_args=FUNCTION_POINTER_ARGS,
+                        file_functions=FILE_FUNCTIONS,
+                        project_structure=PROJECT_STRUCTURE,
+                        project_path=project_path,
+                    )
+                )
+            discovery_facts = legacy_answers_to_facts(
+                answers,
+                target_sites,
+                discovery_spec,
+                resolved_source_root,
+                project_path,
+            )
+    except Exception:
+        # Whatever evidence was collected still goes to the comparison
+        # artifacts; the run error propagates unchanged.
+        _write_discovery_index(discovery_facts)
+        raise
+
+    _write_discovery_index(discovery_facts)
 
     # After all the target parameters are resolved, it adds those connections back to the visualizer data
     collector = STATE.get("VISUALIZER_COLLECTOR")
@@ -2341,6 +2606,19 @@ def trace_variable(
         graph_path = collector.write()
         STATE.set("VISUALIZER_GRAPH_PATH", graph_path)
         print(f"Visualizer graph written to {graph_path}")
+
+    # Add final trace timings after all value-flow output and visualizer work.
+    stats_path = process_results_dir(process_name) / "run_stats.json"
+    if resolver == "valueflow" and stats_path.is_file():
+        run_stats = json.loads(stats_path.read_text(encoding="utf-8"))
+        end_to_end_seconds = time.perf_counter() - trace_started_at
+        run_stats["end-to-end-time"] = round(end_to_end_seconds, 3)
+        run_stats["parsing-time"] = round(
+            max(0.0, end_to_end_seconds - summary_seconds), 3
+        )
+        stats_path.write_text(
+            json.dumps(run_stats, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
 
     return answers
 
@@ -2457,6 +2735,26 @@ if __name__ == "__main__":
         help="Target tracing engine. Default legacy until a valueflow run is diffed against it on the real sources.",
     )
     argument_parser.add_argument(
+        "--targets",
+        type=Path,
+        default=None,
+        help=(
+            "Target spec JSON to use instead of the project-local "
+            "json_data/mpf_data.json (replaces FUNCTION_TYPES only). "
+            "Comparison runs use target_specs/build_index_targets.json."
+        ),
+    )
+    argument_parser.add_argument(
+        "--source-root",
+        type=Path,
+        default=None,
+        help=(
+            "Root that discovery-index paths are relative to. Defaults to the "
+            "chukyu root when the process is rooted at <root>/t-*/src/<process>, "
+            "otherwise the process root."
+        ),
+    )
+    argument_parser.add_argument(
         "--valueflow-path-cap",
         type=int,
         default=10000,
@@ -2466,7 +2764,7 @@ if __name__ == "__main__":
         "--valueflow-concurrency",
         type=int,
         default=10,
-        help="Concurrent value-flow model queries (default 1, so the run is watchable).",
+        help="Concurrent value-flow target/LLM queries (default: 10).",
     )
 
     command_args = argument_parser.parse_args()
@@ -2560,11 +2858,18 @@ if __name__ == "__main__":
     # TODO: Come back here and add what they mean contain properly
     graph_paths: list[Path] = []
     failures: list[dict] = []
+    process_index_dirs: list[Path] = []
+    batch_started_ns = time.time_ns()
 
     # Fist init of app state
     STATE = State()
+    process_names = process_output_names(
+        projects_to_run,
+        root=command_args.process_folder,
+    )
 
     for project_path in projects_to_run:
+        output_process_name = process_names[project_path.resolve()]
 
         # First, we try to recursively find "json_data" directory, which contains the target functions 
         # (TODO: Find what other thing it contains)
@@ -2579,16 +2884,23 @@ if __name__ == "__main__":
             repo_root / "json_data",
         )
 
-        print(f"RUNNING FOR PROJECT {project_path.name}")
+        print(
+            f"RUNNING FOR PROJECT {project_path.name}"
+            + (
+                f" (output name: {output_process_name})"
+                if output_process_name != project_path.name
+                else ""
+            )
+        )
 
         try:
 
             # set tools in global state here
             set_tool_def()
 
-            STATE = load_project_state(json_dir)
+            STATE = load_project_state(json_dir, targets_path=command_args.targets)
             STATE.set("TIME", f"{datetime.now():%Y%m%d_%H%M%S}")
-            STATE.set("PROJECT_NAME", project_path.name)
+            STATE.set("PROJECT_NAME", output_process_name)
 
             summary = trace_variable(
                 project_path=project_path,
@@ -2599,6 +2911,7 @@ if __name__ == "__main__":
                 # TODO: Find out what this cap actually does, i think its cap a on how many paths for a unique source to show in results?
                 valueflow_path_cap=max(1, command_args.valueflow_path_cap),
                 valueflow_concurrency=max(1, command_args.valueflow_concurrency),
+                source_root=command_args.source_root,
             )
 
             console.print(summary)
@@ -2614,7 +2927,8 @@ if __name__ == "__main__":
 
             failures.append(
                 {
-                    "process_name": project_path.name,
+                    "process_name": output_process_name,
+                    "source_process_name": project_path.name,
                     "project_root": str(project_path),
                     "error": str(exc),
                 }
@@ -2623,10 +2937,46 @@ if __name__ == "__main__":
             if not command_args.continue_on_error:
                 raise
 
-            print(f"PROCESS FAILED; CONTINUING: {project_path.name}: {exc}")
+            print(f"PROCESS FAILED; CONTINUING: {output_process_name}: {exc}")
 
         finally:
+            # A resolver may have written its discovery index immediately
+            # before reporting an error.  Keep that evidence in the aggregate
+            # batch index, but exclude stale output from an earlier run.
+            candidate_index = process_results_dir(output_process_name) / "index"
+            metadata_path = candidate_index / "index_metadata.json"
+            if (
+                metadata_path.is_file()
+                and metadata_path.stat().st_mtime_ns >= batch_started_ns
+                and candidate_index not in process_index_dirs
+            ):
+                process_index_dirs.append(candidate_index)
             STATE.reset()
+
+    # A batch has two output layers: the existing per-process visualizer and
+    # discovery indexes, plus one whole-repository build-index-shaped
+    # directory.  The latter is deliberately built after all processes so it
+    # can overlay the successful c-visualizer discoveries and rebuild one
+    # cross-process graph.
+    if batch_mode and (command_args.process_folder or command_args.source_root):
+        aggregate_root = (
+            command_args.source_root
+            or command_args.process_folder
+        )
+        aggregate_dir = results_root() / "index"
+        try:
+            build_aggregate_index(
+                source_root=aggregate_root,
+                output_dir=aggregate_dir,
+                process_indexes=process_index_dirs,
+                process_count=len(projects_to_run),
+                failed_processes=len(failures),
+            )
+            print(f"Whole-repository index written to {aggregate_dir}")
+        except Exception as aggregate_exc:
+            print(f"WHOLE-REPOSITORY INDEX FAILED: {aggregate_exc}")
+            if not command_args.continue_on_error:
+                raise
 
     if batch_mode or command_args.group_name:
         if not graph_paths:

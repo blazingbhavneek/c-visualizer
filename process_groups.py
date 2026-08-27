@@ -9,6 +9,7 @@ the whole pipeline.
 from __future__ import annotations
 
 import json
+import os
 import re
 from collections import defaultdict
 from datetime import datetime, timezone
@@ -31,32 +32,109 @@ _IGNORED_DISCOVERY_DIRS = {
 }
 
 
-def load_project_state(json_dir: Path):
-    """Load one process family's configuration without changing legacy loaders."""
+def load_project_state(json_dir: Path, targets_path: Path | None = None):
+    """Load one process family's configuration without changing legacy loaders.
+
+    ``targets_path`` (the ``--targets`` override) replaces ONLY the target
+    function set (FUNCTION_TYPES).  Callback metadata and the function map
+    still come from the selected project's ``json_dir``, and the override
+    must not change the project source mapping or the selected process root.
+    When an override is used it is loaded through the target-spec loader so
+    duplicate names fail early, the registry digest can be recorded in
+    the discovery-index metadata, and any validation problem fails the run
+    before discovery proceeds (a comparison must never run on a silently
+    wrong or shrunk target registry).
+    """
     import pickle
 
     from state.state import State
 
     json_dir = json_dir.expanduser().resolve()
     state = State()
-    state.set(
-        "FUNCTION_TYPES",
-        json.loads((json_dir / "mpf_data.json").read_text(encoding="utf-8")),
+
+    target_path = (
+        targets_path.expanduser().resolve() if targets_path is not None else json_dir / "mpf_data.json"
     )
-    state.set(
-        "FUNCTION_POINTER_ARGS",
-        json.loads(
-            (json_dir / "function_callback_info.json").read_text(encoding="utf-8")
-        ),
+    if targets_path is not None:
+        from target_spec import load_target_spec, validate_target_spec
+
+        spec = load_target_spec(target_path)
+        problems = validate_target_spec(spec)
+        if problems:
+            detail = "\n".join(f"    - {problem}" for problem in problems)
+            raise ValueError(
+                f"Target registry failed validation ({target_path}); refusing to "
+                "start a discovery run with a wrong target set:\n"
+                f"{detail}"
+            )
+        state.set("TARGET_SPEC", spec)
+        state.set("FUNCTION_TYPES", spec["targets"])
+    else:
+        state.set(
+            "FUNCTION_TYPES",
+            json.loads(target_path.read_text(encoding="utf-8")),
+        )
+    callback_path = json_dir / "function_callback_info.json"
+    callback_info = (
+        json.loads(callback_path.read_text(encoding="utf-8"))
+        if callback_path.is_file()
+        else {}
     )
+    state.set("FUNCTION_POINTER_ARGS", callback_info)
+
+    # The callback registry also carries useful prototypes/arity information.
+    # Keep it separate from FUNCTION_POINTER_ARGS because the call-graph
+    # builder only consumes func_argument, while LLM/tool prompts benefit from
+    # the signature metadata.
+    function_registry_path = json_dir / "function_registry.json"
+    function_registry = (
+        json.loads(function_registry_path.read_text(encoding="utf-8"))
+        if function_registry_path.is_file()
+        else {}
+    )
+    state.set("FUNCTION_SIGNATURES", function_registry)
     function_map_pickle = json_dir.parent / "pickle_data" / "function_map.pkl"
     if function_map_pickle.is_file():
         with function_map_pickle.open("rb") as handle:
             function_map = pickle.load(handle)
     else:
-        function_map = json.loads(
-            (json_dir / "combined_data.json").read_text(encoding="utf-8")
+        combined_data_path = json_dir / "combined_data.json"
+        function_map = (
+            json.loads(combined_data_path.read_text(encoding="utf-8"))
+            if combined_data_path.is_file()
+            else {}
         )
+    # Enrich the documentation map with the checked-in library signatures.
+    # Do not replace non-empty documentation/parameter lists with the sparse
+    # registry entries.  callback_info is loaded last because its prototypes
+    # match the current opt-modern headers for callback APIs (for example
+    # pmf_addevent), whereas function_registry contains older declarations for
+    # some of those functions.
+    function_map = {
+        str(name): dict(value) if isinstance(value, dict) else value
+        for name, value in (function_map or {}).items()
+    }
+
+    def merge_signature(name: str, metadata: dict) -> None:
+        if not isinstance(metadata, dict):
+            return
+        existing = function_map.get(name)
+        if not isinstance(existing, dict):
+            existing = {}
+        merged = dict(existing)
+        for key, value in metadata.items():
+            if value in (None, "", [], {}):
+                continue
+            if key == "parameters" and merged.get(key):
+                continue
+            merged[key] = value
+        function_map[name] = merged
+
+    for name, metadata in function_registry.items():
+        merge_signature(str(name), metadata)
+    for name, metadata in callback_info.items():
+        merge_signature(str(name), metadata)
+
     state.set("FUNCTION_MAP", function_map)
     return state
 
@@ -88,11 +166,15 @@ def discover_processes(folder: Path) -> list[Path]:
 
 
 def validate_processes(projects: Iterable[Path]) -> list[Path]:
-    """Resolve process paths and reject invalid or ambiguous batch inputs."""
+    """Resolve process paths and reject invalid batch inputs.
+
+    Basename collisions are valid in recursive repository scans.  Callers
+    should use :func:`process_output_names` before writing results so those
+    projects receive deterministic path-qualified output names.
+    """
 
     resolved: list[Path] = []
     seen_paths: set[Path] = set()
-    names: dict[str, Path] = {}
     for candidate in projects:
         project = candidate.expanduser().resolve()
         if project in seen_paths:
@@ -101,18 +183,59 @@ def validate_processes(projects: Iterable[Path]) -> list[Path]:
             raise ValueError(f"Process directory does not exist: {project}")
         if not (project / "Makefile").is_file():
             raise ValueError(f"Process needs a Makefile: {project}")
-        previous = names.get(project.name)
-        if previous is not None and previous != project:
-            raise ValueError(
-                "Process names must be unique in one group; "
-                f"both {previous} and {project} are named {project.name!r}."
-            )
         seen_paths.add(project)
-        names[project.name] = project
         resolved.append(project)
     if not resolved:
         raise ValueError("No process directories were selected.")
     return resolved
+
+
+def process_output_names(
+    projects: Iterable[Path], root: Path | None = None
+) -> dict[Path, str]:
+    """Return collision-safe result names for a batch of process paths.
+
+    Unique basenames retain the historical output layout.  Colliding
+    basenames are renamed using their path relative to *root* (or a common
+    parent when no root is supplied).  The real source path remains the
+    process root; this only controls result/visualizer naming.
+    """
+
+    resolved = [Path(project).expanduser().resolve() for project in projects]
+    counts: dict[str, int] = defaultdict(int)
+    for project in resolved:
+        counts[project.name] += 1
+
+    if root is not None:
+        root_path: Path | None = Path(root).expanduser().resolve()
+    elif resolved:
+        try:
+            root_path = Path(os.path.commonpath([str(project) for project in resolved]))
+        except ValueError:
+            root_path = None
+    else:
+        root_path = None
+
+    names: dict[Path, str] = {}
+    used: set[str] = set()
+    for project in resolved:
+        if counts[project.name] == 1:
+            candidate = project.name
+        else:
+            try:
+                relative = project.relative_to(root_path) if root_path else project
+            except ValueError:
+                relative = project
+            candidate = "__".join(relative.parts)
+            candidate = re.sub(r"[^A-Za-z0-9_.-]+", "_", candidate).strip("_")
+            candidate = candidate or project.name
+
+        if candidate in used:
+            absolute_text = str(project).replace("/", "__").replace("\\", "__")
+            candidate = re.sub(r"[^A-Za-z0-9_.-]+", "_", absolute_text).strip("_")
+        used.add(candidate)
+        names[project] = candidate
+    return names
 
 
 def validate_group_name(group_name: str) -> str:

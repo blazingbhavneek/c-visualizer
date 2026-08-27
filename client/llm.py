@@ -15,6 +15,12 @@ from models import (
     outputModelForReturn,
 )
 
+# Default tracer endpoint for the current OpenAI-compatible vLLM service.
+# Environment variables and --llm-* CLI options can still override these
+# values for a different deployment.
+TRACER_DEFAULT_BASE_URL = "http://10.160.144.101:51029/v1"
+TRACER_DEFAULT_MODEL = "gemma-4-31B"
+
 # from models import outputModel # for the llm's response in a string so is not too heavy.
 # from models import outputModelForReturn # for the functions that only demand their return types to be studied..
 
@@ -37,7 +43,7 @@ class OllamaClient:
 
     def __init__(self, data):  # in the data we'll have the config as well as t
         self.model = data.get("model") or os.environ.get(
-            "TRACER_LLM_MODEL", "gemma-4-31B"
+            "TRACER_LLM_MODEL", TRACER_DEFAULT_MODEL
         )
         self.enc = get_encoding("cl100k_base")
         self.temp = data.get("temp", 0.0)
@@ -86,7 +92,7 @@ class OllamaClient:
                 or os.environ.get("TRACER_LLM_API_KEY", "EMPTY"),
                 base_url=data.get("base_url")
                 or os.environ.get(
-                    "TRACER_LLM_BASE_URL", "http://175.28.230.22:54062/v1"
+                    "TRACER_LLM_BASE_URL", TRACER_DEFAULT_BASE_URL
                 ),
             )
         else:
@@ -158,7 +164,7 @@ class OllamaClient:
             print("Error no system prompt_data")
             return (None, None)
         MAX_RETRY_ATTEMPTS = 5
-        MAX_ITERATIONS_ALLOWED = 10
+        MAX_ITERATIONS_ALLOWED = 50
         ANS_FOUND = False
         INPUT_TOKEN = 0
         OUTPUT_TOKEN = 0

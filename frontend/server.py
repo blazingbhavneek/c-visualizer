@@ -1,9 +1,21 @@
 #!/usr/bin/env python3
-"""Serve the visualizer and read graph snapshots directly from results/.
+"""Serve the visualizer and read graph snapshots lazily via a read model.
 
 No build step or third-party Python package is required:
     python frontend/server.py
     python frontend/server.py --results-root /path/to/results/csv_results
+
+Dynamic API (compact, lazy):
+    GET  /api/runs                          metadata-only catalog
+    POST /api/overview                      {selection: [[process, run], ...]}
+    GET  /api/process?process=&run=         one process's structural bundle
+    GET  /api/function?process=&run=&function=
+    GET  /api/source?process=&run=&function=
+    GET  /api/library?component=&selection= (selection = overview selection key)
+    GET  /api/resource?selection=&kind=&name=
+
+`/api/graph` remains as a deprecated raw-snapshot endpoint for debugging and
+backward compatibility; the React client no longer calls it.
 """
 
 from __future__ import annotations
@@ -18,7 +30,14 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from process_groups import load_group_manifest, scan_graph_runs
+from process_groups import load_group_manifest
+
+try:
+    # Running as a script (`python frontend/server.py`) puts this directory on
+    # sys.path; imported as `frontend.server` it must be a package import.
+    from visualizer_readmodel import ApiError, ReadModel
+except ModuleNotFoundError:  # pragma: no cover - depends on import style
+    from frontend.visualizer_readmodel import ApiError, ReadModel
 
 # The chat endpoints are strictly additive: without the wiki package (or its
 # model endpoints) every graph route below behaves exactly as it always has.
@@ -31,7 +50,7 @@ else:
     WIKI_IMPORT_ERROR = None
 
 
-LEGACY_RESULTS_ROOT = Path("/home/seigyo/c_repo/c_repo/results/csv_results")
+LEGACY_RESULTS_ROOT = Path("/home/seigyo/c_repo/bhavneek/c-visualizer/results/csv_results")
 FRONTEND_ROOT = Path(__file__).resolve().parent
 
 
@@ -58,6 +77,7 @@ class VisualizerHandler(SimpleHTTPRequestHandler):
     results_root: Path
     group_members: set[tuple[str, str]] | None = None
     group_info: dict | None = None
+    read_model: ReadModel | None = None
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, directory=str(static_root()), **kwargs)
@@ -76,6 +96,23 @@ class VisualizerHandler(SimpleHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    def _read_body(self) -> dict:
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            length = 0
+        if length <= 0:
+            return {}
+        try:
+            body = json.loads(self.rfile.read(length).decode("utf-8"))
+        except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+            return {}
+        return body if isinstance(body, dict) else {}
+
+    def _query(self) -> dict[str, str]:
+        parsed = urlparse(self.path)
+        return {key: values[0] for key, values in parse_qs(parsed.query).items()}
+
     def _graph_path(self, process_name: str, run_id: str) -> Path | None:
         if not process_name or not run_id:
             return None
@@ -86,39 +123,29 @@ class VisualizerHandler(SimpleHTTPRequestHandler):
             return None
         return candidate if candidate.is_file() else None
 
-    def _load_graph(self, process_name: str, run_id: str):
-        graph_path = self._graph_path(process_name, run_id)
-        if graph_path is None:
-            return None
-        try:
-            return json.loads(graph_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            return None
+    def _model(self) -> ReadModel:
+        """Read model for this handler's (results_root, group) selection."""
+        model = type(self).read_model
+        if (
+            model is None
+            or model.results_root != self.results_root
+            or model.group_members is not self.group_members
+        ):
+            model = ReadModel(self.results_root, self.group_members)
+            type(self).read_model = model
+        return model
 
     def _runs(self):
-        runs = []
-        for run in scan_graph_runs(self.results_root):
-            member = (str(run["process_name"]), str(run["run_id"]))
-            if self.group_members is not None and member not in self.group_members:
-                continue
-            runs.append(
-                {
-                    key: run[key]
-                    for key in (
-                        "process_name",
-                        "run_id",
-                        "generated_at",
-                        "function_count",
-                        "resource_count",
-                        "interaction_count",
-                    )
-                }
-            )
-        return runs
+        """Metadata-only run catalog (kept as a method for existing tests)."""
+        return self._model().runs()
+
+    # ------------------------------------------------------------------ routes
 
     def do_GET(self):
         parsed = urlparse(self.path)
-        if parsed.path == "/api/runs":
+        path = parsed.path
+
+        if path == "/api/runs":
             self._send_json(
                 {
                     "results_root": str(self.results_root),
@@ -128,7 +155,7 @@ class VisualizerHandler(SimpleHTTPRequestHandler):
             )
             return
 
-        if parsed.path == "/api/groups":
+        if path == "/api/groups":
             groups_path = self.results_root / "visualizer" / "groups.json"
             try:
                 groups = json.loads(groups_path.read_text(encoding="utf-8"))
@@ -137,58 +164,98 @@ class VisualizerHandler(SimpleHTTPRequestHandler):
             self._send_json({"results_root": str(self.results_root), "groups": groups})
             return
 
-        if parsed.path in {"/api/graph", "/api/source"}:
-            query = parse_qs(parsed.query)
-            process_name = query.get("process", [""])[0]
-            run_id = query.get("run", [""])[0]
-            graph = self._load_graph(process_name, run_id)
-            if graph is None:
-                self._send_json({"error": "Graph snapshot not found."}, HTTPStatus.NOT_FOUND)
-                return
-            if parsed.path == "/api/graph":
-                self._send_json(graph)
-                return
+        if path == "/api/overview":
+            query = self._query()
+            selection = query.get("selection")
+            if selection:
+                # GET form: selection=process:run,process:run
+                pairs = [pair.split(":", 1) for pair in selection.split(",") if pair]
+            else:
+                body = self._read_body()
+                pairs = body.get("selection")
+            self._api(lambda: self._model().overview(pairs))
+            return
 
-            function_id = query.get("function", [""])[0]
-            function = next((item for item in graph.get("functions", []) if item.get("id") == function_id), None)
-            if function and isinstance(function.get("source"), str):
-                start = max(1, int(function.get("start_line", 1)))
-                source_lines = function["source"].splitlines()
-                snippet = "\n".join(
-                    f"{number:>5}  {line}"
-                    for number, line in enumerate(source_lines, start=start)
+        if path == "/api/process":
+            query = self._query()
+            self._api(
+                lambda: self._model().process(query.get("process", ""), query.get("run", ""))
+            )
+            return
+
+        if path == "/api/function":
+            query = self._query()
+            self._api(
+                lambda: self._model().function_detail(
+                    query.get("process", ""), query.get("run", ""), query.get("function", "")
                 )
-                self._send_json(
-                    {
-                        "file": function.get("file"),
-                        "start_line": start,
-                        "end_line": start + max(0, len(source_lines) - 1),
-                        "text": snippet,
-                        "embedded": True,
-                    }
-                )
-                return
-            source_path = Path(function.get("file", "")) if function else None
-            process_root = Path(graph.get("process", {}).get("root", ""))
-            if not function or not source_path or not source_path.is_file():
-                self._send_json({"error": "Source file not available."}, HTTPStatus.NOT_FOUND)
-                return
+            )
+            return
+
+        if path == "/api/source":
+            query = self._query()
             try:
-                source_path.resolve().relative_to(process_root.resolve())
-            except ValueError:
-                self._send_json({"error": "Source is outside this process."}, HTTPStatus.FORBIDDEN)
+                payload, status = self._model().source(
+                    query.get("process", ""), query.get("run", ""), query.get("function", "")
+                )
+            except ApiError as exc:
+                self._send_json({"error": exc.message}, HTTPStatus(exc.status))
                 return
-            text = source_path.read_text(encoding="latin-1", errors="replace")
-            start = max(1, int(function.get("start_line", 1)))
-            end = int(function.get("end_line", start))
-            lines = text.splitlines()
-            if end < start:
-                end = min(len(lines), start + 80)
-            snippet = "\n".join(f"{number:>5}  {lines[number - 1]}" for number in range(start, min(end, len(lines)) + 1))
-            self._send_json({"file": str(source_path), "start_line": start, "end_line": end, "text": snippet})
+            self._send_json(payload, HTTPStatus(status))
+            return
+
+        if path == "/api/library":
+            query = self._query()
+            self._api(
+                lambda: self._model().library(
+                    query.get("component", ""), query.get("selection", "")
+                )
+            )
+            return
+
+        if path == "/api/resource":
+            query = self._query()
+            self._api(
+                lambda: self._model().resource_detail(
+                    query.get("selection", ""), query.get("kind", ""), query.get("name", "")
+                )
+            )
+            return
+
+        if path == "/api/graph":
+            # Deprecated: returns the complete raw snapshot (source_files and
+            # all).  Kept for debugging and older clients only; the React app
+            # uses the compact /api/overview + /api/process path instead.
+            query = self._query()
+            self._api(lambda: self._load_raw_graph(query.get("process", ""), query.get("run", "")))
             return
 
         return super().do_GET()
+
+    def do_POST(self):
+        path = urlparse(self.path).path
+        if path == "/api/overview":
+            body = self._read_body()
+            self._api(lambda: self._model().overview(body.get("selection")))
+            return
+        self._send_json({"error": "Not found."}, HTTPStatus.NOT_FOUND)
+
+    def _api(self, thunk):
+        """Run a read-model call with uniform error mapping."""
+        try:
+            self._send_json(thunk())
+        except ApiError as exc:
+            self._send_json({"error": exc.message}, HTTPStatus(exc.status))
+        except Exception as exc:  # pragma: no cover - defensive
+            self._send_json({"error": f"Internal error: {exc}"}, HTTPStatus.INTERNAL_SERVER_ERROR)
+
+    def _load_raw_graph(self, process_name: str, run_id: str):
+        if self.group_members is not None and (process_name, run_id) not in self.group_members:
+            raise ApiError(400, "Run is not a member of the active process group.")
+        graph_path = self._graph_path(process_name, run_id)
+        if graph_path is None:
+            raise ApiError(404, "Graph snapshot not found.")
+        return json.loads(graph_path.read_text(encoding="utf-8"))
 
 
 def main():
@@ -207,6 +274,7 @@ def main():
     args = parser.parse_args()
 
     VisualizerHandler.results_root = args.results_root.resolve()
+    group_members: set[tuple[str, str]] | None = None
     if args.group:
         try:
             group_path, manifest = load_group_manifest(
@@ -214,7 +282,7 @@ def main():
             )
         except ValueError as exc:
             raise SystemExit(str(exc)) from exc
-        VisualizerHandler.group_members = {
+        group_members = {
             (str(process["process_name"]), str(process["run_id"]))
             for process in manifest["processes"]
         }
@@ -225,6 +293,7 @@ def main():
             "manifest": str(group_path),
             "totals": manifest.get("totals", {}),
         }
+    VisualizerHandler.group_members = group_members
     handler = VisualizerHandler
     if WikiHandlerMixin is not None and not args.no_chat:
         # The mixin goes first so it can intercept the wiki routes and defer
@@ -233,7 +302,7 @@ def main():
         handler.wiki_service = WikiService(VisualizerHandler.results_root)
 
     server = ThreadingHTTPServer(("0.0.0.0", args.port), handler)
-    print(f"Visualizer: http://10.160.152.38:{args.port}")
+    print(f"Visualizer: http://localhost:{args.port}")
     if handler is VisualizerHandler:
         reason = WIKI_IMPORT_ERROR or "disabled with --no-chat"
         print(f"Chat endpoints off ({reason}). Graph browsing is unaffected.")

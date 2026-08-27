@@ -27,6 +27,8 @@ from typing import Literal, TypeAlias
 OriginKind: TypeAlias = Literal[
     "CONST",
     "MACRO",
+    # Model suggestion retained as evidence, never eligible for exact index.
+    "LLM_CANDIDATE",
     "EXTERNAL_ENTRY",
     "EXTERNAL_DATA",
     "UNKNOWN_INDIRECT",
@@ -42,10 +44,16 @@ class ArgQuery:
     # arg_index is 1-based to match the target JSON configuration.
     call_site_id: str
     arg_index: int
+    # Target configurations for a function-like macro use the source macro's
+    # argument positions. Parameter-flow queries use expanded positions.
+    target: bool = False
 
     def token(self) -> str:
+        fields = ["ARG", self.call_site_id, self.arg_index]
+        if self.target:
+            fields.append("TARGET")
         return json.dumps(
-            ["ARG", self.call_site_id, self.arg_index], separators=(",", ":")
+            fields, separators=(",", ":")
         )
 
 
@@ -69,10 +77,16 @@ class HandleQuery:
     # arg_index is the handle argument; 0 means the handle was ambiguous.
     call_site_id: str
     arg_index: int
+    # The initial query is for the configured target call. Recursive handle
+    # queries follow ordinary expanded call arguments.
+    target: bool = False
 
     def token(self) -> str:
+        fields = ["HANDLE", self.call_site_id, self.arg_index]
+        if self.target:
+            fields.append("TARGET")
         return json.dumps(
-            ["HANDLE", self.call_site_id, self.arg_index], separators=(",", ":")
+            fields, separators=(",", ":")
         )
 
 

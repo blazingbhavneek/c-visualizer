@@ -6,6 +6,7 @@ import inspect
 import json
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -30,6 +31,11 @@ _IDENTIFIER = re.compile(r"^[A-Za-z_]\w*$")
 _STRING_OR_CHAR = re.compile(
     r"^(?:u8|u|U|L)?(?:\"(?:\\.|[^\"])*\"|'(?:\\.|[^'])+')$", re.DOTALL
 )
+
+# Bump this whenever resolution semantics change.  Existing caches may contain
+# facts produced by the old proximity fallback or by an LLM being treated as
+# an exact source, so those facts must not be reused after this change.
+RESOLVER_VERSION = "valueflow-fail-closed-enums-v2"
 
 
 @dataclass(slots=True)
@@ -97,7 +103,12 @@ class IndexedSite:
     # Tree-sitter call_expression node, original source bytes, and parsed args.
     ast_node: Any | None
     source: bytes
+    # Arguments positioned for the expanded callee. These are used while
+    # tracing formal parameters through the call graph.
     arguments: list[Expression]
+    # Arguments exactly as written at the source call. Configured wrapper
+    # macros resolve their target indices against these arguments.
+    target_arguments: list[Expression]
     # Original, smaller CallSite from the call-graph builder.
     raw_call_site: CallSite
     # Set when source calls a macro which expands to the real callee.
@@ -111,6 +122,15 @@ class IndexedSite:
         if index < 1 or index > len(self.arguments):
             return None
         return self.arguments[index - 1]
+
+    def target_argument(self, index: int) -> Expression | None:
+        if index < 1 or index > len(self.target_arguments):
+            return None
+        return self.target_arguments[index - 1]
+
+    @property
+    def is_configured_macro_target(self) -> bool:
+        return bool(self.macro_name and self.macro_name == self.callee_name)
 
 
 @dataclass(frozen=True, slots=True)
@@ -249,6 +269,8 @@ class ValueFlowResolver:
         trees: dict[str, tuple[Any, bytes]],
         project_structure: dict[str, str],
         main_file_name: str,
+        entry_function_name: str = "main",
+        entry_points: list[tuple[str, str]] | None = None,
         function_configs: dict[str, dict[str, Any]],
         macros: dict[str, tuple[str, str, str]] | None = None,
         file_macros: dict[str, dict[str, str]] | None = None,
@@ -266,10 +288,36 @@ class ValueFlowResolver:
         self.project_structure = {
             key: str(value) for key, value in project_structure.items()
         }
+        self._include_key_index: dict[str, tuple[str, ...]] = {}
+        self._include_path_index: dict[Path, tuple[str, ...]] = {}
+        self._include_basename_index: dict[str, tuple[str, ...]] = {}
+        self._project_paths: dict[str, Path] = {}
+        self._build_include_lookup_indexes()
         self.main_file_name = main_file_name
+        self.entry_function_name = entry_function_name or "main"
+        raw_entry_points = entry_points or (
+            [(main_file_name, self.entry_function_name)]
+            if main_file_name
+            else []
+        )
+        self.entry_points = list(dict.fromkeys(
+            (str(file_name), str(function_name))
+            for file_name, function_name in raw_entry_points
+            if file_name and function_name
+        ))
         self.function_configs = function_configs
         self.builder_macros = macros or {}
         self.file_macros = file_macros or {}
+        # The project map can contain several historical copies of a header.
+        # Resolve constants through the include graph of the source file that
+        # uses them instead of merging every copy into one global namespace.
+        print("VALUEFLOW: indexing include graph")
+        self.include_graph = self._build_include_graph()
+        self._visible_enum_cache: dict[
+            str, tuple[dict[str, tuple[str, str, int]], set[str]]
+        ] = {}
+        print("VALUEFLOW: indexing enum constants")
+        self.enum_values, self.enum_ambiguities = self._build_enum_index()
         self.one_hop_resolver = one_hop_resolver
         self.return_use_resolver = return_use_resolver
         self.handle_llm_resolver = handle_llm_resolver
@@ -305,6 +353,17 @@ class ValueFlowResolver:
         self._operation_cache: dict[str, str] = {}
         self._call_number_cache: dict[tuple[str, tuple[str, ...]], str | None] = {}
         fingerprint = hashlib.sha256()
+        fingerprint.update(RESOLVER_VERSION.encode("utf-8"))
+        fingerprint.update(
+            json.dumps(self.file_macros, sort_keys=True, default=str).encode(
+                "utf-8"
+            )
+        )
+        fingerprint.update(
+            json.dumps(self.enum_values, sort_keys=True, default=str).encode(
+                "utf-8"
+            )
+        )
         for file_name, (_, source) in sorted(self.trees.items()):
             fingerprint.update(file_name.encode("utf-8", errors="replace"))
             fingerprint.update(b"\0")
@@ -319,11 +378,18 @@ class ValueFlowResolver:
 
         # Resolver setup order.  Read these methods in this order when
         # debugging why a target was or was not traced.
+        print("VALUEFLOW: indexing function definitions")
         self._build_function_index()   # function definitions + parameter names
+        print(f"VALUEFLOW: indexed {len(self.functions)} functions")
+        print("VALUEFLOW: indexing call sites")
         self._build_call_index()
+        print(f"VALUEFLOW: indexed {len(self.sites)} call sites")
+        print("VALUEFLOW: indexing callbacks and reachability")
         self._build_callback_edges()
         self._compute_reachability()
+        print(f"VALUEFLOW: {len(self.reachable)} reachable functions")
         self._enumerate_seeds()
+        print(f"VALUEFLOW: found {len(self.seeds)} target invocations")
         self._load_cache()
 
     # ------------------------------------------------------------------ index
@@ -519,27 +585,39 @@ class ValueFlowResolver:
                     else (ast_node.start_byte if ast_node is not None else ordinal)
                 )
                 site_id = f"{caller.file_name}:{start_byte}"
-                arguments = self._expressions_for_call(
+                source_arguments = self._expressions_for_call(
                     ast_node, source, caller.file_name, file_path
                 )
+                arguments = source_arguments
                 callee = call_site.callee
                 callee_id = callee.unique_id
-                callee_name = callee.name
+                raw_callee_name = callee.name
+                callee_name = raw_callee_name
                 macro_name = None
                 macro_args_unmapped = False
                 if callee.macro_expansion is not None:
-                    macro_name = callee.name
+                    macro_name = raw_callee_name
                     callee_id = callee.macro_expansion.unique_id
-                    callee_name = callee.macro_expansion.name
+                    expanded_callee_name = callee.macro_expansion.name
                     arguments, reliable = self._macro_call_arguments(
                         macro_name,
-                        callee_name,
+                        expanded_callee_name,
                         arguments,
                         caller.file_name,
                         file_path,
                         call_site.line_number,
                     )
                     macro_args_unmapped = not reliable
+                    # Keep a configured wrapper macro as the target identity,
+                    # while retaining the expanded function as the graph edge.
+                    # This lets targets such as mpf_mfs_clearfile resolve under
+                    # their registry name even though the call graph follows
+                    # their mpf_mfs_clearcc expansion.
+                    callee_name = (
+                        raw_callee_name
+                        if raw_callee_name in self.function_configs
+                        else expanded_callee_name
+                    )
                 site = IndexedSite(
                     site_id=site_id,
                     caller_id=caller_id,
@@ -553,6 +631,11 @@ class ValueFlowResolver:
                     ast_node=ast_node,
                     source=source,
                     arguments=arguments,
+                    target_arguments=(
+                        source_arguments
+                        if raw_callee_name in self.function_configs
+                        else arguments
+                    ),
                     raw_call_site=call_site,
                     macro_name=macro_name,
                     macro_args_unmapped=macro_args_unmapped,
@@ -585,13 +668,18 @@ class ValueFlowResolver:
                 self.forward_edges[site.caller_id].append(edge)
 
     def _compute_reachability(self) -> None:
-        # Targets outside the call graph reachable from the real main() are not
-        # processed. This keeps unrelated/dead project functions out of output.
-        main_id = f"[{self.main_file_name}]main"
-        if main_id not in self.registry:
+        # Middleware may invoke lifecycle callbacks without an application-
+        # visible caller.  Start from every lifecycle root, then follow direct
+        # and synthetic callback edges from their union.
+        entry_ids = [
+            f"[{file_name}]{function_name}"
+            for file_name, function_name in self.entry_points
+            if f"[{file_name}]{function_name}" in self.registry
+        ]
+        if not entry_ids:
             return
-        queue = deque([main_id])
-        self.reachable.add(main_id)
+        queue = deque(entry_ids)
+        self.reachable.update(entry_ids)
         while queue:
             current = queue.popleft()
             for edge in self.forward_edges.get(current, []):
@@ -607,24 +695,23 @@ class ValueFlowResolver:
         return metadata
 
     def _launch_metadata_uncached(self, function_id: str) -> tuple[str, str, str, str]:
-        main_id = f"[{self.main_file_name}]main"
-        if function_id == main_id:
-            path = self.project_structure.get(self.main_file_name, "")
-            return "FORK", "main", path, "-1 (Main function)"
-        queue = deque(
-            [
+        roots = [
+            (
+                f"[{file_name}]{function_name}",
                 (
-                    main_id,
-                    (
-                        "FORK",
-                        "main",
-                        self.project_structure.get(self.main_file_name, ""),
-                        "-1 (Main function)",
-                    ),
-                )
-            ]
-        )
-        visited = {main_id}
+                    "FORK",
+                    function_name,
+                    self.project_structure.get(file_name, ""),
+                    "-1 (Entry function)",
+                ),
+            )
+            for file_name, function_name in self.entry_points
+        ]
+        for entry_id, metadata in roots:
+            if function_id == entry_id:
+                return metadata
+        queue = deque(roots)
+        visited = {entry_id for entry_id, _ in roots}
         while queue:
             current, metadata = queue.popleft()
             for edge in sorted(
@@ -649,12 +736,9 @@ class ValueFlowResolver:
                 if edge.callee_id not in visited:
                     visited.add(edge.callee_id)
                     queue.append((edge.callee_id, next_metadata))
-        return (
-            "FORK",
-            "main",
-            self.project_structure.get(self.main_file_name, ""),
-            "-1 (Main function)",
-        )
+        if roots:
+            return roots[0][1]
+        return "FORK", self.entry_function_name, "", "-1 (Entry function)"
 
     def _enumerate_seeds(self) -> None:
         # A seed means one concrete configured target invocation, not merely a
@@ -816,9 +900,12 @@ class ValueFlowResolver:
         site = self.sites.get(query.call_site_id)
         if site is None:
             return [self._unresolved_fact(query, "missing call site")]
-        if site.macro_args_unmapped:
-            return await self._resolve_across_macro(query, site)
-        expression = site.argument(query.arg_index)
+        if query.target and site.is_configured_macro_target:
+            expression = site.target_argument(query.arg_index)
+        else:
+            if site.macro_args_unmapped:
+                return await self._resolve_across_macro(query, site)
+            expression = site.argument(query.arg_index)
         if expression is None:
             return [self._unresolved_fact(query, f"missing argument {query.arg_index}")]
         return await self._resolve_expression(expression, site, query, stack, set())
@@ -843,7 +930,7 @@ class ValueFlowResolver:
             return [
                 Fact(
                     value=str(answer.value),
-                    origin_kind="CONST",
+                    origin_kind="LLM_CANDIDATE",
                     source_file=site.file_path,
                     source_line=site.line,
                     source_expr=answer.source_expr or call_text,
@@ -882,13 +969,16 @@ class ValueFlowResolver:
         if self._literal(value):
             return [self._source_fact(value, "CONST", expression, query)]
 
-        macro = self._resolve_macro(value)
+        macro = self._resolve_macro(value, expression.file_name)
         if macro is not None:
             resolved, macro_file, macro_line = macro
+            visible_enum_values, _ = self._visible_enum_index(expression.file_name)
             return [
                 Fact(
                     value=resolved,
-                    origin_kind="MACRO",
+                    origin_kind=(
+                        "CONST" if value in visible_enum_values else "MACRO"
+                    ),
                     source_file=macro_file or expression.file_path,
                     source_line=macro_line or expression.line,
                     source_expr=value,
@@ -932,7 +1022,7 @@ class ValueFlowResolver:
                 return [
                     Fact(
                         value=str(llm_answer.value),
-                        origin_kind="CONST",
+                        origin_kind="LLM_CANDIDATE",
                         source_file=expression.file_path,
                         source_line=expression.line,
                         source_expr=llm_answer.source_expr or raw,
@@ -1066,14 +1156,23 @@ class ValueFlowResolver:
             and candidate.start_byte < site.start_byte
         ]
         matches: set[int] = set()
-        for index, argument in enumerate(site.arguments, start=1):
+        site_arguments = (
+            site.target_arguments
+            if site.is_configured_macro_target
+            else site.arguments
+        )
+        for index, argument in enumerate(site_arguments, start=1):
             root = normalise_handle(argument.text)
             if not root:
                 continue
             for opening in opens:
                 if any(
                     normalise_handle(candidate.text) == root
-                    for candidate in opening.arguments
+                    for candidate in (
+                        opening.target_arguments
+                        if opening.is_configured_macro_target
+                        else opening.arguments
+                    )
                 ):
                     matches.add(index)
         return sorted(matches)
@@ -1091,10 +1190,12 @@ class ValueFlowResolver:
             return None
         candidates = self._handle_candidates(seed.site, dependencies)
         # Index 0 deliberately represents an ambiguous handle.  Keeping it as
-        # a query lets the LLM and legacy-proximity fallbacks run and ensures a
-        # visible HANDLE_AMBIGUOUS fact if neither can recover.
+        # a query lets the resolver emit a visible HANDLE_AMBIGUOUS fact if
+        # exact binding and the optional LLM candidate both fail.
         query = HandleQuery(
-            seed.site.site_id, candidates[0] if len(candidates) == 1 else 0
+            seed.site.site_id,
+            candidates[0] if len(candidates) == 1 else 0,
+            target=True,
         )
         self._handle_dependencies[query.token()] = dependencies
         return query
@@ -1103,13 +1204,17 @@ class ValueFlowResolver:
         self, query: HandleQuery, stack: frozenset[str]
     ) -> list[Fact]:
         # Handle resolution order: same-function variable binding -> parameter
-        # binding through callers -> global/field binding -> LLM -> old nearest
-        # open fallback. The first successful level supplies the source facts.
+        # binding through callers -> global/field binding -> LLM candidate.
+        # A nearby open with a different handle is never proof of ownership.
         site = self.sites.get(query.call_site_id)
         dependencies = self._handle_dependencies.get(query.token(), ())
         if site is None or not dependencies:
             return [self._unresolved_fact(query, "HANDLE_AMBIGUOUS")]
-        argument = site.argument(query.arg_index)
+        argument = (
+            site.target_argument(query.arg_index)
+            if query.target and site.is_configured_macro_target
+            else site.argument(query.arg_index)
+        )
         root = normalise_handle(argument.text) if argument is not None else ""
         bindings = (
             self._binding_opens(site.caller_id, root, site.start_byte, dependencies)
@@ -1124,7 +1229,7 @@ class ValueFlowResolver:
                     or []
                 )
                 for index in indices:
-                    child = ArgQuery(opening.site_id, int(index))
+                    child = ArgQuery(opening.site_id, int(index), target=True)
                     self._add_provenance(child, query)
                     for fact in await self.resolve(child, stack):
                         facts.append(
@@ -1168,7 +1273,7 @@ class ValueFlowResolver:
                     self.function_configs.get(opening.callee_name, {}).get("indices")
                     or []
                 ):
-                    child = ArgQuery(opening.site_id, int(index))
+                    child = ArgQuery(opening.site_id, int(index), target=True)
                     self._add_provenance(child, query)
                     for fact in await self.resolve(child, stack):
                         facts.append(
@@ -1181,7 +1286,7 @@ class ValueFlowResolver:
         facts = [
             Fact(
                 value=str(answer.value),
-                origin_kind="CONST",
+                origin_kind="LLM_CANDIDATE",
                 source_file=site.file_path,
                 source_line=site.line,
                 source_expr=answer.source_expr
@@ -1197,27 +1302,19 @@ class ValueFlowResolver:
         if facts:
             return facts
 
-        for opening in self._proximity_opens(site.caller_id, dependencies):
-            for index in (
-                self.function_configs.get(opening.callee_name, {}).get("indices") or []
-            ):
-                child = ArgQuery(opening.site_id, int(index))
-                self._add_provenance(child, query)
-                for fact in await self.resolve(child, stack):
-                    facts.append(
-                        Fact(**{**fact.to_dict(), "link_method": "LEGACY_PROXIMITY"})
-                    )
+        # Do not use the historical nearest-open fallback here.  It can bind a
+        # consumer to an unrelated handle and manufacture several false exact
+        # values (the SVM records that motivated this fix were an example).
         return facts or [self._unresolved_fact(query, "HANDLE_AMBIGUOUS")]
 
     def _proximity_opens(
         self, caller_id: str, dependencies: tuple[str, ...]
     ) -> list[IndexedSite]:
-        """Nearest open-family calls in this function or its closest ancestor.
+        """Return legacy nearby opens for diagnostics only.
 
-        This keeps the intent of the former subtree-proximity guess -- an open
-        that merely sits near the consumer on the call tree -- but finds it by
-        walking caller edges instead of materialising main-to-target paths.
-        Reached only when handle variable tracing and the LLM both fail.
+        This helper is intentionally not called by ``_resolve_handle``:
+        proximity is not ownership proof.  Keeping it available makes old
+        debugging callers harmless while preventing it from creating facts.
         """
         queue = deque([caller_id])
         visited = {caller_id}
@@ -1247,7 +1344,12 @@ class ValueFlowResolver:
             if site.callee_name in dependencies
             and site.start_byte < before_byte
             and any(
-                normalise_handle(argument.text) == root for argument in site.arguments
+                normalise_handle(argument.text) == root
+                for argument in (
+                    site.target_arguments
+                    if site.is_configured_macro_target
+                    else site.arguments
+                )
             )
         ]
         if not candidates:
@@ -1258,7 +1360,12 @@ class ValueFlowResolver:
             if self.function_configs.get(site.callee_name, {}).get("type") == "CLOSEF"
             and site.start_byte < before_byte
             and any(
-                normalise_handle(argument.text) == root for argument in site.arguments
+                normalise_handle(argument.text) == root
+                for argument in (
+                    site.target_arguments
+                    if site.is_configured_macro_target
+                    else site.arguments
+                )
             )
         ]
         if close_sites:
@@ -1445,15 +1552,82 @@ class ValueFlowResolver:
 
     # ------------------------------------------------------------ public run
     async def run(self) -> list[ResolvedSeed]:
-        async def resolve_seed(seed: Seed) -> list[ResolvedSeed]:
-            started = time.perf_counter()
-            rows = await self._resolve_seed(seed)
-            if self.progress is not None:
-                self.progress(seed, rows, time.perf_counter() - started)
-            return rows
+        """Resolve every seed through a bounded async producer/consumer pipeline.
 
-        nested = await asyncio.gather(*(resolve_seed(seed) for seed in self.seeds))
-        records = [record for group in nested for record in group]
+        A small pool of worker tasks pulls ``(index, seed)`` items off a
+        bounded queue and awaits the existing ``_resolve_seed()`` state
+        machine.  The workers only ever run on this coordinator's event loop,
+        so shared resolution state (``results``, ``in_flight``, provenance,
+        caches) is untouched by threads or processes.  While one worker is
+        yielded away inside a pending model request, the other workers keep
+        doing CPU-side tracing; ``_llm_gate`` still caps concurrent model
+        calls at ``llm_concurrency``.
+
+        Final records are flattened in original seed order, never completion
+        order, so output/cache/diagnostic ordering is unchanged.
+        """
+        if not self.seeds:
+            self.persist_cache()
+            return []
+
+        limit = max(2, min(len(self.seeds), self.llm_concurrency * 2))
+        queue: asyncio.Queue[tuple[int, Seed] | None] = asyncio.Queue(maxsize=limit)
+        rows_by_seed: dict[int, list[ResolvedSeed]] = {}
+        first_error: BaseException | None = None
+
+        async def producer() -> None:
+            for index, seed in enumerate(self.seeds):
+                await queue.put((index, seed))
+            # One sentinel per worker so idle workers terminate after the
+            # last real seed has been consumed.
+            for _ in range(limit):
+                await queue.put(None)
+
+        async def worker() -> None:
+            nonlocal first_error
+            while True:
+                item = await queue.get()
+                if item is None:
+                    return
+                if first_error is not None:
+                    # A sibling seed failed: keep draining the queue so the
+                    # producer can finish, but do no further resolution work.
+                    continue
+                index, seed = item
+                started = time.perf_counter()
+                try:
+                    rows = await self._resolve_seed(seed)
+                except BaseException as exc:
+                    if first_error is None:
+                        first_error = exc
+                    raise
+                rows_by_seed[index] = rows
+                if self.progress is not None:
+                    self.progress(seed, rows, time.perf_counter() - started)
+
+        producer_task = asyncio.create_task(producer())
+        workers = [asyncio.create_task(worker()) for _ in range(limit)]
+        try:
+            # Await the producer and workers together.  Waiting for the
+            # producer first can deadlock if every worker fails while the
+            # producer is still trying to enqueue work: there would be no
+            # consumers left to drain the bounded queue, so the exception
+            # cleanup below would never be reached.
+            await asyncio.gather(producer_task, *workers)
+        except BaseException:
+            # A seed failure (or cancellation of run() itself) cancels the
+            # remaining scheduler work instead of leaving it behind.
+            for task in [producer_task, *workers]:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(producer_task, *workers, return_exceptions=True)
+            raise
+
+        records = [
+            record
+            for index in range(len(self.seeds))
+            for record in rows_by_seed[index]
+        ]
         self.persist_cache()
         return self._deduplicate_records(records)
 
@@ -1474,11 +1648,14 @@ class ValueFlowResolver:
             queries.append((handle_query.arg_index, handle_query))
         else:
             queries.extend(
-                (int(index), ArgQuery(seed.site.site_id, int(index)))
+                (
+                    int(index),
+                    ArgQuery(seed.site.site_id, int(index), target=True),
+                )
                 for index in seed.config.get("indices") or []
             )
         if not queries:
-            no_target_query = ArgQuery(seed.site.site_id, 0)
+            no_target_query = ArgQuery(seed.site.site_id, 0, target=True)
             self._label_query(no_target_query)
             fact = Fact(
                 value="NO TARGET",
@@ -1712,6 +1889,331 @@ class ValueFlowResolver:
                 functions.append(function_id)
         return functions
 
+    # --------------------------------------------------------------- constants
+    def _build_include_lookup_indexes(self) -> None:
+        """Build O(1) lookup tables used while resolving include edges.
+
+        The old include resolver scanned every project file for every include
+        spelling, which became quadratic on large projects with archived
+        headers. These indexes preserve the old uniqueness rules while
+        avoiding repeated full-tree scans.
+        """
+        by_key: dict[str, list[str]] = defaultdict(list)
+        by_path: dict[Path, list[str]] = defaultdict(list)
+        by_basename: dict[str, list[str]] = defaultdict(list)
+
+        for file_name in self.trees:
+            normalized = str(file_name).replace("\\", "/").lstrip("./")
+            by_key[normalized].append(file_name)
+
+            project_path = Path(
+                self.project_structure.get(file_name, file_name)
+            ).resolve()
+            self._project_paths[file_name] = project_path
+            by_path[project_path].append(file_name)
+            by_basename[Path(str(file_name)).name].append(file_name)
+
+        self._include_key_index = {
+            key: tuple(names) for key, names in by_key.items()
+        }
+        self._include_path_index = {
+            path: tuple(names) for path, names in by_path.items()
+        }
+        self._include_basename_index = {
+            basename: tuple(names) for basename, names in by_basename.items()
+        }
+
+    def _build_include_graph(self) -> dict[str, tuple[str, ...]]:
+        """Build a best-effort source-to-header include graph from the AST.
+
+        The project map may contain both the current source tree and archived
+        headers with the same basename.  Exact include-key/path matching keeps
+        an include such as ``<Dyn/DynReEneFileDef.h>`` attached to the active
+        ``Dyn/DynReEneFileDef.h`` entry instead of the unrelated archive.
+        """
+        items = list(self.trees.items())
+        workers = min(4, max(1, len(items)))
+        with ThreadPoolExecutor(
+            max_workers=workers, thread_name_prefix="valueflow-include"
+        ) as executor:
+            return dict(executor.map(self._build_include_graph_entry, items))
+
+    def _build_include_graph_entry(
+        self, item: tuple[str, tuple[Any, bytes]]
+    ) -> tuple[str, tuple[str, ...]]:
+        file_name, (tree, source) = item
+        included: list[str] = []
+        for node in _walk(tree.root_node):
+            if node.type != "preproc_include":
+                continue
+            path_node = node.child_by_field_name("path")
+            if path_node is None:
+                continue
+            raw = node_text(path_node, source).strip().strip('<">')
+            target = self._resolve_include(file_name, raw)
+            if target is not None and target not in included:
+                included.append(target)
+        return file_name, tuple(included)
+
+    def _resolve_include(self, source_file: str, requested: str) -> str | None:
+        requested = requested.replace("\\", "/").strip()
+        if not requested:
+            return None
+        normalized = requested.lstrip("./")
+
+        # The project map keys preserve include spellings in the normal case.
+        exact = self._include_key_index.get(normalized, ())
+        if len(exact) == 1:
+            return exact[0]
+
+        source_path = self._project_paths.get(
+            source_file,
+            Path(self.project_structure.get(source_file, source_file)).resolve(),
+        )
+        requested_path = (source_path.parent / requested).resolve()
+        by_path = self._include_path_index.get(requested_path, ())
+        if len(by_path) == 1:
+            return by_path[0]
+
+        # A basename fallback is safe only when the project has one such file.
+        # If there are multiple copies, leaving the edge unresolved is safer
+        # than importing the wrong header into the visibility set.
+        by_basename = self._include_basename_index.get(Path(requested).name, ())
+        return by_basename[0] if len(by_basename) == 1 else None
+
+    def _visible_files(self, file_name: str) -> tuple[str, ...]:
+        """Return a file and its transitive includes in deterministic order."""
+        queue = deque([file_name])
+        visited: set[str] = set()
+        ordered: list[str] = []
+        while queue:
+            current = queue.popleft()
+            if current in visited:
+                continue
+            visited.add(current)
+            ordered.append(current)
+            queue.extend(self.include_graph.get(current, ()))
+        return tuple(ordered)
+
+    def _build_enum_index(
+        self,
+    ) -> tuple[dict[str, tuple[str, str, int]], set[str]]:
+        """Index integer enum constants from the parsed source tree.
+
+        ``extract_all_macros`` cannot see enum values, which previously sent
+        names such as ``DynReSchSetTkFNO`` to the LLM.  Enum values are syntax
+        facts, so evaluate the small integer-expression subset used by C enum
+        declarations while the AST is already available.
+
+        A name with conflicting definitions is deliberately omitted.  A
+        wrong exact value is more harmful than an unresolved value.
+        """
+        candidates: dict[str, list[tuple[str, str, int]]] = defaultdict(list)
+        per_file_candidates: dict[
+            str, dict[str, list[tuple[str, str, int]]]
+        ] = defaultdict(lambda: defaultdict(list))
+        items = sorted(self.trees.items())
+        workers = min(4, max(1, len(items)))
+        with ThreadPoolExecutor(
+            max_workers=workers, thread_name_prefix="valueflow-enum"
+        ) as executor:
+            file_results = executor.map(self._enum_candidates_for_file, items)
+            for file_name, file_candidates in file_results:
+                for name, entries in file_candidates.items():
+                    candidates[name].extend(entries)
+                    per_file_candidates[file_name][name].extend(entries)
+
+        values: dict[str, tuple[str, str, int]] = {}
+        ambiguities: set[str] = set()
+        for name, entries in candidates.items():
+            distinct_values = {entry[0] for entry in entries}
+            if len(distinct_values) > 1:
+                ambiguities.add(name)
+                continue
+            values[name] = sorted(entries, key=lambda entry: (entry[1], entry[2]))[0]
+        self.enum_values_by_file: dict[str, dict[str, tuple[str, str, int]]] = {}
+        self.enum_ambiguities_by_file: dict[str, set[str]] = {}
+        for file_name, file_candidates in per_file_candidates.items():
+            file_values: dict[str, tuple[str, str, int]] = {}
+            file_ambiguities: set[str] = set()
+            for name, entries in file_candidates.items():
+                if len({entry[0] for entry in entries}) > 1:
+                    file_ambiguities.add(name)
+                else:
+                    file_values[name] = sorted(
+                        entries, key=lambda entry: (entry[1], entry[2])
+                    )[0]
+            self.enum_values_by_file[file_name] = file_values
+            self.enum_ambiguities_by_file[file_name] = file_ambiguities
+        return values, ambiguities
+
+    def _enum_candidates_for_file(
+        self, item: tuple[str, tuple[Any, bytes]]
+    ) -> tuple[str, dict[str, list[tuple[str, str, int]]]]:
+        file_name, (tree, source) = item
+        file_path = self.project_structure.get(file_name, file_name)
+        file_candidates: dict[str, list[tuple[str, str, int]]] = defaultdict(list)
+        known: dict[str, int] = {}
+        for specifier in _walk(tree.root_node):
+            if specifier.type != "enum_specifier":
+                continue
+            body = specifier.child_by_field_name("body")
+            if body is None:
+                continue
+            previous: int | None = None
+            for enumerator in body.named_children:
+                if enumerator.type != "enumerator":
+                    continue
+                name_node = enumerator.child_by_field_name("name")
+                if name_node is None:
+                    continue
+                name = node_text(name_node, source).strip()
+                value_node = enumerator.child_by_field_name("value")
+                if value_node is not None:
+                    previous = self._evaluate_enum_expression(
+                        value_node, source, known
+                    )
+                elif previous is not None:
+                    previous += 1
+                if previous is None:
+                    continue
+                known[name] = previous
+                file_candidates[name].append(
+                    (
+                        str(previous),
+                        str(file_path),
+                        enumerator.start_point.row + 1,
+                    )
+                )
+        return file_name, file_candidates
+
+    def _visible_enum_index(
+        self, file_name: str
+    ) -> tuple[dict[str, tuple[str, str, int]], set[str]]:
+        cached = self._visible_enum_cache.get(file_name)
+        if cached is not None:
+            return cached
+        candidates: dict[str, list[tuple[str, str, int]]] = defaultdict(list)
+        ambiguities: set[str] = set()
+        for visible_file in self._visible_files(file_name):
+            ambiguities.update(
+                self.enum_ambiguities_by_file.get(visible_file, set())
+            )
+            for name, entry in self.enum_values_by_file.get(visible_file, {}).items():
+                candidates[name].append(entry)
+
+        values: dict[str, tuple[str, str, int]] = {}
+        for name, entries in candidates.items():
+            if len({entry[0] for entry in entries}) > 1:
+                ambiguities.add(name)
+            else:
+                values[name] = sorted(
+                    entries, key=lambda entry: (entry[1], entry[2])
+                )[0]
+        result = values, ambiguities
+        self._visible_enum_cache[file_name] = result
+        return result
+
+    def _evaluate_enum_expression(
+        self, node: Any, source: bytes, known: dict[str, int]
+    ) -> int | None:
+        """Evaluate a conservative integer expression used by an enumerator."""
+        node_type = node.type
+        text = strip_outer_parens(node_text(node, source).strip())
+        if node_type == "number_literal":
+            return self._parse_c_integer_literal(text)
+        if node_type == "identifier":
+            return self._integer_symbol_value(text, known, set())
+        if node_type == "parenthesized_expression":
+            children = list(node.named_children)
+            return (
+                self._evaluate_enum_expression(children[0], source, known)
+                if children
+                else None
+            )
+        if node_type == "unary_expression":
+            children = list(node.named_children)
+            if not children:
+                return None
+            value = self._evaluate_enum_expression(children[-1], source, known)
+            if value is None:
+                return None
+            operator = node.children[0].type if node.children else ""
+            return {
+                "+": lambda: value,
+                "-": lambda: -value,
+                "~": lambda: ~value,
+                "!": lambda: int(not value),
+            }.get(operator, lambda: None)()
+        if node_type == "binary_expression":
+            children = list(node.named_children)
+            if len(children) != 2 or len(node.children) < 3:
+                return None
+            left = self._evaluate_enum_expression(children[0], source, known)
+            right = self._evaluate_enum_expression(children[1], source, known)
+            if left is None or right is None:
+                return None
+            operator = node.children[1].type
+            try:
+                if operator == "+":
+                    return left + right
+                if operator == "-":
+                    return left - right
+                if operator == "*":
+                    return left * right
+                if operator == "/":
+                    return int(left / right) if right else None
+                if operator == "%":
+                    return left % right if right else None
+                if operator == "<<":
+                    return left << right
+                if operator == ">>":
+                    return left >> right
+                if operator == "|":
+                    return left | right
+                if operator == "&":
+                    return left & right
+                if operator == "^":
+                    return left ^ right
+            except (ArithmeticError, ValueError):
+                return None
+        return None
+
+    def _parse_c_integer_literal(self, value: str) -> int | None:
+        value = strip_outer_parens(value.strip())
+        value = re.sub(r"[uUlL]+$", "", value)
+        if not value:
+            return None
+        try:
+            if value.lower().startswith("0x"):
+                return int(value, 16)
+            if value.lower().startswith("0b"):
+                return int(value, 2)
+            if len(value) > 1 and value.startswith("0"):
+                return int(value, 8)
+            return int(value, 10)
+        except ValueError:
+            return None
+
+    def _integer_symbol_value(
+        self, name: str, known: dict[str, int], visited: set[str]
+    ) -> int | None:
+        if name in known:
+            return known[name]
+        if name in visited:
+            return None
+        visited.add(name)
+        macro = self._all_macros().get(name)
+        if macro is None:
+            return None
+        replacement = strip_outer_parens(macro[0].strip())
+        literal = self._parse_c_integer_literal(replacement)
+        if literal is not None:
+            return literal
+        if _IDENTIFIER.fullmatch(replacement):
+            return self._integer_symbol_value(replacement, known, visited)
+        return None
+
     # --------------------------------------------------------------- utilities
     def _literal(self, value: str) -> bool:
         value = strip_outer_parens(value.strip())
@@ -1731,9 +2233,19 @@ class ValueFlowResolver:
                 combined[name] = (value, path)
         return combined
 
-    def _resolve_macro(self, name: str) -> tuple[str, str, int] | None:
+    def _resolve_macro(
+        self, name: str, file_name: str | None = None
+    ) -> tuple[str, str, int] | None:
         if not _IDENTIFIER.fullmatch(name):
             return None
+        visible_enum_values, visible_enum_ambiguities = self._visible_enum_index(
+            file_name or self.main_file_name
+        )
+        if name in visible_enum_ambiguities:
+            return None
+        enum_value = visible_enum_values.get(name)
+        if enum_value is not None:
+            return enum_value
         macros = self._all_macros()
         current = name
         visited: set[str] = set()

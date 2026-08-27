@@ -25,6 +25,9 @@ class ValueFlowTests(unittest.TestCase):
         return_use=None,
         path_cap: int = 100,
         cache_path: Path | None = None,
+        main_file_name: str = "main.c",
+        entry_function_name: str = "main",
+        entry_points: list[tuple[str, str]] | None = None,
     ) -> ValueFlowResolver:
         project_structure = {}
         for name, source in files.items():
@@ -59,7 +62,9 @@ class ValueFlowTests(unittest.TestCase):
             project_structure={
                 key: str(value) for key, value in project_structure.items()
             },
-            main_file_name="main.c",
+            main_file_name=main_file_name,
+            entry_function_name=entry_function_name,
+            entry_points=entry_points,
             function_configs=configs,
             macros=builder.macros,
             file_macros=file_macros,
@@ -108,6 +113,265 @@ class ValueFlowTests(unittest.TestCase):
             self.assertEqual(len({seed.site.site_id for seed in resolver.seeds}), 3)
             parameter_token = ParamQuery("[main.c]wrapper", 1).token()
             self.assertIn(parameter_token, resolver.results)
+
+    def test_enum_constants_are_resolved_without_llm(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            called = []
+
+            async def one_hop(*args):
+                called.append(args)
+                return OneHopAnswer(kind="VALUE", value="999")
+
+            resolver = self.build_resolver(
+                Path(temp_dir),
+                {
+                    "defs.h": (
+                        "enum FileNos { BASE = 3909, NEXT, "
+                        "ALIAS = BASE + 3, HEX = 0xF };\n"
+                    ),
+                    "main.c": (
+                        '#include "defs.h"\n'
+                        "typedef struct { int value; } Handle;\n"
+                        "void open_h(Handle *h, int file_no);\n"
+                        "void read_h(Handle *h);\n"
+                        "int main(void) { Handle h; "
+                        "open_h(&h, NEXT); read_h(&h); return 0; }\n"
+                    ),
+                },
+                {
+                    "open_h": {
+                        "type": "OPENF",
+                        "indices": [2],
+                        "handle_index": 1,
+                        "dependent_functions": [],
+                    },
+                    "read_h": {
+                        "type": "READF",
+                        "indices": [],
+                        "handle_index": 1,
+                        "dependent_functions": ["open_h"],
+                    },
+                },
+                one_hop=one_hop,
+            )
+            records = asyncio.run(resolver.run())
+
+            self.assertEqual(resolver.enum_values["NEXT"][0], "3910")
+            self.assertEqual(resolver.enum_values["ALIAS"][0], "3912")
+            self.assertEqual(
+                {
+                    record.fact.value
+                    for record in records
+                    if record.seed.target_function in {"open_h", "read_h"}
+                },
+                {"3910"},
+            )
+            self.assertTrue(
+                all(
+                    record.fact.resolved_by == "SYNTAX"
+                    for record in records
+                    if record.fact.value == "3910"
+                )
+            )
+            self.assertEqual(called, [])
+
+    def test_enum_resolution_uses_included_header_not_archive_copy(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            called = []
+
+            async def one_hop(*args):
+                called.append(args)
+                return OneHopAnswer(kind="VALUE", value="1021")
+
+            resolver = self.build_resolver(
+                Path(temp_dir),
+                {
+                    "active/types.h": (
+                        "enum FileNos { DynReCtlInfFNO = 3918 };\n"
+                    ),
+                    "active/api.h": '#include "active/types.h"\n',
+                    "archive/types.h": (
+                        "enum FileNos { DynReCtlInfFNO = 1021 };\n"
+                    ),
+                    "main.c": (
+                        '#include "active/api.h"\n'
+                        "void target(int value);\n"
+                        "int main(void) { target(DynReCtlInfFNO); return 0; }\n"
+                    ),
+                },
+                {
+                    "target": {
+                        "type": "READF",
+                        "indices": [1],
+                        "dependent_functions": [],
+                    }
+                },
+                one_hop=one_hop,
+            )
+            records = asyncio.run(resolver.run())
+
+            self.assertEqual(records[0].fact.value, "3918")
+            self.assertEqual(records[0].fact.origin_kind, "CONST")
+            self.assertEqual(records[0].fact.resolved_by, "SYNTAX")
+            self.assertEqual(called, [])
+
+    def test_unrelated_nearby_open_is_not_a_handle_resolution(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            resolver = self.build_resolver(
+                Path(temp_dir),
+                {
+                    "main.c": (
+                        "typedef struct { int value; } Handle;\n"
+                        "void open_h(Handle *h, int file_no);\n"
+                        "void read_h(Handle *h);\n"
+                        "int main(void) { Handle a; Handle b; Handle c;\n"
+                        "  open_h(&a, 10); open_h(&b, 20); read_h(&c);\n"
+                        "  return 0; }\n"
+                    )
+                },
+                {
+                    "open_h": {
+                        "type": "OPENF",
+                        "indices": [2],
+                        "handle_index": 1,
+                        "dependent_functions": [],
+                    },
+                    "read_h": {
+                        "type": "READF",
+                        "indices": [],
+                        "handle_index": 1,
+                        "dependent_functions": ["open_h"],
+                    },
+                },
+            )
+            records = asyncio.run(resolver.run())
+            read_records = [
+                record
+                for record in records
+                if record.seed.target_function == "read_h"
+            ]
+
+            self.assertEqual(len(read_records), 1)
+            self.assertEqual(read_records[0].fact.origin_kind, "UNRESOLVED")
+            self.assertEqual(read_records[0].fact.value, "HANDLE_AMBIGUOUS")
+            self.assertNotEqual(read_records[0].fact.link_method, "LEGACY_PROXIMITY")
+
+    def test_llm_value_is_a_candidate_not_an_exact_fact(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            async def one_hop(*args):
+                return OneHopAnswer(kind="VALUE", value="999")
+
+            resolver = self.build_resolver(
+                Path(temp_dir),
+                {
+                    "main.c": (
+                        "void target(int value);\n"
+                        "int main(void) { int input; target(input); return 0; }\n"
+                    )
+                },
+                {
+                    "target": {
+                        "type": "READF",
+                        "indices": [1],
+                        "dependent_functions": [],
+                    }
+                },
+                one_hop=one_hop,
+            )
+            records = asyncio.run(resolver.run())
+
+            self.assertEqual(len(records), 1)
+            self.assertEqual(records[0].fact.value, "999")
+            self.assertEqual(records[0].fact.origin_kind, "LLM_CANDIDATE")
+            self.assertEqual(records[0].fact.resolved_by, "LLM")
+
+    def test_configured_wrapper_macro_keeps_target_identity(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            resolver = self.build_resolver(
+                Path(temp_dir),
+                {
+                    "api.h": "#define target_wrapper(value) target_impl(-1, (value))\n",
+                    "main.c": (
+                        '#include "api.h"\n'
+                        "void target_impl(int value, int mode);\n"
+                        "int main(void) { target_wrapper(7); return 0; }\n"
+                    ),
+                },
+                {
+                    "target_wrapper": {
+                        "type": "READF",
+                        "indices": [1],
+                        "dependent_functions": [],
+                    }
+                },
+            )
+
+            records = asyncio.run(resolver.run())
+
+            self.assertEqual(len(resolver.seeds), 1)
+            self.assertEqual(resolver.seeds[0].target_function, "target_wrapper")
+            self.assertEqual(resolver.seeds[0].site.callee_id, "target_impl")
+            self.assertEqual(records[0].fact.value, "7")
+
+    def test_nonstandard_process_entry_is_reachable(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            resolver = self.build_resolver(
+                Path(temp_dir),
+                {
+                    "entry.c": (
+                        "void target(int value);\n"
+                        "int pmf_main_H(void) { target(7); return 0; }\n"
+                    )
+                },
+                {
+                    "target": {
+                        "type": "READF",
+                        "indices": [1],
+                        "dependent_functions": [],
+                    }
+                },
+                main_file_name="entry.c",
+                entry_function_name="pmf_main_H",
+            )
+
+            records = asyncio.run(resolver.run())
+
+            self.assertEqual(len(resolver.reachable), 2)
+            self.assertEqual(len(resolver.seeds), 1)
+            self.assertEqual(records[0].fact.value, "7")
+            self.assertEqual(records[0].seed.call_function, "pmf_main_H")
+
+    def test_all_defined_lifecycle_entries_are_reachable_roots(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            resolver = self.build_resolver(
+                Path(temp_dir),
+                {
+                    "entry.c": (
+                        "void target(int value);\n"
+                        "int pmf_main_H(void) { target(7); return 0; }\n"
+                        "int pmf_end_H(void) { target(8); return 0; }\n"
+                    )
+                },
+                {
+                    "target": {
+                        "type": "READF",
+                        "indices": [1],
+                        "dependent_functions": [],
+                    }
+                },
+                main_file_name="entry.c",
+                entry_function_name="pmf_main_H",
+                entry_points=[
+                    ("entry.c", "pmf_main_H"),
+                    ("entry.c", "pmf_end_H"),
+                ],
+            )
+
+            records = asyncio.run(resolver.run())
+
+            self.assertEqual({record.fact.value for record in records}, {"7", "8"})
+            self.assertEqual(len(resolver.seeds), 2)
+            self.assertEqual(len(resolver.reachable), 3)
 
     def test_callback_edges_are_deduplicated_and_external_parameters_are_named(self):
         with tempfile.TemporaryDirectory() as temp_dir:

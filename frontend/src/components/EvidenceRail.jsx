@@ -194,7 +194,10 @@ export default function EvidenceRail({ turn, focusTarget, onReveal }) {
                       >
                         {copied === item.id ? <Check size={13} /> : <Copy size={13} />}
                       </button>
-                      <GraphButton label={t.graph} onClick={() => onReveal?.([item.id])} />
+                      <GraphButton
+                        label={t.graph}
+                        onClick={() => onReveal?.([item.id], [], item.process || item.processes?.[0] || null)}
+                      />
                     </div>
                     {open && (
                       item.source ? (
@@ -240,7 +243,7 @@ export default function EvidenceRail({ turn, focusTarget, onReveal }) {
                       </div>
                       <GraphButton
                         label={t.graph}
-                        onClick={() => onReveal?.(functionIdsForPath(path), edgeKeysForPath(path))}
+                        onClick={() => onReveal?.(functionIdsForPath(path), edgeKeysForPath(path), path.process || undefined)}
                       />
                     </div>
                     <div className="flex flex-wrap items-center gap-y-2">
@@ -258,7 +261,7 @@ export default function EvidenceRail({ turn, focusTarget, onReveal }) {
                           )}
                           <button
                             type="button"
-                            onClick={() => onReveal?.([step.function_id])}
+                            onClick={() => onReveal?.([step.function_id], [], step.process || path.process || null)}
                             className={`rounded-md border px-2 py-1 text-left font-mono text-[10px] transition hover:border-rule-strong ${
                               step.kind === "callback"
                                 ? "border-violet-400/60 bg-violet-500/10 text-violet-700 dark:text-violet-300"
@@ -316,7 +319,7 @@ export default function EvidenceRail({ turn, focusTarget, onReveal }) {
                           <button
                             key={fn.id}
                             type="button"
-                            onClick={() => onReveal?.([fn.id])}
+                            onClick={() => onReveal?.([fn.id], [], fn.process || resource.processes?.[0] || null)}
                             className="rounded border border-rule bg-sunken px-1.5 py-0.5 font-mono text-[10px] text-ink-muted hover:text-ink"
                           >
                             {fn.name}
