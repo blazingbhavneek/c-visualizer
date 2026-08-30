@@ -4,6 +4,14 @@ This project resolves the C files selected by a process Makefile, builds a
 static call graph for every discovered function, traces configured daemon/API
 arguments, and writes self-contained snapshots for the React visualizer.
 
+## How the value-flow pipeline works
+
+`walkthrough.md` is a step-by-step, plain-English tour of the
+`--resolver valueflow` pipeline: Makefile resolution, tree-sitter parsing,
+call-graph and reachability, seeds, the backward value walk, when the LLM is
+called, and the output shape — each step tied to the file/function/line that
+does it. Start there to understand the code.
+
 ## Run a complete index
 
 An index-only run does not call the legacy target-variable LLM:
