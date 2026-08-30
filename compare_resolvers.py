@@ -43,7 +43,7 @@ def main() -> None:
     state = load_project_state(json_dir)
     state.set("PROJECT_NAME", project_path.name)
 
-    structure, main_files = return_project_mapping(show=False, project_path=project_path)
+    structure, main_files, _srcs = return_project_mapping(show=False, project_path=project_path)
     structure = dict(sorted(structure.items(), key=lambda item: str(item[0])))
     state.set("PROJECT_STRUCTURE", structure)
     # preprocess() needs real Paths; trace_variable also stringifies only after.

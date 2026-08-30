@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from typing import Literal, TypeAlias
 
 # VALUE-FLOW "QUESTION" AND "ANSWER" SHAPES
@@ -27,6 +27,10 @@ from typing import Literal, TypeAlias
 OriginKind: TypeAlias = Literal[
     "CONST",
     "MACRO",
+    # A source-backed table/wrapper result.  Each value is retained as
+    # evidence, but downstream must not treat the set as one exact path.
+    "CONST_TABLE",
+    "BOUNDED_SET",
     # Model suggestion retained as evidence, never eligible for exact index.
     "LLM_CANDIDATE",
     "EXTERNAL_ENTRY",
@@ -117,6 +121,10 @@ class Fact:
     source_site_id: str = ""
     resolved_by: Literal["SYNTAX", "LLM"] = "SYNTAX"
     link_method: str = ""
+    # Structured provenance for bounded tables, wrapper writes, string flow,
+    # and pointer-parameter bindings.  Optional so old query caches remain
+    # readable.
+    metadata: dict = field(default_factory=dict)
 
     @property
     def source_key(self) -> tuple[str, int, str, str, str, str]:

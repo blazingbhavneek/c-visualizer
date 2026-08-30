@@ -46,6 +46,15 @@ def normalise_handle(expression: str) -> str:
     # value; it only answers "are these two handle expressions the same object?"
     value = strip_outer_parens(expression)
 
+    # Compatible pointer casts do not change handle identity.  Restrict this
+    # to pointer-shaped C casts; ordinary parenthesized expressions remain
+    # untouched and are handled by strip_outer_parens above.
+    value = re.sub(
+        r"^\((?:const\s+)?(?:struct\s+)?[A-Za-z_]\w*(?:\s*\*)+\)\s*",
+        "",
+        value,
+    )
+
     # Address-of syntax is not part of a handle's identity:
     # `fcb`, `&fcb`, and `(&fcb)` all refer to the same root object here.
     while value.startswith("&"):

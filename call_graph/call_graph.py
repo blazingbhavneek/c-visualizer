@@ -21,6 +21,22 @@ console = Console()
 FILE_NAME_REGEX = r"\[(.*?)\]"
 
 
+def _collapse_single_named(node):
+    """Descend through wrapper nodes carrying exactly one named child.
+
+    A bare token like ``handler`` parses as
+    ``translation_unit > expression_statement > identifier``; macro-
+    expansion parsing needs the inner node.
+    """
+    while (
+        node is not None
+        and node.type in ("translation_unit", "expression_statement")
+        and len(node.named_children) == 1
+    ):
+        node = node.named_children[0]
+    return node
+
+
 class CallGraphBuilder:
     def __init__(
         self,
@@ -69,12 +85,19 @@ class CallGraphBuilder:
             replacement = self.macros[current_name][0]
 
             try:
-                tree = self.parser.parse(replacement.encode("latin-1"))
-                root = tree.root_node
+                # A bare call parses as ERROR without a statement terminator;
+                # adding one keeps the structure without changing tokens.
+                tree = self.parser.parse(
+                    (replacement + ";").encode("latin-1")
+                )
+                root = _collapse_single_named(tree.root_node)
 
-                if root.type == "identifier":
+                if root is not None and root.type == "identifier":
                     current_name = root.text.decode("latin-1")
                     continue
+
+                if root is None:
+                    break
 
                 stack = [root]
                 while stack:
@@ -172,7 +195,7 @@ class CallGraphBuilder:
                             else:
                                 self.global_funcs[name] = (str(filepath), node)
 
-                    if filepath.suffix == ".h":
+                    if filepath.suffix in (".c", ".h"):
                         if node.type in ("preproc_def", "preproc_function_def"):
                             name_node = node.child_by_field_name("name")
                             value_node = node.child_by_field_name("value")
@@ -199,11 +222,14 @@ class CallGraphBuilder:
                                 )
 
                                 macro_name = name_node.text.decode("latin-1")
-                                self.macros[macro_name] = (
-                                    macro_value,
-                                    str(filepath),
-                                    macro_signature,
-                                )
+                                # Header macros stay authoritative; a .c
+                                # definition only fills a name no header gave.
+                                if macro_name not in self.macros:
+                                    self.macros[macro_name] = (
+                                        macro_value,
+                                        str(filepath),
+                                        macro_signature,
+                                    )
 
                     for child in reversed(node.children):
                         stack.append(child)
@@ -329,6 +355,223 @@ class CallGraphBuilder:
 
         return None
 
+    def _callback_registrar(self, callee_name: str) -> tuple[str, str | None] | None:
+        """Return ``(config_name, registrar_macro)`` for callback configs.
+
+        The config may belong to the raw callee or to a function-like wrapper
+        macro that expands to the configured API.  Returns ``None`` when the
+        call registers no configured callbacks.
+        """
+        if callee_name in self.fp_args_map:
+            return callee_name, None
+
+        expanded = self._get_expanded_macro_name(callee_name)
+        if expanded and expanded in self.fp_args_map:
+            return expanded, callee_name
+
+        return None
+
+    def _unwrap_value_node(self, arg_node):
+        """Unwrap casts, parentheses, and address-of down to the value node."""
+        node = arg_node
+        seen = 0
+        while seen < 8:
+            if node.type == "cast_expression":
+                node = node.child_by_field_name("value")
+            elif node.type in ("pointer_expression", "unary_expression"):
+                node = node.child_by_field_name("argument")
+            elif node.type == "parenthesized_expression":
+                inner = [c for c in node.children if c.type not in ("(", ")")]
+                node = inner[0] if inner else None
+            else:
+                break
+            seen += 1
+        return node
+
+    def _resolve_value_alias(self, name: str) -> tuple[str, str]:
+        """Canonicalize a callback argument through safe macro aliases.
+
+        Supports object-like chains (``A -> B -> function``) and object-like
+        macros whose whole value is one direct call.  Function-like wrappers,
+        token pasting, stringification, and variadic forwarding are recorded
+        as diagnostics instead of guessed edges.
+        """
+        visited: set[str] = set()
+        current = name
+        while current in self.macros and current not in visited:
+            visited.add(current)
+            replacement, _definition_file, signature = self.macros[current]
+            if "(" in signature:
+                # A function-like macro as a value alias needs argument
+                # substitution; only the registrar seam models that, so a
+                # raw alias is recorded instead of guessed.
+                return name, f"unsupported_function_like_alias:{current}"
+            if any(token in replacement for token in ("##", "#", "__VA_ARGS__")):
+                return name, f"unsupported_macro_syntax:{current}"
+            try:
+                tree = self.parser.parse(
+                    (replacement + ";").encode("latin-1")
+                )
+            except Exception:
+                return name, f"unparsable_macro_expansion:{current}"
+            root = _collapse_single_named(tree.root_node)
+            if root is None:
+                return name, f"ambiguous_macro_expansion:{current}"
+            if root.type == "identifier":
+                current = root.text.decode("latin-1")
+                continue
+            calls = [n for n in self._iter_nodes(root) if n.type == "call_expression"]
+            if len(calls) != 1:
+                return name, f"ambiguous_macro_expansion:{current}"
+            func = calls[0].child_by_field_name("function")
+            if not func or func.type != "identifier":
+                return name, f"indirect_macro_expansion:{current}"
+            return func.text.decode("latin-1"), ""
+        return current, ""
+
+    @staticmethod
+    def _iter_nodes(root):
+        stack = [root]
+        while stack:
+            node = stack.pop()
+            yield node
+            for child in node.children:
+                stack.append(child)
+
+    def _map_registrar_position(
+        self,
+        registrar_macro: str,
+        position: int,
+        arg_nodes: list,
+    ):
+        """Map a configured position of the expanded API back to one actual
+        argument of the wrapper macro call.
+
+        Returns ``(arg_node, diagnostic)``.  The mapping is only trusted when
+        exactly one plain parameter token of the macro signature occupies the
+        position in the expansion.
+        """
+        expansion, _definition_file, signature = self.macros[registrar_macro]
+        if any(token in expansion for token in ("##", "#", "__VA_ARGS__")):
+            return None, f"unsupported_registrar_macro:{registrar_macro}"
+        try:
+            params = [
+                p.strip()
+                for p in signature.split("(", 1)[1].rsplit(")", 1)[0].split(",")
+                if p.strip()
+            ]
+        except IndexError:
+            return None, f"unparsable_registrar_signature:{registrar_macro}"
+
+        try:
+            tree = self.parser.parse((expansion + ";").encode("latin-1"))
+        except Exception:
+            return None, f"unparsable_registrar_expansion:{registrar_macro}"
+
+        calls = [n for n in self._iter_nodes(tree.root_node) if n.type == "call_expression"]
+        if len(calls) != 1:
+            return None, f"ambiguous_registrar_expansion:{registrar_macro}"
+        args_node = calls[0].child_by_field_name("arguments")
+        if args_node is None:
+            return None, f"registrar_has_no_arguments:{registrar_macro}"
+        expanded_args = args_node.named_children
+        if position < 1 or position > len(expanded_args):
+            return None, f"registrar_position_out_of_range:{registrar_macro}:{position}"
+
+        token = expanded_args[position - 1]
+        if token.type != "identifier":
+            return None, f"registrar_position_not_plain_parameter:{registrar_macro}:{position}"
+        token_text = token.text.decode("latin-1")
+        matches = [p for p in params if p == token_text]
+        if len(matches) != 1:
+            return None, f"registrar_parameter_ambiguous:{registrar_macro}:{token_text}"
+        index = params.index(token_text)
+        if index >= len(arg_nodes):
+            return None, f"registrar_argument_missing:{registrar_macro}:{position}"
+        return arg_nodes[index], ""
+
+    def _extract_callbacks(
+        self,
+        *,
+        call_site: CallSite,
+        callee_name: str,
+        call_node,
+        args_node,
+        caller_file: str,
+    ) -> None:
+        """Record callback registrations with one-based, AST-named arguments."""
+        registrar = self._callback_registrar(callee_name)
+        if registrar is None:
+            return
+        config_name, registrar_macro = registrar
+        arg_indices = self.fp_args_map[config_name].get("func_argument", [])
+        if not arg_indices or args_node is None:
+            return
+        arg_nodes = list(args_node.named_children)
+
+        seen_canonical: set[str] = set()
+        for position in sorted(set(arg_indices)):
+            record: dict[str, object] = {
+                "registrar": callee_name,
+                "registrar_expanded": config_name if registrar_macro else "",
+                "spelling": "",
+                "canonical": "",
+                "raw_text": "",
+                "start_byte": -1,
+                "end_byte": -1,
+                "registrar_file": caller_file,
+                "registrar_line": call_site.line_number,
+                "diagnostic": "",
+                "node": None,
+            }
+
+            if registrar_macro is not None:
+                target_arg, diagnostic = self._map_registrar_position(
+                    registrar_macro, position, arg_nodes
+                )
+                if diagnostic:
+                    record["diagnostic"] = diagnostic
+                    call_site.callback_records.append(record)
+                    continue
+            elif 1 <= position <= len(arg_nodes):
+                target_arg = arg_nodes[position - 1]
+            else:
+                record["diagnostic"] = f"callback_position_out_of_range:{callee_name}:{position}"
+                call_site.callback_records.append(record)
+                continue
+
+            value_node = self._unwrap_value_node(target_arg)
+            record["raw_text"] = target_arg.text.decode("latin-1", errors="replace")
+            record["start_byte"] = target_arg.start_byte
+            record["end_byte"] = target_arg.end_byte
+
+            if value_node is None or value_node.type != "identifier":
+                record["diagnostic"] = f"non_identifier_callback_argument:{callee_name}:{position}"
+                call_site.callback_records.append(record)
+                continue
+
+            spelling = value_node.text.decode("latin-1")
+            canonical, diagnostic = self._resolve_value_alias(spelling)
+            record["spelling"] = spelling
+            record["canonical"] = canonical
+            record["diagnostic"] = diagnostic
+            if diagnostic:
+                call_site.callback_records.append(record)
+                continue
+
+            if canonical in seen_canonical:
+                # Duplicate registration of the same canonical handler keeps a
+                # single canonical edge; the display records stay separate.
+                call_site.callback_records.append(record)
+                continue
+            seen_canonical.add(canonical)
+
+            node = self._get_or_create_node(canonical, caller_file)
+            record["node"] = node
+            call_site.callbacks.append(node)
+            call_site.callback_records.append(record)
+            print("Argument function name", canonical)
+
     def _process_function_body(
         self,
         func_node,
@@ -369,48 +612,14 @@ class CallGraphBuilder:
 
                     self.graph[caller_node.unique_id].append(call_site)
 
-                    if callee_name in self.fp_args_map:
-                        arg_indices = self.fp_args_map[callee_name].get(
-                            "func_argument", []
+                    if self._callback_registrar(callee_name) is not None:
+                        self._extract_callbacks(
+                            call_site=call_site,
+                            callee_name=callee_name,
+                            call_node=node,
+                            args_node=node.child_by_field_name("arguments"),
+                            caller_file=caller_file,
                         )
-
-                        if arg_indices:
-                            args_node = node.child_by_field_name("arguments")
-
-                            if args_node:
-                                for idx, arg_child in enumerate(
-                                    args_node.children,
-                                    start=1,
-                                ):
-                                    if idx / 2 in arg_indices:
-                                        if arg_child.type == "identifier":
-                                            arg_func_name = arg_child.text.decode(
-                                                "latin-1"
-                                            )
-                                            print(
-                                                "Argument function name",
-                                                arg_func_name,
-                                            )
-                                            arg_func_node = self._resolve_callee(
-                                                callee_name=arg_func_name,
-                                                caller_file=caller_file,
-                                            )
-                                            call_site.callbacks.append(arg_func_node)
-
-                                        arg_func_name = self._extract_arg_function_name(
-                                            arg_child
-                                        )
-
-                                        if arg_func_name:
-                                            print(
-                                                "Argument function name",
-                                                arg_func_name,
-                                            )
-                                            arg_func_node = self._resolve_callee(
-                                                callee_name=arg_func_name,
-                                                caller_file=caller_file,
-                                            )
-                                            call_site.callbacks.append(arg_func_node)
 
                 else:
                     line = node.start_point.row + 1

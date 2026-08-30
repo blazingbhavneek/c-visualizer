@@ -39,7 +39,7 @@ import json
 import os
 import re
 import tempfile
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from io import StringIO
 from pathlib import Path
@@ -55,7 +55,7 @@ from target_spec import (
 )
 from value_flow.handles import strip_outer_parens
 
-DISCOVERY_SCHEMA_VERSION = 1
+DISCOVERY_SCHEMA_VERSION = 3
 
 # build-index graph lock classification (mirrors build_graph.py exactly:
 # copyfile and _D record operations intentionally produce no graph edge)
@@ -89,6 +89,11 @@ EVIDENCE_COLUMNS = [
     "path_count",
     "resolver",
     "status",
+    "reachability",
+    "evidence_process",
+    "owner_process",
+    "owner_kind",
+    "metadata",
 ]
 
 # Discovery fact statuses.  EXACT rows may feed the exact JSON indexes; every
@@ -100,6 +105,24 @@ STATUS_DYNAMIC = "DYNAMIC"
 STATUS_NO_TARGET = "NO_TARGET"
 STATUS_UNREACHABLE = "UNREACHABLE"
 STATUS_CYCLE = "CYCLE"
+
+# Reachability dimension, kept separate from value-resolution ``status``.
+# Promotion to the exact JSON indexes requires status EXACT, in_process, and a
+# root-proven reachability (DIRECT_ROOT or CALLBACK) -- never a cross-process
+# or root-failure row.
+REACH_DIRECT_ROOT = "DIRECT_ROOT"
+REACH_CALLBACK = "CALLBACK"
+REACH_CROSS_PROCESS_CALLER = "CROSS_PROCESS_CALLER"
+REACH_OUT_OF_PROCESS_SCOPE = "OUT_OF_PROCESS_SCOPE"
+REACH_ROOT_PARSE_FAILURE = "ROOT_PARSE_FAILURE"
+REACH_NO_PROCESS_ROOT = "NO_PROCESS_ROOT"
+REACH_UNREACHABLE_IN_PROCESS = "UNREACHABLE_IN_PROCESS"
+REACH_LOCAL_BACKWALK = "LOCAL_BACKWALK"
+REACH_UNKNOWN = "UNKNOWN"
+
+# The only reachability values that promote an EXACT row into the exact
+# process indexes.
+ROOT_PROVEN_REACHABILITIES = frozenset({REACH_DIRECT_ROOT, REACH_CALLBACK})
 
 
 # --------------------------------------------------------------------- paths
@@ -500,6 +523,11 @@ class NormalizedDiscoveryFact:
     path_count: int
     status: str
     in_process: bool = True
+    # How the target's process roots relate to this site; see the
+    # REACH_* constants.  Old rows without the column read as UNKNOWN and are
+    # never treated as proven dead code.
+    reachability: str = REACH_UNKNOWN
+    metadata: dict[str, Any] = field(default_factory=dict)
 
 
 def _classify_valueflow_fact(
@@ -531,6 +559,11 @@ def _classify_valueflow_fact(
     # through the parsed source tree.  Keep it visible in evidence while
     # preventing it from entering the exact index.
     if origin == "LLM_CANDIDATE":
+        return STATUS_UNRESOLVED, value
+
+    # Bounded source-backed sets are valid evidence but not one exact runtime
+    # path.  Keep status conservative so exact indexes cannot flatten them.
+    if origin in {"CONST_TABLE", "BOUNDED_SET"}:
         return STATUS_UNRESOLVED, value
 
     if origin in {"EXTERNAL_DATA", "EXTERNAL_ENTRY"}:
@@ -579,8 +612,45 @@ def _join_site(
     return None
 
 
+def classify_reachability(
+    resolver_state: dict[str, Any] | None,
+    *,
+    in_process: bool,
+    caller_id: str | None = None,
+) -> str:
+    """Reachability dimension for one evidence row.
+
+    A missing ``resolver_state`` means incomplete diagnostic data (legacy
+    rows, tests without resolver state): the row stays UNKNOWN, which is
+    never a proven dead-code result.  Cross-process rows never masquerade as
+    in-process unreachable rows; root failures are explicit instead of a
+    blanket unreachable claim.
+    """
+    if not resolver_state:
+        return REACH_UNKNOWN
+    if not in_process:
+        return REACH_OUT_OF_PROCESS_SCOPE
+    direct_reachable = set(resolver_state.get("direct_reachable") or ())
+    reachable = set(resolver_state.get("reachable") or ())
+    if caller_id:
+        if caller_id in direct_reachable:
+            return REACH_DIRECT_ROOT
+        if caller_id in reachable:
+            return REACH_CALLBACK
+    root_state = str(resolver_state.get("root_state") or "")
+    if root_state == REACH_ROOT_PARSE_FAILURE:
+        return REACH_ROOT_PARSE_FAILURE
+    if root_state == REACH_NO_PROCESS_ROOT:
+        return REACH_NO_PROCESS_ROOT
+    return REACH_UNREACHABLE_IN_PROCESS
+
+
 def _unreachable_facts(
-    sites: list[TargetSite], covered: set[tuple], resolver: str, targets: dict[str, Any]
+    sites: list[TargetSite],
+    covered: set[tuple],
+    resolver: str,
+    targets: dict[str, Any],
+    resolver_state: dict[str, Any] | None = None,
 ) -> list[NormalizedDiscoveryFact]:
     """Inventory sites with no resolver evidence become explicit rows.
 
@@ -588,6 +658,7 @@ def _unreachable_facts(
     call; it must remain visible instead of silently disappearing from the
     output.
     """
+    resolver_state = resolver_state or {}
     rows: list[NormalizedDiscoveryFact] = []
     for site in sites:
         key = (site.target_function, site.site_file, site.site_line, site.arg_index)
@@ -613,6 +684,10 @@ def _unreachable_facts(
                 path_count=0,
                 status=STATUS_UNREACHABLE,
                 in_process=site.in_process,
+                reachability=classify_reachability(
+                    resolver_state,
+                    in_process=site.in_process,
+                ),
             )
         )
     return rows
@@ -667,13 +742,16 @@ def valueflow_records_to_facts(
     spec: dict[str, Any] | None,
     source_root: Path,
     process_root: Path,
+    resolver_state: dict[str, Any] | None = None,
 ) -> list[NormalizedDiscoveryFact]:
     """Convert value-flow ResolvedSeed records into normalized facts.
 
     ``records`` are the in-memory resolver results (never the flattened
     legacy CSV).  Facts join back to the shared site inventory for the raw
-    target expression and operation.
+    target expression and operation.  ``resolver_state`` carries root state
+    and reachability sets so every row gets an explicit reachability class.
     """
+    resolver_state = resolver_state or {}
     targets = (spec or {}).get("targets") or {}
     site_index = _make_site_index(sites)
     facts: list[NormalizedDiscoveryFact] = []
@@ -697,6 +775,18 @@ def valueflow_records_to_facts(
         status, value = _classify_valueflow_fact(
             record, resource, operation, site.arg_expression if site else ""
         )
+        in_process = site.in_process if site is not None else True
+        caller_id = getattr(getattr(record, "seed", None), "site", None)
+        caller_id = getattr(caller_id, "caller_id", None)
+        row_reachability = classify_reachability(
+            resolver_state,
+            in_process=in_process,
+            caller_id=caller_id,
+        )
+        if str(getattr(record.fact, "link_method", "") or "") == "LOCAL_BACKWALK":
+            # Same-function backwalk proves a source-valid value, not root
+            # reachability; keep it a separate, explicitly labeled row.
+            row_reachability = REACH_LOCAL_BACKWALK
         facts.append(
             NormalizedDiscoveryFact(
                 resolver="valueflow",
@@ -716,11 +806,13 @@ def valueflow_records_to_facts(
                 link_method=str(fact.link_method or ""),
                 path_count=int(getattr(record, "path_count", 0) or 0),
                 status=status,
-                in_process=site.in_process if site is not None else True,
+                in_process=in_process,
+                reachability=row_reachability,
+                metadata=dict(getattr(fact, "metadata", {}) or {}),
             )
         )
 
-    facts.extend(_unreachable_facts(sites, covered, "valueflow", targets))
+    facts.extend(_unreachable_facts(sites, covered, "valueflow", targets, resolver_state))
     return _dedupe_facts(facts)
 
 
@@ -846,6 +938,7 @@ def legacy_answers_to_facts(
                         path_count=1,
                         status=status,
                         in_process=site.in_process if site is not None else True,
+                        metadata={},
                     )
                 )
 
@@ -868,6 +961,8 @@ def build_discovery_payloads(
     target_registry_version: str = "",
     target_registry_digest: str = "",
     file_function_counts: dict[str, int] | None = None,
+    preprocessor_config: dict[str, Any] | None = None,
+    root_diagnostics: dict[str, Any] | None = None,
 ) -> dict[str, str]:
     """Assemble every artifact of one discovery index (pure, no I/O).
 
@@ -876,7 +971,23 @@ def build_discovery_payloads(
     """
     prefix = process_relative_prefix(source_root, process_root)
 
-    exact = [f for f in facts if f.status == STATUS_EXACT and f.in_process]
+    # Exact promotion needs a proven value, an in-process site, and a
+    # root-proven reachability.  Cross-process and root-failure rows stay
+    # evidence-only.  LOCAL_BACKWALK rows promote only when the run's root
+    # diagnostics show no unresolved root failure.  UNKNOWN (legacy rows and
+    # legacy resolver output) keeps its historical promotion behavior so old
+    # results read unchanged.
+    local_backwalk_allowed = str(
+        (root_diagnostics or {}).get("root_state") or ""
+    ) == "OK"
+    promotable = ROOT_PROVEN_REACHABILITIES | {REACH_UNKNOWN}
+    if local_backwalk_allowed:
+        promotable = promotable | {REACH_LOCAL_BACKWALK}
+    exact = [
+        f
+        for f in facts
+        if f.status == STATUS_EXACT and f.in_process and f.reachability in promotable
+    ]
     dynamic = [f for f in facts if f.status == STATUS_DYNAMIC and f.in_process]
 
     # --- forkproc ----------------------------------------------------------
@@ -967,6 +1078,11 @@ def build_discovery_payloads(
             "path_count": f.path_count,
             "resolver": f.resolver,
             "status": f.status,
+            "reachability": f.reachability,
+            "evidence_process": process_name,
+            "owner_process": "",
+            "owner_kind": "",
+            "metadata": json.dumps(f.metadata or {}, ensure_ascii=False, sort_keys=True),
         }
         for f in facts
     ]
@@ -983,8 +1099,12 @@ def build_discovery_payloads(
 
     # --- metadata ---------------------------------------------------------------
     status_counts: dict[str, int] = {}
+    reachability_counts: dict[str, int] = {}
     for fact in facts:
         status_counts[fact.status] = status_counts.get(fact.status, 0) + 1
+        reachability_counts[fact.reachability] = (
+            reachability_counts.get(fact.reachability, 0) + 1
+        )
     metadata = {
         "schema_version": DISCOVERY_SCHEMA_VERSION,
         "pipeline": "c-visualizer",
@@ -997,6 +1117,8 @@ def build_discovery_payloads(
             "version": target_registry_version,
             "digest": target_registry_digest,
         },
+        "preprocessor": preprocessor_config or {},
+        "root_diagnostics": root_diagnostics or {},
         "run_id": run_id or "",
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "counts": {
@@ -1004,6 +1126,7 @@ def build_discovery_payloads(
             "target_sites_in_process": sum(1 for s in target_sites if s.in_process),
             "facts": len(facts),
             "evidence_statuses": dict(sorted(status_counts.items())),
+            "reachability": dict(sorted(reachability_counts.items())),
             "forkproc_callers": len(forkproc_callers_json),
             "mfs_file_access_entries": sum(len(v) for v in mfs_file_access.values()),
             "mfs_queue_access_entries": sum(len(v) for v in mfs_queue_access.values()),
@@ -1308,6 +1431,8 @@ def write_discovery_index(
     run_id: str | None = None,
     target_registry_digest: str = "",
     file_function_counts: dict[str, int] | None = None,
+    preprocessor_config: dict[str, Any] | None = None,
+    root_diagnostics: dict[str, Any] | None = None,
 ) -> Path:
     """Write the compatible discovery index atomically under ``output_dir``.
 
@@ -1331,6 +1456,8 @@ def write_discovery_index(
         target_registry_version=target_registry_version,
         target_registry_digest=target_registry_digest,
         file_function_counts=file_function_counts,
+        preprocessor_config=preprocessor_config,
+        root_diagnostics=root_diagnostics,
     )
 
     for name, text in payloads.items():

@@ -23,6 +23,7 @@ import subprocess
 import sys
 import tempfile
 from collections import defaultdict
+from io import StringIO
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -171,6 +172,123 @@ def _merge_dynamic_indexes(process_indexes: Iterable[Path]) -> dict[str, list[di
     }
 
 
+def _load_process_manifest(indexes: Iterable[Path]) -> list[dict[str, Any]]:
+    """Per-process ownership manifest built from index metadata.
+
+    Each entry carries canonical absolute paths.  Ownership is decided by
+    longest-prefix match on the process root, never by basename; a process
+    directory named ``lib*`` without executable roots is library-owned.
+    """
+    entries: list[dict[str, Any]] = []
+    for index_dir in indexes:
+        metadata = _read_json(index_dir / "index_metadata.json", {})
+        if not isinstance(metadata, dict):
+            continue
+        process_root = str(metadata.get("process_root") or "")
+        if not process_root:
+            continue
+        try:
+            resolved_root = str(Path(process_root).resolve())
+        except OSError:
+            continue
+        root_diagnostics = metadata.get("root_diagnostics") or {}
+        accepted = root_diagnostics.get("accepted_entry_points") or []
+        entries.append(
+            {
+                "process_name": str(
+                    metadata.get("process_name")
+                    or index_dir.parent.name
+                ),
+                "process_root": resolved_root,
+                "source_root": str(
+                    Path(str(metadata.get("source_root") or "")).resolve()
+                    if metadata.get("source_root")
+                    else ""
+                ),
+                "is_library": Path(resolved_root).name.startswith("lib"),
+                "is_executable": bool(accepted)
+                and str(root_diagnostics.get("root_state") or "")
+                != "NO_PROCESS_ROOT",
+            }
+        )
+    # Longest path first so a specific process root wins over a parent scope.
+    entries.sort(key=lambda entry: len(entry["process_root"].rstrip(os.sep)), reverse=True)
+    return entries
+
+
+def _owner_for_path(
+    path: str | Path, manifest: list[dict[str, Any]]
+) -> dict[str, Any] | None:
+    """The process whose root is the longest prefix of ``path``."""
+    if not path:
+        return None
+    try:
+        resolved = Path(path).expanduser()
+        if not resolved.is_absolute():
+            return None
+        resolved = resolved.resolve()
+    except OSError:
+        return None
+    resolved_text = str(resolved)
+    best = None
+    for entry in manifest:
+        root = entry["process_root"]
+        if resolved_text == root or resolved_text.startswith(root + os.sep):
+            if best is None or len(root) > len(best["process_root"]):
+                best = entry
+    return best
+
+
+def _owner_resolution_statuses(
+    indexes: Iterable[Path], manifest: list[dict[str, Any]]
+) -> dict[str, dict[tuple[str, int, int], str]]:
+    """Owner-process fact rows keyed by (absolute site file, line, arg index).
+
+    Values are the strongest owner-side outcome: ``resolved`` (an EXACT row
+    with root-proven reachability), ``present`` (some fact exists), or
+    ``absent`` is left out of the map entirely.
+    """
+    root_proven = {"DIRECT_ROOT", "CALLBACK"}
+    by_process: dict[str, dict[tuple[str, int, int], str]] = {}
+    for index_dir in indexes:
+        metadata = _read_json(index_dir / "index_metadata.json", {})
+        if not isinstance(metadata, dict):
+            continue
+        process_name = str(metadata.get("process_name") or index_dir.parent.name)
+        source_root = str(metadata.get("source_root") or "")
+        path = index_dir / "discovery_facts.csv"
+        if not path.is_file():
+            continue
+        facts: dict[tuple[str, int, int], str] = by_process.setdefault(
+            process_name, {}
+        )
+        with path.open(encoding="utf-8-sig", newline="") as handle:
+            for raw in csv.DictReader(handle):
+                site_file = str(raw.get("target_site_file", "") or "")
+                if not site_file:
+                    continue
+                site_path = Path(site_file)
+                if not site_path.is_absolute() and source_root:
+                    site_path = Path(source_root) / site_path
+                try:
+                    site_key_file = str(site_path.resolve())
+                except OSError:
+                    continue
+                try:
+                    line = int(raw.get("target_site_line", 0) or 0)
+                    arg_index = int(raw.get("arg_index", 0) or 0)
+                except ValueError:
+                    continue
+                key = (site_key_file, line, arg_index)
+                reachability = str(raw.get("reachability", "") or "")
+                status = str(raw.get("status", "") or "")
+                if status == "EXACT" and reachability in root_proven:
+                    facts[key] = "resolved"
+                elif facts.get(key) != "resolved":
+                    facts[key] = facts.get(key, "present")
+    return by_process
+
+
 def _merge_evidence(process_indexes: Iterable[Path]) -> list[dict[str, str]]:
     rows: dict[tuple[str, ...], dict[str, str]] = {}
     for index_dir in process_indexes:
@@ -219,6 +337,102 @@ def _rebuild_collisions(
     return result
 
 
+def classify_cross_process_rows(
+    evidence: list[dict[str, str]],
+    manifest: list[dict[str, Any]],
+    owner_statuses: dict[str, dict[tuple[str, int, int], str]],
+    source_root: str | Path,
+) -> tuple[list[dict[str, str]], list[dict[str, str]], dict[str, int]]:
+    """Rewrite out-of-process evidence rows with owner information.
+
+    Returns ``(evidence, cross_process_rows, counts)``.  A target site
+    outside the observing process is evidence for the observer but its
+    ownership and resolution belong to the process (or library) whose root
+    contains the site.  These rows never enter any exact JSON index:
+    per-process promotion already excludes out-of-process sites, and the
+    aggregate only unions per-process exact indexes.
+    """
+    source_root = Path(source_root)
+    cross_process_rows: list[dict[str, str]] = []
+    counts = {
+        "cross_process_caller_rows": 0,
+        "out_of_process_scope_rows": 0,
+        "unresolved_owner_rows": 0,
+    }
+    observing_roots = {
+        entry["process_name"]: entry["process_root"] for entry in manifest
+    }
+    for row in evidence:
+        reachability = row.get("reachability", "") or ""
+        if reachability not in ("", "UNKNOWN", "OUT_OF_PROCESS_SCOPE"):
+            continue
+        observed = row.get("evidence_process", "") or ""
+        site_file = row.get("target_site_file", "") or ""
+        if not site_file:
+            continue
+        site_path = Path(site_file)
+        if not site_path.is_absolute():
+            site_path = source_root / site_path
+        try:
+            site_abs = site_path.resolve()
+        except OSError:
+            continue
+        # A site under the observing process's own root is in-process
+        # evidence; only rows outside it are cross-process candidates.
+        observing_root = observing_roots.get(observed, "")
+        if observing_root and (
+            str(site_abs) == observing_root
+            or str(site_abs).startswith(observing_root + os.sep)
+        ):
+            continue
+        owner = _owner_for_path(site_abs, manifest)
+        if owner is None:
+            row["reachability"] = (
+                reachability if reachability else "OUT_OF_PROCESS_SCOPE"
+            )
+            if row["reachability"] == "OUT_OF_PROCESS_SCOPE":
+                counts["out_of_process_scope_rows"] += 1
+            continue
+        owner_name = owner["process_name"]
+        row["reachability"] = "CROSS_PROCESS_CALLER"
+        row["owner_process"] = owner_name
+        row["owner_kind"] = "library" if owner["is_library"] else "process"
+        site_key = (
+            str(site_abs),
+            int(row.get("target_site_line", 0) or 0),
+            int(row.get("arg_index", 0) or 0),
+        )
+        owner_status = owner_statuses.get(owner_name, {}).get(site_key, "absent")
+        if owner_status == "absent" or not owner["is_executable"]:
+            counts["unresolved_owner_rows"] += 1
+        counts["cross_process_caller_rows"] += 1
+        try:
+            line = int(row.get("target_site_line", 0) or 0)
+        except ValueError:
+            line = 0
+        cross_process_rows.append(
+            {
+                "target_site_file": site_file,
+                "target_site_line": str(line),
+                "target_function": row.get("target_function", "") or "",
+                "observed_from_process": observed,
+                "owner_process": owner_name,
+                "owner_kind": row["owner_kind"],
+                "owner_resolution_status": owner_status,
+                "owner_reachability": row.get("reachability", "") or "",
+            }
+        )
+    cross_process_rows.sort(
+        key=lambda item: (
+            item["target_site_file"],
+            item["target_site_line"],
+            item["target_function"],
+            item["observed_from_process"],
+        )
+    )
+    return evidence, cross_process_rows, counts
+
+
 def merge_cvisualizer_discoveries(
     structural_dir: str | Path,
     process_indexes: Iterable[str | Path],
@@ -239,6 +453,16 @@ def merge_cvisualizer_discoveries(
     dynamic = _merge_dynamic_indexes(indexes)
     evidence = _merge_evidence(indexes)
 
+    # Cross-process classification: see classify_cross_process_rows.
+    manifest = _load_process_manifest(indexes)
+    owner_statuses = _owner_resolution_statuses(indexes, manifest)
+    evidence, cross_process_rows, cross_counts = classify_cross_process_rows(
+        evidence, manifest, owner_statuses, source_root
+    )
+    cross_process_count = cross_counts["cross_process_caller_rows"]
+    out_of_scope_count = cross_counts["out_of_process_scope_rows"]
+    unresolved_owner_count = cross_counts["unresolved_owner_rows"]
+
     overlays = {
         "forkproc_callers.json": forkproc_callers,
         "forkproc_targets_by_caller.json": forkproc_targets,
@@ -252,6 +476,26 @@ def merge_cvisualizer_discoveries(
     for filename, payload in overlays.items():
         _atomic_write(structural_dir / filename, _json_text(payload))
     _write_evidence(structural_dir / "discovery_facts.csv", evidence)
+
+    cross_process_stream = StringIO()
+    cross_process_columns = (
+        "target_site_file",
+        "target_site_line",
+        "target_function",
+        "observed_from_process",
+        "owner_process",
+        "owner_kind",
+        "owner_resolution_status",
+        "owner_reachability",
+    )
+    cross_process_writer = csv.DictWriter(
+        cross_process_stream, fieldnames=cross_process_columns, lineterminator="\n"
+    )
+    cross_process_writer.writeheader()
+    cross_process_writer.writerows(cross_process_rows)
+    _atomic_write(
+        structural_dir / "cross_process_callers.csv", cross_process_stream.getvalue()
+    )
 
     metadata_sources = [
         _read_json(index_dir / "index_metadata.json", {}) for index_dir in indexes
@@ -268,6 +512,9 @@ def merge_cvisualizer_discoveries(
         "mfs_file_access_entries": sum(len(entries) for entries in file_access.values()),
         "mfs_queue_access_entries": sum(len(entries) for entries in queue_access.values()),
         "mfs_dynamic_addque_entries": sum(len(entries) for entries in dynamic.values()),
+        "cross_process_caller_rows": cross_process_count,
+        "out_of_process_scope_rows": out_of_scope_count,
+        "unresolved_owner_rows": unresolved_owner_count,
     }
     metadata = {
         "schema_version": 2,

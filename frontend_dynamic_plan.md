@@ -488,3 +488,4 @@ Then verify:
   and 404 behavior.
 - Library planes, run picker, Inspector, and chat citation highlighting still
   work with no global function registry in the browser.
+

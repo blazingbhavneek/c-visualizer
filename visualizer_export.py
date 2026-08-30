@@ -245,6 +245,7 @@ class VisualizerCollector:
         main_file_name: str | None,
         entry_function_name: str | None = None,
         entry_points: list[tuple[str, str]] | None = None,
+        root_diagnostics: dict[str, Any] | None = None,
         library_functions: set[str] | list[str] | None = None,
         run_id: str | None = None,
         results_root: Path | None = None,
@@ -259,6 +260,7 @@ class VisualizerCollector:
             entry_points
             or ([(main_file_name, self.entry_function_name)] if main_file_name else [])
         ))
+        self.root_diagnostics = root_diagnostics
         self.library_functions = set(library_functions or [])
         self.run_id = run_id or datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
         self.results_root = results_root or get_visualizer_results_root()
@@ -717,6 +719,7 @@ class VisualizerCollector:
                 "entry_function": primary_entry["function"] if primary_entry else None,
                 "entry_function_id": primary_entry["id"] if primary_entry else None,
                 "entry_points": entry_records,
+                "root_diagnostics": self.root_diagnostics or {},
             },
             "functions": sorted(self.functions.values(), key=lambda item: (item["name"], item["id"])),
             "calls": sorted(self.calls.values(), key=lambda item: item["id"]),

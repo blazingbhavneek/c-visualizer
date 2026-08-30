@@ -79,6 +79,10 @@ class CallSite:
     callee: FunctionNode
     line_number: int  # at which it was called to build the intial context..
     callbacks: list[FunctionNode] = field(default_factory=list)
+    # Structured callback registrations: source spelling, canonical target,
+    # raw argument text, byte range, registrar, and diagnostics.
+    # ``callbacks`` stays populated from these records for older consumers.
+    callback_records: list[dict] = field(default_factory=list)
     # Tree-sitter byte offsets make two calls on the same source line distinct.
     # Defaults preserve compatibility with tests and callers which construct
     # CallSite objects manually.

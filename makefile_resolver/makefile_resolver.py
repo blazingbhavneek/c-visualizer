@@ -1,5 +1,6 @@
 import os
 import re
+import shlex
 from pathlib import Path
 from pprint import pprint
 from typing import Dict, List, Tuple, Union
@@ -87,7 +88,7 @@ class MakefileContext:
 
         self.parsed_files.add(file_path)
 
-        with open(file_path, "r", errors="ignore") as f:
+        with open(file_path, "r", encoding="latin-1") as f:
             content = f.read().replace("\\\n", " ")
             lines = content.splitlines()
 
@@ -166,6 +167,109 @@ class MakefileContext:
             "UNRESOLVED": self.unresolved_log,
         }
 
+    def get_preprocessor_flags(self) -> dict[str, tuple[str, ...]]:
+        """Extract the C preprocessor macro state from build flags.
+
+        This intentionally reads only compile-related variables.  Linker
+        flags and arbitrary Makefile assignments must not become ``unifdef``
+        arguments.  Values are returned without the leading ``-D``/``-U`` so
+        the preprocessing layer owns command-line construction.
+        """
+        flag_variables = (
+            "CPPFLAGS",
+            "CFLAGS",
+            "CCFLAGS",
+            "CDEFS",
+            "DEFS",
+            "DEFINES",
+        )
+        tokens: list[str] = []
+        for variable in flag_variables:
+            raw = self.resolve_string(self.vars.get(variable, ""))
+            if not raw:
+                continue
+            try:
+                tokens.extend(shlex.split(raw))
+            except ValueError:
+                # A malformed Makefile token should not prevent source
+                # discovery; the normal unifdef fallback remains available.
+                tokens.extend(raw.split())
+
+        defines: list[str] = []
+        undefines: list[str] = []
+        index = 0
+        while index < len(tokens):
+            token = tokens[index]
+            if token in {"-D", "-U"} and index + 1 < len(tokens):
+                value = tokens[index + 1]
+                index += 2
+                (defines if token == "-D" else undefines).append(value)
+                continue
+            if token.startswith("-D") and len(token) > 2:
+                defines.append(token[2:])
+            elif token.startswith("-U") and len(token) > 2:
+                undefines.append(token[2:])
+            index += 1
+
+        return {
+            "defines": tuple(dict.fromkeys(defines)),
+            "undefines": tuple(dict.fromkeys(undefines)),
+        }
+
+
+def load_project_structure_cache(path: Path | str):
+    """Load a v6 ``(structure, main_files, srcs_paths)`` cache.
+
+    Returns ``None`` when the cache is missing, unreadable, or predates the
+    path-keyed SRCS entry so callers re-resolve instead of trusting stale
+    root paths.
+    """
+    import pickle
+
+    path = Path(path)
+    if not path.exists():
+        return None
+    try:
+        with open(path, "rb") as f:
+            cached = pickle.load(f)
+    except (OSError, pickle.UnpicklingError):
+        return None
+    if isinstance(cached, tuple) and len(cached) == 3:
+        return cached
+    return None
+
+
+def save_project_structure_cache(
+    path: Path | str,
+    structure: dict,
+    main_files: list[str],
+    srcs_paths: list[str],
+) -> None:
+    import pickle
+
+    path = Path(path)
+    path.parent.mkdir(exist_ok=True, parents=True)
+    with open(path, "wb") as f:
+        pickle.dump((structure, main_files, list(srcs_paths)), f)
+
+
+def get_project_preprocessor_flags(project_path: Path) -> dict[str, tuple[str, ...]]:
+    """Read compile macro flags without resolving the complete file graph."""
+    project_path = Path(project_path)
+    makefile_input = project_path / "Makefile"
+    if not makefile_input.is_file():
+        return {"defines": (), "undefines": ()}
+
+    project_root = makefile_input.parent.parent
+    os.environ["MODERNLIB"] = str(project_root)
+    os.environ["HOMELIB"] = str(project_root)
+    os.environ["MODERN"] = str(project_root)
+    os.environ["ORDERLIB"] = str(project_root)
+
+    context = MakefileContext(makefile_input)
+    context.parse_file(makefile_input)
+    return context.get_preprocessor_flags()
+
 
 @time_it(message="")
 def return_project_mapping(
@@ -225,6 +329,21 @@ def return_project_mapping(
 
     files: dict[str, Path] = {}
     potential_main_files: list[str] = []
+    # Canonical absolute paths of every Makefile SRCS source; the
+    # path-keyed identity used for executable-root membership.
+    srcs_paths: list[str] = []
+
+    def _merge_files(target: dict[str, Path], new_files: dict[str, Path]) -> None:
+        """Merge files without letting two same-basename sources overwrite
+        each other.  The first owner keeps the plain basename key; later
+        duplicates get a directory-qualified key so both stay parseable.
+        """
+        for name, path in new_files.items():
+            existing = target.get(name)
+            if existing is None or existing == path:
+                target[name] = path
+            else:
+                target[f"{path.parent.name}/{name}"] = path
 
     # Build source/header set from resolved Makefile info.
     for key in info:
@@ -235,6 +354,7 @@ def return_project_mapping(
             for path in info[key]:
                 files[path.name] = path
                 potential_main_files.append(path.name)
+                srcs_paths.append(str(path.resolve()))
             continue
 
         for path in info[key]:
@@ -242,9 +362,9 @@ def return_project_mapping(
                 continue
 
             if path.is_dir() and path != makefile_input.parent:
-                files.update(get_c_and_h_files(path))
+                _merge_files(files, get_c_and_h_files(path))
             elif path.is_file():
-                files[path.name] = path
+                _merge_files(files, {path.name: path})
 
     # Fallback if Makefile parsing did not produce source files.
     if not files:
@@ -255,7 +375,7 @@ def return_project_mapping(
         ]
 
     # Include local library files after project files.
-    files.update(get_local_library_files())
+    _merge_files(files, get_local_library_files())
 
     include_dirs = list(info.get("INCLUDES", []))
     include_dirs.append(project_path.parent)
@@ -289,7 +409,7 @@ def return_project_mapping(
         console.print(file_wise_dependency)
         console.print(combined_dependency)
 
-    return combined_dependency, potential_main_files
+    return combined_dependency, potential_main_files, srcs_paths
 
 
 if __name__ == "__main__":

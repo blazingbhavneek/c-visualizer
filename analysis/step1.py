@@ -413,6 +413,10 @@ class CVisualizerSite:
     syntax_values: set[str] = field(default_factory=set)
     rows: list[dict[str, str]] = field(default_factory=list)
     directness: str = "UNKNOWN_ARGUMENT"
+    # True when at least one evidence row classifies this site as belonging
+    # to another process/library scope; such rows are reported separately
+    # from in-process unreachable results.
+    cross_process: bool = False
 
 
 @dataclass
@@ -565,6 +569,8 @@ def load_cvisualizer(
         if expression:
             item.expressions.add(expression)
         item.statuses[row.get("status", "")] += 1
+        if row.get("reachability") in {"CROSS_PROCESS_CALLER", "OUT_OF_PROCESS_SCOPE"}:
+            item.cross_process = True
         if row.get("resolved_by"):
             item.resolved_by[row["resolved_by"]] += 1
         if row.get("link_method"):
@@ -719,6 +725,7 @@ def site_dict(
             "resolved_by": counter_dict(cvisualizer.resolved_by) if cvisualizer else {},
             "link_methods": counter_dict(cvisualizer.link_methods) if cvisualizer else {},
             "fact_rows": len(cvisualizer.rows) if cvisualizer else 0,
+            "cross_process": bool(cvisualizer.cross_process) if cvisualizer else False,
         },
         "legacy": {
             "raw_expressions": sorted(legacy.raw_expressions) if legacy else [],
@@ -975,7 +982,7 @@ def render_markdown(report: dict[str, Any]) -> str:
         "",
         "### Why does c-visualizer have more comparison sites?",
         "",
-        f"There are **{discovery['cvisualizer_only_indirect_active_sites']:,} c-visualizer-only operation-aware sites**. Of these, **{sum(1 for row in report['sites'] if row['cvisualizer']['expressions'] and not row['legacy']['raw_expressions'] and 'UNREACHABLE' in row['cvisualizer']['statuses']):,}** are marked `UNREACHABLE`. That means c-visualizer found the target call in active source code, but did not find a path to it from a recognized entry point. These are discovered call locations, not successful value resolutions. Legacy also has **{report['populations']['legacy']['excluded_sites'].get('UNKNOWN_ARGUMENT', 0):,}** proof locations with no original argument expression; those are excluded because we cannot tell whether their argument was indirect.",
+        f"There are **{discovery['cvisualizer_only_indirect_active_sites']:,} c-visualizer-only operation-aware sites**. Of these, **{sum(1 for row in report['sites'] if row['cvisualizer']['expressions'] and not row['legacy']['raw_expressions'] and 'UNREACHABLE' in row['cvisualizer']['statuses'] and not row['cvisualizer']['cross_process']):,}** are marked `UNREACHABLE`. That means c-visualizer found the target call in active source code, but did not find a path to it from a recognized entry point. These are discovered call locations, not successful value resolutions. Separately, **{sum(1 for row in report['sites'] if row['cvisualizer']['expressions'] and row['cvisualizer']['cross_process']):,}** c-visualizer-only sites are cross-process or out-of-scope evidence (the target belongs to another process or library); they are not in-process unreachable results. Legacy also has **{report['populations']['legacy']['excluded_sites'].get('UNKNOWN_ARGUMENT', 0):,}** proof locations with no original argument expression; those are excluded because we cannot tell whether their argument was indirect.",
         "",
         "For example, `/home/chukyu/t-dif/src/libdif/difSVRep.c:198` calls `pmf_forkprocbs_H(cpuname)`. c-visualizer records this active target call as `UNREACHABLE`; the legacy proof file has no corresponding row. This increases c-visualizer’s discovery count even though no value was resolved.",
         "",

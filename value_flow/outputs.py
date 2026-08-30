@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import json
 import os
 import re
 import tempfile
@@ -30,6 +31,7 @@ FACT_COLUMNS = [
     "call_function",
     "call_number",
     "link_method",
+    "metadata",
     "path_count",
     "resolved_by",
 ]
@@ -273,6 +275,7 @@ def write_outputs(
                 "call_function": record.seed.call_function,
                 "call_number": _display_call_number(record.call_number),
                 "link_method": fact.link_method,
+                "metadata": json.dumps(fact.metadata or {}, ensure_ascii=False, sort_keys=True),
                 "path_count": record.path_count,
                 "resolved_by": fact.resolved_by,
             }

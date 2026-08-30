@@ -9,7 +9,7 @@ pipeline.
 Step 0 includes only a target argument that is directly:
 
 * an integer or string literal; or
-* a single macro name that c-visualizer proves from a ``#define`` line.
+* a single macro/enum name whose value is proved directly by syntax.
 
 It excludes values obtained through helper parameters, variables, FCB/handle
 matching, proximity matching, or LLM/data-flow propagation.  Those belong in
@@ -295,30 +295,145 @@ class SourceLines:
         return lines[line - 1]
 
 
+class SourceDefinitions:
+    """Index source-defined macros and enum constants used by Step 0.
+
+    The resolver represents an enum constant as ``origin_kind=CONST``.  It is
+    still a direct constant when the enum name is the target argument itself;
+    it must not be pushed into Step 1 merely because it is not spelled
+    ``#define``.  The legacy macro table is also incomplete for queue macros,
+    so the legacy side uses this source index as a fallback.
+    """
+
+    SOURCE_SUFFIXES = {".c", ".h", ".cc", ".hh", ".cpp", ".hpp", ".inc"}
+
+    def __init__(self, source_root: Path):
+        self.source_root = source_root
+        self._loaded: dict[Path, tuple[set[str], set[str]]] = {}
+        self._all_loaded = False
+        self.macro_names: set[str] = set()
+        self.enum_names: set[str] = set()
+
+    @staticmethod
+    def _strip_comments(text: str) -> str:
+        text = re.sub(
+            r"/\*.*?\*/",
+            lambda match: "\n" * match.group(0).count("\n"),
+            text,
+            flags=re.DOTALL,
+        )
+        return re.sub(r"//[^\n]*", "", text)
+
+    @classmethod
+    def _enum_names(cls, text: str) -> set[str]:
+        """Return names from simple C enum bodies.
+
+        This intentionally extracts names only; value evaluation remains the
+        resolver's job.  Enum bodies in this source tree are ordinary comma-
+        separated enumerators, including the leading-comma style used by the
+        Dyn headers.
+        """
+
+        clean = cls._strip_comments(text)
+        names: set[str] = set()
+        for match in re.finditer(r"\benum(?:\s+[A-Za-z_]\w*)?\s*\{", clean):
+            depth = 1
+            index = match.end()
+            while index < len(clean) and depth:
+                if clean[index] == "{":
+                    depth += 1
+                elif clean[index] == "}":
+                    depth -= 1
+                index += 1
+            if depth:
+                continue
+            body = clean[match.end() : index - 1]
+            for item in body.split(","):
+                enumerator = re.match(r"\s*([A-Za-z_]\w*)\b", item)
+                if enumerator:
+                    names.add(enumerator.group(1))
+        return names
+
+    def _load(self, value: Any) -> tuple[set[str], set[str]]:
+        path = absolute_source_path(value, self.source_root).resolve()
+        if path in self._loaded:
+            return self._loaded[path]
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            result = (set(), set())
+            self._loaded[path] = result
+            return result
+
+        macros = {
+            match.group(1)
+            for match in re.finditer(
+                r"^\s*#\s*define\s+([A-Za-z_]\w*)\b", text, flags=re.MULTILINE
+            )
+        }
+        enums = self._enum_names(text)
+        result = (macros, enums)
+        self._loaded[path] = result
+        return result
+
+    def load_file(self, value: Any) -> None:
+        macros, enums = self._load(value)
+        self.macro_names.update(macros)
+        self.enum_names.update(enums)
+
+    def load_all(self) -> None:
+        if self._all_loaded:
+            return
+        for path in self.source_root.rglob("*"):
+            if path.is_file() and path.suffix.lower() in self.SOURCE_SUFFIXES:
+                self.load_file(path)
+        self._all_loaded = True
+
+    def is_enum_in_file(self, symbol: str, proof_file: Any) -> bool:
+        _, enums = self._load(proof_file)
+        return symbol in enums
+
+    def is_macro_in_source(self, symbol: str) -> bool:
+        self.load_all()
+        return symbol in self.macro_names
+
+
 def is_direct_literal(expression: str) -> bool:
     expression = expression.strip()
     return bool(INTEGER_LITERAL.fullmatch(expression) or STRING_LITERAL.fullmatch(expression))
 
 
-def is_direct_macro(expression: str, proof_line: str) -> bool:
-    """Require the target expression itself to be the proven macro name.
+def is_direct_symbol(
+    expression: str,
+    proof_line: str,
+    proof_file: Any,
+    definitions: SourceDefinitions,
+) -> bool:
+    """Require the target expression itself to be a proven symbol.
 
     This rejects examples such as ``file_no``, ``filenum``, ``fno``, and
     ``&fcb`` where c-visualizer eventually found a macro value elsewhere in
     the value flow.  The proof line for those rows defines a different macro.
+
+    Enum constants are accepted here as direct constants.  Their proof line
+    is an enumerator such as ``DynReCtlMainteFNO`` rather than a ``#define``.
     """
     expression = expression.strip()
     if not IDENTIFIER.fullmatch(expression):
         return False
-    return bool(
-        re.search(
-            rf"#\s*define\s+{re.escape(expression)}(?:\s|\(|$)",
-            proof_line,
-        )
-    )
+    if re.search(
+        rf"#\s*define\s+{re.escape(expression)}(?:\s|\(|$)",
+        proof_line,
+    ):
+        return True
+    return definitions.is_enum_in_file(expression, proof_file)
 
 
-def is_direct_cvisualizer_row(row: dict[str, str], source_lines: SourceLines) -> bool:
+def is_direct_cvisualizer_row(
+    row: dict[str, str],
+    source_lines: SourceLines,
+    definitions: SourceDefinitions,
+) -> bool:
     if not (
         row.get("status") == "EXACT"
         and row.get("resolved_by") == "SYNTAX"
@@ -328,9 +443,11 @@ def is_direct_cvisualizer_row(row: dict[str, str], source_lines: SourceLines) ->
     expression = row.get("target_expression", "").strip()
     if is_direct_literal(expression):
         return True
-    return is_direct_macro(
+    return is_direct_symbol(
         expression,
         source_lines.line(row.get("source_file", ""), row.get("source_line", "")),
+        row.get("source_file", ""),
+        definitions,
     )
 
 
@@ -354,10 +471,21 @@ def source_contains_token(source_lines: SourceLines, file: str, line: int, token
     return False
 
 
+def index_macro_names(directory: Path) -> set[str]:
+    payload = read_json(directory / "mfs_fno_macros.json", {})
+    names: set[str] = set()
+    if isinstance(payload, dict):
+        for values in payload.values():
+            if isinstance(values, list):
+                names.update(str(value) for value in values)
+    return names
+
+
 def load_direct_legacy_records(
     directory: Path,
     source_root: Path,
     source_lines: SourceLines,
+    definitions: SourceDefinitions,
 ) -> tuple[set[Record], list[dict[str, Any]]]:
     """Load legacy rows whose raw argument is on the target source line.
 
@@ -372,6 +500,8 @@ def load_direct_legacy_records(
     """
     records: set[Record] = set()
     details: list[dict[str, Any]] = []
+    known_macros = index_macro_names(directory)
+    definitions.load_all()
 
     for filename, resource in (
         ("mfs_file_access.json", "mfs_file"),
@@ -384,6 +514,14 @@ def load_direct_legacy_records(
             for entry in entries or []:
                 raw = str(entry.get("fno_raw", "")).strip()
                 if not (INTEGER_LITERAL.fullmatch(raw) or IDENTIFIER.fullmatch(raw)):
+                    continue
+                if IDENTIFIER.fullmatch(raw) and not (
+                    raw in known_macros
+                    or raw in definitions.macro_names
+                    or raw in definitions.enum_names
+                ):
+                    # An identifier such as file_no or fcb is a propagated
+                    # variable, not a direct macro argument.
                     continue
                 file = normalize_path(entry.get("file"), source_root)
                 line = int(entry.get("line") or 0)
@@ -402,7 +540,9 @@ def load_direct_legacy_records(
                     {
                         "record": record,
                         "raw": raw,
-                        "kind": "CONST" if INTEGER_LITERAL.fullmatch(raw) else "MACRO",
+                        "kind": "CONST"
+                        if INTEGER_LITERAL.fullmatch(raw)
+                        else "MACRO/ENUM",
                     }
                 )
 
@@ -437,6 +577,7 @@ def direct_cvisualizer_records(
     facts: list[dict[str, str]],
     aggregate: set[Record],
     source_root: Path,
+    definitions: SourceDefinitions,
 ) -> tuple[set[Record], set[Record], dict[Record, list[dict[str, str]]], int]:
     source_lines = SourceLines(source_root)
     evidence_records: set[Record] = set()
@@ -445,7 +586,7 @@ def direct_cvisualizer_records(
     direct_rows = 0
 
     for row in facts:
-        if not is_direct_cvisualizer_row(row, source_lines):
+        if not is_direct_cvisualizer_row(row, source_lines, definitions):
             continue
         resource = resource_for_operation(row.get("operation", ""))
         if not resource:
@@ -527,22 +668,82 @@ def source_classification(
     }
 
 
+def legacy_gap_classification(
+    records: set[Record],
+    cvisualizer_evidence: set[Record],
+    facts_by_site: dict[tuple[str, str, int, str], list[dict[str, str]]],
+    source_lines: SourceLines,
+    definitions: SourceDefinitions,
+) -> dict[str, int]:
+    """Explain legacy records absent from c-viz's final aggregate index."""
+
+    counts: Counter[str] = Counter()
+    for record in sorted(records):
+        if record in cvisualizer_evidence:
+            counts["FOUND_IN_CVIZ_EVIDENCE_NOT_PROMOTED"] += 1
+            continue
+        rows = facts_by_site.get(record.site, [])
+        direct_exact = [
+            row
+            for row in rows
+            if is_direct_cvisualizer_row(row, source_lines, definitions)
+        ]
+        if direct_exact:
+            counts["CVIZ_EXACT_DIFFERENT_VALUE"] += 1
+            continue
+        if not rows:
+            counts["NO_CVIZ_FACT_AT_SITE"] += 1
+            continue
+        statuses = {row.get("status", "") or "UNKNOWN" for row in rows}
+        reachabilities = {row.get("reachability", "") or "" for row in rows}
+        if reachabilities & {"CROSS_PROCESS_CALLER", "OUT_OF_PROCESS_SCOPE"}:
+            # The site belongs to another process or library scope; it is not
+            # an in-process unreachable result and must not be counted as one.
+            counts["CVIZ_CROSS_PROCESS"] += 1
+        elif "UNREACHABLE" in statuses:
+            counts["CVIZ_UNREACHABLE"] += 1
+        elif "UNRESOLVED" in statuses:
+            counts["CVIZ_UNRESOLVED"] += 1
+        elif "EXTERNAL" in statuses:
+            counts["CVIZ_EXTERNAL"] += 1
+        elif "DYNAMIC" in statuses:
+            counts["CVIZ_DYNAMIC"] += 1
+        else:
+            counts["CVIZ_OTHER_STATUS"] += 1
+    return dict(sorted(counts.items()))
+
+
 def build_report(cvisualizer_index: Path, legacy_index: Path, source_root: Path) -> dict[str, Any]:
     aggregate = load_exact_index(cvisualizer_index, source_root)
     facts = read_facts(cvisualizer_index / "discovery_facts.csv")
+    definitions = SourceDefinitions(source_root)
     direct_cviz, direct_cviz_evidence, evidence_by_record, direct_fact_rows = direct_cvisualizer_records(
-        facts, aggregate, source_root
+        facts, aggregate, source_root, definitions
     )
 
     source_lines = SourceLines(source_root)
     direct_legacy, legacy_details = load_direct_legacy_records(
-        legacy_index, source_root, source_lines
+        legacy_index, source_root, source_lines, definitions
     )
 
     shared = direct_cviz & direct_legacy
     cvisualizer_only = direct_cviz - direct_legacy
     legacy_only = direct_legacy - direct_cviz
     legacy_source = source_classification(legacy_only, source_root)
+    facts_by_site = fact_statuses(facts, source_root)
+    legacy_gap = legacy_gap_classification(
+        legacy_only,
+        direct_cviz_evidence,
+        facts_by_site,
+        source_lines,
+        definitions,
+    )
+    no_fact_records = {
+        record
+        for record in legacy_only
+        if record not in direct_cviz_evidence
+        and not facts_by_site.get(record.site)
+    }
 
     return {
         "counts": {
@@ -573,6 +774,8 @@ def build_report(cvisualizer_index: Path, legacy_index: Path, source_root: Path)
             for resource in ("mfs_file", "mfs_queue", "forkproc")
         },
         "legacy_source": legacy_source,
+        "legacy_gap": legacy_gap,
+        "legacy_no_fact_source": source_classification(no_fact_records, source_root),
         "examples": {
             "shared": example_record(
                 shared,
@@ -604,7 +807,7 @@ def build_report(cvisualizer_index: Path, legacy_index: Path, source_root: Path)
             ),
         },
         "evidence_by_record": evidence_by_record,
-        "facts_by_site": fact_statuses(facts, source_root),
+        "facts_by_site": facts_by_site,
     }
 
 
@@ -652,6 +855,8 @@ def render_markdown(report: dict[str, Any], paths: dict[str, str], source_root: 
     counts = report["counts"]
     by_resource = report["by_resource"]
     legacy_source = report["legacy_source"]
+    legacy_gap = report["legacy_gap"]
+    legacy_no_fact_source = report["legacy_no_fact_source"]
     shared = report["examples"]["shared"]
     tool = report["examples"]["cvisualizer_tool"]
     external = report["examples"]["cvisualizer_external_header"]
@@ -666,7 +871,7 @@ def render_markdown(report: dict[str, Any], paths: dict[str, str], source_root: 
         "## What is included",
         "",
         "- A **constant** is a number or string written directly in the target argument, such as `1055` or `\"cha001\"`.",
-        "- A **direct macro** is a macro name written directly in the target argument, such as `DifDefineNo`, with a `#define` proof for its value.",
+        "- A **direct macro/constant** is a macro name or enum constant written directly in the target argument, such as `DifDefineNo` or `DynReCtlMainteFNO`, with a syntax proof for its value.",
         "- A **record** means one source location, operation, and resolved value in an index.",
         "- A **shared record** is present in both indexes with the same file, line, operation, and value.",
         "- A **c-viz-only record** is in the c-visualizer index but not the legacy index.",
@@ -677,6 +882,8 @@ def render_markdown(report: dict[str, Any], paths: dict[str, str], source_root: 
         "This step does not count values that arrive through a helper parameter or variable, such as `file_no`, `filenum`, or `fno`. It also excludes `&fcb`/handle matching, proximity matching, LLM results, and other data-flow propagation. Those are Step 1 cases.",
         "",
         "For example, c-visualizer may eventually resolve `file_no` to four macros, but the target argument is still the variable `file_no`; it is not a direct CONST/MACRO target argument.",
+        "",
+        "The c-visualizer evidence file contains every discovered target fact. The final aggregate JSON index contains only exact facts that are in the relevant process scope. Therefore a value can be present in c-visualizer evidence but absent from its final JSON index.",
         "",
         "## The direct comparison",
         "",
@@ -714,6 +921,39 @@ def render_markdown(report: dict[str, Any], paths: dict[str, str], source_root: 
         f"The final c-visualizer index has **{counts['cvisualizer_direct_index_records']:,} direct records**. The legacy index has **{counts['legacy_direct_records']:,} direct records**. They share **{counts['shared_records']:,} records**. c-visualizer has **{counts['cvisualizer_only_records']:,} additional records**, while legacy has **{counts['legacy_only_records']:,} records that c-visualizer does not have**.",
         "",
         f"The c-visualizer evidence file contains **{counts['cvisualizer_direct_fact_rows']:,} direct exact rows** before aggregate-index filtering. **{counts['cvisualizer_direct_not_promoted']:,}** of those were not promoted into the final aggregate index, so the comparison above uses the final index rather than mixing evidence rows with index rows.",
+        "",
+        "## Why legacy still has more final-index records",
+        "",
+        f"The raw difference is **{counts['legacy_direct_records'] - counts['cvisualizer_direct_index_records']:,} records** ({counts['legacy_direct_records']:,} legacy versus {counts['cvisualizer_direct_index_records']:,} c-visualizer). This is a net difference, not the number of calls c-visualizer missed: c-visualizer also has **{counts['cvisualizer_only_records']:,} records** that legacy does not have.",
+        "",
+        "The following breakdown explains every legacy-only record in the final-index comparison:",
+        "",
+        markdown_table(
+            [
+                ["What happened to the legacy record", "Records"],
+                *[
+                    [
+                        {
+                            "FOUND_IN_CVIZ_EVIDENCE_NOT_PROMOTED": "c-viz found the same value in evidence, but scope rules kept it out of the final JSON index",
+                            "CVIZ_EXACT_DIFFERENT_VALUE": "c-viz found the same direct call with a different exact value",
+                            "NO_CVIZ_FACT_AT_SITE": "no c-viz fact exists at that source location",
+                            "CVIZ_CROSS_PROCESS": "the target site belongs to another process or library scope (cross-process evidence, not in-process unreachable)",
+                            "CVIZ_UNREACHABLE": "c-viz found the call but could not prove reachability",
+                            "CVIZ_UNRESOLVED": "c-viz found the call but did not resolve its value",
+                            "CVIZ_EXTERNAL": "c-viz classified the value as external data",
+                            "CVIZ_DYNAMIC": "c-viz classified the value as dynamic",
+                            "CVIZ_OTHER_STATUS": "another c-viz status",
+                        }.get(label, label),
+                        f"{value:,}",
+                    ]
+                    for label, value in legacy_gap.items()
+                ],
+            ]
+        ),
+        "",
+        "The most important distinction is between `FOUND_IN_CVIZ_EVIDENCE_NOT_PROMOTED` and `NO_CVIZ_FACT_AT_SITE`: the first is an index-scope difference, while the second is a genuine discovery gap that needs investigation. Enum constants are now included in the direct count, so they are no longer incorrectly pushed into Step 1.",
+        "",
+        f"Of the **{legacy_gap.get('NO_CVIZ_FACT_AT_SITE', 0):,}** locations with no c-viz fact, **{legacy_no_fact_source.get('IF0_DISABLED', {}).get('records', 0):,}** are inside `#if 0` disabled code and **{legacy_no_fact_source.get('ACTIVE_CODE', {}).get('records', 0):,}** are active-looking source locations. The active-looking portion is the real discovery gap to investigate; it is not automatically evidence of a resolver-value bug.",
         "",
         "## Counts by target type",
         "",

@@ -59,7 +59,12 @@ from helpers.Preprocess.preprocess import (
 )
 from helpers.time_it import time_it
 from function_summaries import SummaryConfig, summarize_collector
-from makefile_resolver.makefile_resolver import return_project_mapping
+from makefile_resolver.makefile_resolver import (
+    get_project_preprocessor_flags,
+    load_project_structure_cache,
+    return_project_mapping,
+    save_project_structure_cache,
+)
 from models import (
     Combined,
     FunctionTokenCount,
@@ -2003,6 +2008,20 @@ async def make_value_flow_calls(
         # Main resolver execution.
         # Produces fact records: target call + resolved value + paths/evidence.
         records = await resolver.run()
+
+        # Root/reachability state for the discovery index: which functions a
+        # recognized root reaches directly, which only through callbacks, and
+        # the run-level root diagnostic.
+        state.set(
+            "RESOLVER_STATE",
+            {
+                "root_state": str(
+                    (state.get("ROOT_DIAGNOSTICS") or {}).get("root_state") or ""
+                ),
+                "direct_reachable": set(resolver.direct_reachable),
+                "reachable": set(resolver.reachable),
+            },
+        )
     finally:
         # Release both pools even when indexing or resolution raises.  No
         # work is submitted after this point.  cancel_futures drops queued
@@ -2210,17 +2229,25 @@ def trace_variable(
         str(project_path.resolve()).encode("utf-8")
     ).hexdigest()[:16]
     project_structure_path = pickle_dir / (
-        f"{project_path.name}_{project_key}_include_v5.pkl"
+        f"{project_path.name}_{project_key}_include_v6.pkl"
     )
 
     PROJECT_STRUCTURE = None
     potential_main_files: list[str] | None = None
+    # Canonical absolute paths of the Makefile SRCS sources.  Root
+    # membership is decided by this path-keyed set, never by basename alone.
+    srcs_paths: list[str] | None = None
 
-    if USE_PROJECT_STRUCTURE_PICKLE and project_structure_path.exists():
-        import pickle
-
-        with open(project_structure_path, "rb") as f:
-            PROJECT_STRUCTURE, potential_main_files = pickle.load(f)
+    cached = None
+    if USE_PROJECT_STRUCTURE_PICKLE:
+        cached = load_project_structure_cache(project_structure_path)
+        if project_structure_path.exists() and cached is None:
+            print(
+                "WARNING: project-structure cache predates path-keyed SRCS; "
+                "re-resolving instead of trusting stale root paths"
+            )
+    if cached is not None:
+        PROJECT_STRUCTURE, potential_main_files, srcs_paths = cached
     else:
         print(
             "PROJECT STRUCTURE NEEDS TO BE RESOLVED. "
@@ -2260,7 +2287,7 @@ def trace_variable(
 
         # potential_main_files:
         # ['svm001.c', 'svm001_kansi.c', 'svm001_kbtmsg.c', 'svm001_svminit.c']
-        PROJECT_STRUCTURE, potential_main_files = return_project_mapping(
+        PROJECT_STRUCTURE, potential_main_files, srcs_paths = return_project_mapping(
             show=False,
             project_path=project_path,
         )
@@ -2272,26 +2299,73 @@ def trace_variable(
 
         # Save to pickle for later reuse (for prod)
         if USE_PROJECT_STRUCTURE_PICKLE:
-            import pickle
-
-            with open(project_structure_path, "wb") as f:
-                pickle.dump((PROJECT_STRUCTURE, potential_main_files), f)
+            save_project_structure_cache(
+                project_structure_path,
+                PROJECT_STRUCTURE,
+                potential_main_files,
+                srcs_paths,
+            )
 
     # endregion pickle caching
 
     potential_main_files = potential_main_files or []
+    srcs_paths = srcs_paths or []
+
+    # Path-keyed process-source membership: canonical absolute path to the
+    # PROJECT_STRUCTURE key that holds that file.  Basename membership stays
+    # only as a compatibility fallback when no SRCS paths are available.
+    srcs_absolute: set[str] = set()
+    srcs_membership: dict[str, str] = {}
+    for raw_key, raw_path in PROJECT_STRUCTURE.items():
+        try:
+            resolved = str(Path(raw_path).resolve())
+        except (OSError, TypeError):
+            continue
+        if raw_key in potential_main_files:
+            srcs_absolute.add(resolved)
+            srcs_membership.setdefault(resolved, raw_key)
+    if not srcs_absolute:
+        for raw_path in srcs_paths:
+            srcs_absolute.add(str(Path(raw_path).resolve()))
+
+    def _is_process_source(key: str, raw_path: str) -> bool:
+        try:
+            if str(Path(raw_path).resolve()) in srcs_absolute:
+                return True
+        except (OSError, TypeError):
+            pass
+        return any(key == x for x in potential_main_files)
 
     STATE.set("PROJECT_STRUCTURE", PROJECT_STRUCTURE)
     print("THE MAIN FILES ARE: ", potential_main_files)
 
-    # main tree sitter parsing
+    # Main Tree-sitter parsing.  Keep the preprocessing macro state tied to
+    # this process's Makefile; do not apply one machine-wide -D/-U profile to
+    # every project.  The Preprocess fallback is only considered for files
+    # whose first parse contains syntax errors.
     # output: dict file:(tree sitter tree, cleaned file contents)
-    # TODO: Anaylyze logic later
-    trees = Preprocess().preprocess(
-        project_structure=PROJECT_STRUCTURE
+    preprocessor_flags = get_project_preprocessor_flags(project_path)
+    preprocessor = Preprocess(
+        defines=preprocessor_flags.get("defines", ()),
+        undefines=preprocessor_flags.get("undefines", ()),
+    )
+    expected_entries_by_file = {
+        filename: ENTRY_FUNCTION_NAMES for filename in potential_main_files
+    }
+    trees = preprocessor.preprocess(
+        project_structure=PROJECT_STRUCTURE,
+        expected_entry_names=expected_entries_by_file,
     )
 
     STATE.set("TREES", trees)
+    STATE.set(
+        "PREPROCESSOR_CONFIG",
+        {
+            **preprocessor_flags,
+            "fallback_undefines": preprocessor.config.fallback_undefines,
+            "file_metadata": preprocessor.file_metadata,
+        },
+    )
 
     # converts all values in PROJECT_STRUCTURE keys to strings
     PROJECT_STRUCTURE = {
@@ -2338,7 +2412,7 @@ def trace_variable(
         )
 
         entry_candidates = [name for name in ENTRY_FUNCTION_NAMES if name in functions]
-        is_process_source = any(files == x for x in potential_main_files)
+        is_process_source = _is_process_source(files, PROJECT_STRUCTURE[files])
 
         # Every lifecycle callback implemented by the process is a root.  The
         # Makefile-derived source list prevents shared-library definitions
@@ -2375,6 +2449,83 @@ def trace_variable(
     STATE.set("MACROS", macros)
     STATE.set("ENTRY_POINTS", entry_points)
 
+    # Root diagnostics: every executable source with a raw accepted root but
+    # no parsed root is a ROOT_PARSE_FAILURE; a scope with no accepted root
+    # at all is NO_PROCESS_ROOT.  Never leave an empty root list unexplained.
+    file_metadata = (
+        (STATE.get("PREPROCESSOR_CONFIG") or {}).get("file_metadata") or {}
+    )
+    root_state = "OK" if entry_points else None
+    root_failure_reason = ""
+    per_file_root_diagnostics: dict[str, dict[str, object]] = {}
+    if not entry_points:
+        for files, raw_path in PROJECT_STRUCTURE.items():
+            if files.endswith(".h"):
+                continue
+            meta = file_metadata.get(files, {}) or {}
+            raw_candidates = meta.get("root_candidates") or []
+            raw_root_names = {
+                item["name"]
+                for item in raw_candidates
+                if item["kind"] in ("definition", "inactive_definition")
+            }
+            parsed_roots = [n for n in ENTRY_FUNCTION_NAMES if n in FILE_FUNCTIONS.get(files, {})]
+            if _is_process_source(files, raw_path):
+                if parsed_roots:
+                    state = "OK"
+                elif raw_root_names:
+                    state = "ROOT_PARSE_FAILURE"
+                else:
+                    state = "NO_ACCEPTED_ROOT"
+            else:
+                state = "NO_PROCESS_ROOT"
+            per_file_root_diagnostics[files] = {
+                "state": state,
+                "parsed_roots": parsed_roots,
+                "raw_root_names": sorted(raw_root_names),
+                "root_variant": meta.get("root_variant", ""),
+                "root_validation": meta.get("root_validation", ""),
+                "root_failure_reason": meta.get("root_failure_reason", ""),
+            }
+        states = [item["state"] for item in per_file_root_diagnostics.values()]
+        if "ROOT_PARSE_FAILURE" in states:
+            root_state = "ROOT_PARSE_FAILURE"
+            failing = sorted(
+                files for files, item in per_file_root_diagnostics.items()
+                if item["state"] == "ROOT_PARSE_FAILURE"
+            )
+            root_failure_reason = "raw_accepted_root_not_parsed_in:" + ",".join(failing)
+        elif any(s in ("OK",) for s in states):
+            root_state = "OK"
+        else:
+            root_state = "NO_PROCESS_ROOT"
+            root_failure_reason = "no_accepted_root_definition_in_any_process_source"
+
+    root_diagnostics = {
+        "root_state": root_state,
+        "root_failure_reason": root_failure_reason,
+        "accepted_entry_points": [name for _file, name in entry_points],
+        "per_file": per_file_root_diagnostics,
+        "root_candidates": {
+            files: (meta.get("root_candidates") or [])
+            for files, meta in file_metadata.items()
+            if meta.get("root_candidates")
+        },
+        "parse_health": {
+            "initial_error_files": sum(
+                1 for meta in file_metadata.values() if meta.get("initial_has_error")
+            ),
+            "final_error_files": sum(
+                1 for meta in file_metadata.values() if meta.get("final_has_error")
+            ),
+            "fallback_variant_files": sum(
+                1 for meta in file_metadata.values() if meta.get("fallback_used")
+            ),
+        },
+    }
+    STATE.set("ROOT_DIAGNOSTICS", root_diagnostics)
+    print(f"ROOT DIAGNOSTICS: state={root_state} roots={entry_points}")
+
     # TODO: analyze this, how is this diff from above? waht this contains etc
     # TODO: We are not using the 3rd and 4th params, then why calc it? Or, further down the line its being made again and used, maybe use it and pass it to there 
     graph, registry, _, _ = build_complete_call_graph(
@@ -2398,6 +2549,7 @@ def trace_variable(
         main_file_name=main_file_name,
         entry_function_name=entry_function_name,
         entry_points=entry_points,
+        root_diagnostics=STATE.get("ROOT_DIAGNOSTICS"),
         library_functions=set((STATE.get("FUNCTION_MAP") or {}).keys())
         | set((STATE.get("FUNCTION_TYPES") or {}).keys()),
         run_id=STATE.get("TIME"),
@@ -2497,6 +2649,8 @@ def trace_variable(
                 resolver=resolver,
                 run_id=STATE.get("TIME"),
                 file_function_counts=file_function_counts,
+                preprocessor_config=STATE.get("PREPROCESSOR_CONFIG") or {},
+                root_diagnostics=STATE.get("ROOT_DIAGNOSTICS"),
             )
             print(
                 f"Discovery index written to "
@@ -2538,7 +2692,7 @@ def trace_variable(
                     functions_identified=functions_identified, # target functiosn in trees
                     answers=answers, # to add answer inplace
                     main_file_name=main_file_name, # starting point
-                    entry_function_name=entry_function_name or "main",
+                    entry_function_name=entry_function_name,
                     entry_points=entry_points,
                     function_pointer_args=FUNCTION_POINTER_ARGS,
                     file_functions=FILE_FUNCTIONS,
@@ -2554,6 +2708,7 @@ def trace_variable(
                 discovery_spec,
                 resolved_source_root,
                 project_path,
+                STATE.get("RESOLVER_STATE"),
             )
 
         # Fallback to legacy code, resolving for all unique paths in main
@@ -2569,7 +2724,7 @@ def trace_variable(
                         functions_identified=functions_identified,
                         answers=answers,
                         main_file_name=main_file_name,
-                        entry_function_name=entry_function_name or "main",
+                        entry_function_name=entry_function_name,
                         entry_points=entry_points,
                         function_pointer_args=FUNCTION_POINTER_ARGS,
                         file_functions=FILE_FUNCTIONS,
