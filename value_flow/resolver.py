@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import inspect
 import json
+import os
 import re
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -44,6 +45,9 @@ _NUMBER = re.compile(
     r"^[+-]?(?:0[xX][0-9a-fA-F]+|0[bB][01]+|0[0-7]+|\d+(?:\.\d*)?(?:[eE][+-]?\d+)?)[uUlLfF]*$"
 )
 _IDENTIFIER = re.compile(r"^[A-Za-z_]\w*$")
+# _IDENTIFIER is anchored with ^...$ and only usable with fullmatch(); this is
+# a separate scan pattern for finding identifiers inside a larger text.
+_IDENT_SCAN = re.compile(r"[A-Za-z_]\w*")
 _STRING_OR_CHAR = re.compile(
     r"^(?:u8|u|U|L)?(?:\"(?:\\.|[^\"])*\"|'(?:\\.|[^'])+')$", re.DOTALL
 )
@@ -133,6 +137,10 @@ class IndexedSite:
     # in the source macro call may not be argument 1 in the expanded function.
     # Do not trust `arguments[index]`; use the macro/LLM fallback instead.
     macro_args_unmapped: bool = False
+    # False when start_byte/end_byte fell back to a list ordinal because
+    # neither the call site nor its AST node carried a real byte offset.
+    # Callers must not present that ordinal as a byte range.
+    byte_range_known: bool = True
 
     def argument(self, index: int) -> Expression | None:
         if index < 1 or index > len(self.arguments):
@@ -410,9 +418,19 @@ class ValueFlowResolver:
         self._call_number_cache: dict[tuple[str, tuple[str, ...]], str | None] = {}
         self.transfer_cache: dict[str, dict[str, Any]] = {}
         self.transfer_diagnostics: list[str] = []
+        self.transfer_rejections: dict[str, int] = defaultdict(int)
         self.transfer_cache_hits = 0
         self.transfer_cache_misses = 0
         self.transfer_request_count = 0
+        self._function_slice_cache: dict[str, tuple[str, int]] = {}
+        self._route_cache: dict[tuple[str, bool], list[Any]] = {}
+        self._visible_names_cache: dict[str, set[str]] = {}
+        self._constants_cache: dict[str, dict[str, str]] = {}
+        # Part 5 flags: default off, so an unset environment reproduces
+        # today's behaviour exactly. See implementation_plan.md Part 5.1.
+        self.allow_opaque_formula = os.environ.get("TRACER_VF_GRAMMAR_EXTENDED") == "1"
+        self.external_unknown = os.environ.get("TRACER_VF_EXTERNAL_UNKNOWN") == "1"
+        self.multi_open = os.environ.get("TRACER_VF_MULTI_OPEN") == "1"
         fingerprint = hashlib.sha256()
         fingerprint.update(RESOLVER_VERSION.encode("utf-8"))
         fingerprint.update(
@@ -469,14 +487,31 @@ class ValueFlowResolver:
 
         for function_id, function_node in self.registry.items():
             source = self.trees.get(function_node.file_name, (None, b""))[1]
-            ast_node = None
+            candidates = []
             for candidate in definitions_by_file.get(function_node.file_name, []):
                 name = _extract_declarator_identifier(
                     candidate.child_by_field_name("declarator"), source
                 )
                 if name == function_node.name:
-                    ast_node = candidate
-                    break
+                    candidates.append(candidate)
+
+            ast_node = None
+            if len(candidates) == 1:
+                ast_node = candidates[0]
+            elif candidates:
+                # Several same-named definitions in one file (e.g. a static and
+                # an extern sharing a name): pick the one whose byte range
+                # contains the registry's recorded start line, so they don't
+                # all bind to the first candidate found.
+                start = function_node.start_line
+                if start > 0:
+                    for candidate in candidates:
+                        first = candidate.start_point[0] + 1
+                        last = candidate.end_point[0] + 1
+                        if first <= start <= last:
+                            ast_node = candidate
+                            break
+                ast_node = ast_node or candidates[0]
             parameters: list[str] = []
             parameter_nodes: list[Any] = []
             if ast_node is not None:
@@ -503,6 +538,14 @@ class ValueFlowResolver:
                 source=source,
                 parameters=parameters,
                 parameter_nodes=parameter_nodes,
+            )
+
+        missing = [fid for fid, info in self.functions.items() if info.ast_node is None]
+        if missing:
+            print(
+                f"VALUEFLOW: WARNING {len(missing)} function(s) have no AST node; "
+                f"their parameters are empty and every transfer through them will "
+                f"fail. First 10: {missing[:10]}"
             )
 
     def _build_file_static_index(self) -> None:
@@ -645,7 +688,10 @@ class ValueFlowResolver:
                 continue
             arguments = candidate.child_by_field_name("arguments")
             if arguments is None:
-                return [], True
+                # An empty argument list is not a usable mapping; marking it
+                # reliable causes every site.argument(i) lookup to fail with
+                # no model call. Route it through the macro-unmapped path.
+                return [], False
             return [
                 Expression(
                     text=node_text(argument, expanded_source),
@@ -672,11 +718,19 @@ class ValueFlowResolver:
             )
             for ordinal, call_site in enumerate(call_sites):
                 ast_node = self._site_ast(caller_id, call_site)
-                start_byte = (
-                    call_site.start_byte
-                    if call_site.start_byte >= 0
-                    else (ast_node.start_byte if ast_node is not None else ordinal)
-                )
+                byte_range_known = True
+                if call_site.start_byte >= 0:
+                    start_byte = call_site.start_byte
+                elif ast_node is not None:
+                    start_byte = ast_node.start_byte
+                else:
+                    # Neither the call site nor its AST node carries a real
+                    # byte offset. `ordinal` (a list index) keeps site_id
+                    # stable/identity-preserving, but it must not be presented
+                    # to callers as an actual byte range.
+                    start_byte = ordinal
+                    byte_range_known = False
+                    self.transfer_rejections["site_without_bytes"] += 1
                 site_id = f"{caller.file_name}:{start_byte}"
                 source_arguments = self._expressions_for_call(
                     ast_node, source, caller.file_name, file_path
@@ -732,6 +786,7 @@ class ValueFlowResolver:
                     raw_call_site=call_site,
                     macro_name=macro_name,
                     macro_args_unmapped=macro_args_unmapped,
+                    byte_range_known=byte_range_known,
                 )
                 self.sites[site_id] = site
                 self.sites_by_caller[caller_id].append(site)
@@ -990,10 +1045,19 @@ class ValueFlowResolver:
             return
         try:
             payload = json.loads(self.cache_path.read_text(encoding="utf-8"))
-            if (
-                payload.get("schema_version") != 3
-                or payload.get("fingerprint") != self.cache_fingerprint
-            ):
+            if payload.get("schema_version") != 3:
+                return
+            # Transfer entries are self-validating: make_transfer_cache_key
+            # already digests the function slice, the selected site source,
+            # the prompt version and the model id. A change to an unrelated
+            # file cannot produce a false hit, so these survive a project
+            # fingerprint change.
+            self.transfer_cache = {
+                str(key): value
+                for key, value in (payload.get("transfer_cache") or {}).items()
+                if isinstance(value, dict)
+            }
+            if payload.get("fingerprint") != self.cache_fingerprint:
                 return
             self.results = {
                 token: [Fact.from_dict(fact) for fact in facts]
@@ -1007,11 +1071,6 @@ class ValueFlowResolver:
                 },
             )
             self.query_labels.update(payload.get("query_labels", {}))
-            self.transfer_cache = {
-                str(key): value
-                for key, value in (payload.get("transfer_cache") or {}).items()
-                if isinstance(value, dict)
-            }
         except (OSError, ValueError, TypeError):
             # A partial/old cache is never allowed to break a trace.
             self.results = {}
@@ -1778,6 +1837,7 @@ class ValueFlowResolver:
             except Exception as exc:
                 # A transport/model failure must degrade this one query to the
                 # syntactic answer, never abort the whole process run.
+                self.transfer_rejections["llm_exception"] += 1
                 print(f"Value-flow LLM query failed, continuing without it: {exc}")
                 return None
 
@@ -2442,6 +2502,10 @@ class ValueFlowResolver:
         that index keeps route identity independent from display labels and,
         importantly, never unions unrelated callers of a formal parameter.
         """
+        cache_key = (seed.site.site_id, seed.local_backwalk)
+        cached_routes = self._route_cache.get(cache_key)
+        if cached_routes is not None:
+            return cached_routes
         target_caller = seed.site.caller_id
         roots = {
             f"[{file_name}]{function_name}"
@@ -2452,7 +2516,7 @@ class ValueFlowResolver:
             digest = hashlib.sha256(
                 f"local\0{seed.site.site_id}".encode("utf-8", errors="replace")
             ).hexdigest()[:20]
-            return [
+            routes = [
                 RouteGuide(
                     route_id=f"route:{digest}",
                     root_function_id=target_caller,
@@ -2461,7 +2525,10 @@ class ValueFlowResolver:
                     reachability="LOCAL_BACKWALK",
                 )
             ]
+            self._route_cache[cache_key] = routes
+            return routes
         if target_caller not in self.reachable or not roots:
+            self._route_cache[cache_key] = []
             return []
 
         found: list[tuple[str, tuple[CallerEdge, ...]]] = []
@@ -2506,7 +2573,9 @@ class ValueFlowResolver:
                     reachability=reachability,
                 )
             )
-        return sorted(routes, key=lambda item: item.route_id)
+        routes = sorted(routes, key=lambda item: item.route_id)
+        self._route_cache[cache_key] = routes
+        return routes
 
     def initial_route_arm(
         self,
@@ -2550,12 +2619,16 @@ class ValueFlowResolver:
         }
 
     def _transfer_visible_names(self, file_name: str) -> set[str]:
+        cached = self._visible_names_cache.get(file_name)
+        if cached is not None:
+            return cached
         names = set(self.file_macros.get(file_name, {}))
         try:
             enum_values, _ = self._visible_enum_index(file_name)
             names.update(enum_values)
         except Exception:
             pass
+        self._visible_names_cache[file_name] = names
         return names
 
     def _constant_from_text(self, text: str, file_name: str) -> tuple[str, str] | None:
@@ -2650,6 +2723,31 @@ class ValueFlowResolver:
     def _terminal(binding: Binding) -> bool:
         return binding.kind in {"EXACT", "EXTERNAL", "UNKNOWN"}
 
+    def _function_slice(self, function: FunctionInfo) -> tuple[str, int]:
+        """Return (source text, file offset) for one function.
+
+        FunctionInfo.source is the whole file, because reaching-definition
+        analysis indexes it with absolute Tree-sitter offsets. The model needs
+        only the function, so slice here rather than shipping the file.
+        """
+        cached = self._function_slice_cache.get(function.function_id)
+        if cached is not None:
+            return cached
+        node = function.ast_node
+        if node is None:
+            # No AST node: fall back to today's behaviour rather than send
+            # nothing. See the _build_function_index warning (Fix 0.3).
+            result = function.source.decode("latin-1", errors="replace"), 0
+        else:
+            result = (
+                function.source[node.start_byte:node.end_byte].decode(
+                    "latin-1", errors="replace"
+                ),
+                node.start_byte,
+            )
+        self._function_slice_cache[function.function_id] = result
+        return result
+
     def _evidence_texts(self, evidence: list[EvidenceSpan]) -> tuple[str, ...]:
         texts: list[str] = []
         for span in evidence:
@@ -2672,7 +2770,75 @@ class ValueFlowResolver:
             if project_path == path:
                 return file_name
         matches = [name for name in self.trees if Path(name).name == Path(candidate).name]
-        return matches[0] if len(matches) == 1 else None
+        if len(matches) == 1:
+            return matches[0]
+        if not matches:
+            return None
+        # Several files share this basename. Prefer the longest matching path
+        # suffix; a tie leaves the ambiguity unresolved.
+        parts = tuple(Path(candidate).parts)
+        best, best_score = None, 0
+        for name in matches:
+            other = tuple(Path(name).parts)
+            score = 0
+            while (
+                score < min(len(parts), len(other))
+                and parts[-1 - score] == other[-1 - score]
+            ):
+                score += 1
+            if score > best_score:
+                best, best_score = name, score
+            elif score == best_score:
+                best = None
+        return best
+
+    def _repair_span(self, evidence, source: bytes, fn_start: int, fn_end: int, *, same_file: bool) -> tuple[int, int] | None:
+        """Return a usable (start, end) byte span, or None.
+
+        Models reliably get byte arithmetic wrong. The common failures are a
+        degenerate span (start == end), an inverted span, and offsets given
+        relative to the function body rather than the file. Each is repairable
+        from source, so none of them should cost a whole answer.
+        """
+        limit = len(source)
+        start = max(0, min(int(evidence.start_byte), limit))
+        end = max(0, min(int(evidence.end_byte), limit))
+
+        # 1. An exact snippet beats any offset the model computed.
+        snippet = (evidence.snippet or "").strip()
+        if snippet:
+            raw = snippet.encode("latin-1", errors="replace")
+            found = source.find(raw, fn_start, fn_end) if same_file and fn_end else -1
+            if found < 0:
+                found = source.find(raw)
+            if found >= 0:
+                return found, found + len(raw)
+
+        # 2. Offsets given relative to the function body.
+        if same_file and fn_end and end > start and end <= (fn_end - fn_start):
+            shifted_start, shifted_end = fn_start + start, fn_start + end
+            if shifted_end <= fn_end:
+                return shifted_start, shifted_end
+
+        # 3. A well-formed absolute span.
+        if end > start:
+            return start, end
+
+        # 4. Degenerate or inverted: widen to the line containing the anchor.
+        #    This is the reported start_byte == end_byte case.  Offsets of 0/0
+        #    carry no anchor at all -- the prompt tells the model to send that
+        #    when it is unsure -- so do not invent a span at the top of the
+        #    file, whose text belongs to some unrelated function and would then
+        #    count as evidence for the literal-coverage check.
+        if not start and not end:
+            return None
+        anchor = start if start else end
+        if not (0 <= anchor < limit):
+            return None
+        line_start = source.rfind(b"\n", 0, anchor) + 1
+        line_end = source.find(b"\n", anchor)
+        line_end = limit if line_end < 0 else line_end
+        return (line_start, line_end) if line_end > line_start else None
 
     def _validate_transfer_answer(
         self,
@@ -2691,58 +2857,79 @@ class ValueFlowResolver:
                 else TransferAnswerModel.model_validate(raw_answer)
             )
         except (TypeError, ValueError):
+            self.transfer_rejections["schema_invalid"] += 1
             return None
         valid: list[tuple[TransferAnswerModel, list[EvidenceSpan]]] = []
         pending_set = set(pending)
         for model_arm in answer.arms:
             bindings = model_arm.bindings
             indices = [item.target_arg for item in bindings]
-            if len(indices) != len(set(indices)) or set(indices) != pending_set:
+            if len(indices) != len(set(indices)) or not set(indices) <= pending_set:
+                self.transfer_rejections["pending_mismatch"] += 1
+                continue
+            if not indices:
                 continue
             spans: list[EvidenceSpan] = []
-            valid_spans = True
             current_span = False
             function_node = current_function.ast_node
+            fn_start = function_node.start_byte if function_node is not None else 0
+            fn_end = function_node.end_byte if function_node is not None else 0
             for evidence in model_arm.evidence:
                 file_name = self._resolve_project_file(evidence.file)
                 if file_name is None:
-                    valid_spans = False
-                    break
+                    self.transfer_rejections["file_unresolved"] += 1
+                    continue
                 source = self.trees[file_name][1]
-                if evidence.end_byte > len(source):
-                    valid_spans = False
-                    break
-                span = EvidenceSpan(file_name, evidence.start_byte, evidence.end_byte)
-                spans.append(span)
+                span = self._repair_span(
+                    evidence,
+                    source,
+                    fn_start,
+                    fn_end,
+                    same_file=file_name == current_function.node.file_name,
+                )
+                if span is None:
+                    self.transfer_rejections["span_unrepairable"] += 1
+                    continue
+                start, end = span
+                spans.append(EvidenceSpan(file_name, start, end))
                 if (
                     file_name == current_function.node.file_name
                     and function_node is not None
-                    and evidence.start_byte < function_node.end_byte
-                    and evidence.end_byte > function_node.start_byte
+                    and start < fn_end
+                    and end > fn_start
                 ):
                     current_span = True
-            if not valid_spans or not spans or not current_span:
+            if not spans or not current_span:
+                self.transfer_rejections["no_current_span"] += 1
                 continue
             evidence_texts = self._evidence_texts(spans)
+            visible = self._transfer_visible_names(
+                current_function.node.file_name
+            ) | {"NULL", "nullptr"}
+            guard = model_arm.guard
             try:
                 validate_formula(
-                    model_arm.guard,
+                    guard,
                     parameter_count=len(current_function.parameters),
-                    visible_names=self._transfer_visible_names(
-                        current_function.node.file_name
-                    ) | {"NULL", "nullptr"},
+                    visible_names=visible,
                     evidence_texts=evidence_texts,
                     allow_boolean_literals=True,
                 )
+            except (FormulaError, ValueError, TypeError):
+                # A guard only ever narrows an answer. If it cannot be
+                # expressed in the formula grammar, drop the guard and keep
+                # the bindings rather than discarding a correct transfer.
+                self.transfer_rejections["guard_formula"] += 1
+                guard = "true"
+            try:
                 for binding in bindings:
                     if binding.kind == "EXPRESSION":
                         validate_formula(
                             binding.expression,
                             parameter_count=len(current_function.parameters),
-                            visible_names=self._transfer_visible_names(
-                                current_function.node.file_name
-                            ) | {"NULL", "nullptr"},
+                            visible_names=visible,
                             evidence_texts=evidence_texts,
+                            allow_opaque=self.allow_opaque_formula,
                         )
                     elif binding.kind == "EXTERNAL":
                         # EXTERNAL is a source expression, never a disguised
@@ -2759,7 +2946,10 @@ class ValueFlowResolver:
                         ):
                             raise FormulaError("invalid external parameter placeholder")
             except (FormulaError, ValueError, TypeError):
+                self.transfer_rejections["binding_formula"] += 1
                 continue
+            if guard != model_arm.guard:
+                model_arm = model_arm.model_copy(update={"guard": guard})
             valid.append((model_arm, spans))
         return valid or None
 
@@ -2779,12 +2969,28 @@ class ValueFlowResolver:
         request_bindings = tuple(
             binding for binding in arm.bindings if binding.target_arg in pending
         )
+        function_text, function_base = self._function_slice(current_function)
+        # Derived only from the function text and its file, both immutable for
+        # the run.  This is built before the cache lookup because it feeds the
+        # cache key, so memoise it or every cache hit re-resolves 200 macros.
+        constants = self._constants_cache.get(current_function.function_id)
+        if constants is None:
+            names = set(_IDENT_SCAN.findall(function_text)) & self._transfer_visible_names(
+                current_function.node.file_name
+            )
+            constants = {}
+            for name in sorted(names)[:200]:      # bounded: this goes in the prompt
+                resolved = self._constant_from_text(name, current_function.node.file_name)
+                if resolved is not None:
+                    constants[name] = resolved[0]
+            self._constants_cache[current_function.function_id] = constants
         macro_context = json.dumps(
             {
                 "name": selected_site.macro_name,
                 "unmapped": selected_site.macro_args_unmapped,
                 "expanded_arguments": [item.text for item in selected_site.arguments],
                 "source_arguments": [item.text for item in selected_site.target_arguments],
+                "constants": constants,
             },
             sort_keys=True,
         )
@@ -2793,30 +2999,15 @@ class ValueFlowResolver:
             prompt_version=self.transfer_prompt_version,
             model_id=self.transfer_model_id,
             function_id=current_function.function_id,
-            function_source=current_function.source,
+            function_source=function_text,
             selected_site_id=selected_site.site_id,
             selected_site_source=selected_site.source[selected_site.start_byte:selected_site.end_byte],
             bindings=request_bindings,
             guards=tuple(arm.guards),
             macro_digest=macro_digest,
         )
-        call_text = node_text(selected_site.ast_node, selected_site.source) if selected_site.ast_node is not None else selected_site.callee_name
-        request = TransferRequest(
-            route=route,
-            function_id=current_function.function_id,
-            function_name=current_function.node.name,
-            function_file=current_function.node.file_name,
-            function_source=current_function.source.decode("latin-1", errors="replace"),
-            parameters=tuple(current_function.parameters),
-            selected_site_id=selected_site.site_id,
-            selected_call_text=call_text,
-            selected_call_start_byte=selected_site.start_byte,
-            selected_call_end_byte=selected_site.end_byte,
-            bindings=request_bindings,
-            guards=tuple(arm.guards),
-            macro_context=macro_context,
-        )
         cached = self.transfer_cache.get(key)
+        request: TransferRequest | None = None
         if cached is not None:
             self.transfer_cache_hits += 1
             raw_answer = cached.get("answer")
@@ -2824,9 +3015,31 @@ class ValueFlowResolver:
             self.transfer_cache_misses += 1
             if self.transfer_resolver is None:
                 return None
+            call_text = node_text(selected_site.ast_node, selected_site.source) if selected_site.ast_node is not None else selected_site.callee_name
+            request = TransferRequest(
+                route=route,
+                function_id=current_function.function_id,
+                function_name=current_function.node.name,
+                function_file=current_function.node.file_name,
+                function_source=function_text,
+                function_start_byte=function_base,
+                parameters=tuple(current_function.parameters),
+                selected_site_id=selected_site.site_id,
+                selected_call_text=call_text,
+                selected_call_start_byte=(
+                    selected_site.start_byte if selected_site.byte_range_known else -1
+                ),
+                selected_call_end_byte=(
+                    selected_site.end_byte if selected_site.byte_range_known else -1
+                ),
+                bindings=request_bindings,
+                guards=tuple(arm.guards),
+                macro_context=macro_context,
+            )
             self.transfer_request_count += 1
             raw_answer = await self._await_llm(self.transfer_resolver, request)
         if raw_answer is None:
+            self.transfer_rejections["llm_returned_none"] += 1
             return None
         validated = self._validate_transfer_answer(
             raw_answer,
@@ -2835,6 +3048,7 @@ class ValueFlowResolver:
             pending=pending,
         )
         if not validated:
+            self.transfer_rejections["all_arms_rejected"] += 1
             return None
         # Cache only a source-validated structured response.  Invalid model
         # output must not poison the next run or turn a later correction into
@@ -2864,13 +3078,26 @@ class ValueFlowResolver:
                 item.target_arg: Binding(item.target_arg, item.kind, item.expression)
                 for item in model_arm.bindings
             }
+            # An arm may answer only some of the requested arguments.  An
+            # unanswered one may be carried to the caller only when its text is
+            # a formula over formal parameters, which _substitute_arm can still
+            # rewrite.  A bare local name means nothing in the caller, and a
+            # same-named local there would resolve it to the wrong value.
+            child_bindings: list[Binding] = []
+            for binding in arm.bindings:
+                answered = model_bindings.get(binding.target_arg)
+                if answered is not None:
+                    child_bindings.append(answered)
+                elif binding.target_arg not in pending or placeholder_indices(binding.text):
+                    child_bindings.append(binding)
+                else:
+                    child_bindings.append(
+                        Binding(binding.target_arg, "UNKNOWN", binding.text)
+                    )
             child = RouteArm(
                 route_id=arm.route_id,
                 correlation_id=f"corr:{child_id}",
-                bindings=[
-                    model_bindings.get(binding.target_arg, binding)
-                    for binding in arm.bindings
-                ],
+                bindings=child_bindings,
                 guards=[*arm.guards, model_arm.guard]
                 if model_arm.guard.strip().lower() != "true"
                 else list(arm.guards),
@@ -2927,7 +3154,7 @@ class ValueFlowResolver:
 
     def _substitute_arm(self, arm: RouteArm, edge: CallerEdge) -> RouteArm | None:
         site = self.sites.get(edge.site_id)
-        if site is None or site.macro_args_unmapped:
+        if site is None:
             return None
         indexes = {
             index
@@ -2940,6 +3167,10 @@ class ValueFlowResolver:
             for guard in arm.guards
             for index in placeholder_indices(guard)
         )
+        if site.macro_args_unmapped and indexes:
+            # Positions through this macro are untrustworthy, but only matters
+            # if this arm actually reads an argument position.
+            return None
         actuals: dict[int, str] = {}
         for index in indexes:
             expression = site.argument(index)
@@ -3046,8 +3277,18 @@ class ValueFlowResolver:
             value = binding.text or "EXTERNAL"
             origin = str(source.get("origin_kind") or ("EXTERNAL_ENTRY" if "$" in value else "EXTERNAL_DATA"))
         else:
-            value = "UNRESOLVED"
-            origin = "RECURSIVE" if binding.text == "RECURSIVE" else "UNRESOLVED"
+            sentinel = binding.text in {
+                "RECURSIVE", "UNRESOLVED", "missing argument", "HANDLE_AMBIGUOUS",
+            }
+            if self.external_unknown and not sentinel and binding.text.strip():
+                # An expression we could not trace further is still an
+                # answer: the legacy engine reports it as EXTERNAL_DATA
+                # rather than discarding it (P17).
+                value = binding.text
+                origin = "UNKNOWN_INDIRECT" if "(*" in binding.text else "EXTERNAL_DATA"
+            else:
+                value = "UNRESOLVED"
+                origin = "RECURSIVE" if binding.text == "RECURSIVE" else "UNRESOLVED"
         metadata = {
             "route_id": route.route_id,
             "correlation_id": arm.correlation_id,
@@ -3059,6 +3300,10 @@ class ValueFlowResolver:
             "transfer_chain": list(arm.transfer_chain),
             "reachability": route.reachability,
         }
+        if binding.kind == "UNKNOWN" and binding.text not in {
+            "RECURSIVE", "UNRESOLVED", "missing argument", "HANDLE_AMBIGUOUS",
+        }:
+            metadata["unresolved_expr"] = binding.text
         for edge in route.edges:
             if edge.synthetic_callback and edge.callback_meta:
                 metadata.update(edge.callback_meta)
@@ -3223,6 +3468,7 @@ class ValueFlowResolver:
                         for item in arm.bindings
                     ]
                     terminal.append(arm)
+                    active.discard(state_key)
                     continue
                 for child in transferred:
                     child = self._settle_transfer_arm(child, selected_site)
@@ -3272,7 +3518,13 @@ class ValueFlowResolver:
                         continue
                     substituted = self._substitute_arm(child, edge)
                     if substituted is None:
-                        terminal.append(self._mark_external_or_unknown(child, external=False))
+                        terminal.append(
+                            self._mark_external_or_unknown(
+                                child,
+                                external=True,
+                                parameter_names=tuple(current_function.parameters),
+                            )
+                        )
                         continue
                     next_arms.append(substituted)
                 active.discard(state_key)
@@ -3344,6 +3596,48 @@ class ValueFlowResolver:
             before = site.start_byte
             edge_index -= 1
         return None
+
+    def _openings_for_route(
+        self, seed: Seed, route: RouteGuide, dependencies: tuple[str, ...]
+    ) -> list[IndexedSite]:
+        """Every candidate open, where _opening_for_route requires exactly one.
+
+        A handle written by two branches has two legitimate origins; the
+        engine already represents alternatives as separate correlated arms
+        (P13, flagged behind TRACER_VF_MULTI_OPEN).
+        """
+        argument_index = int(seed.config.get("handle_index") or 1)
+        current_id = seed.site.caller_id
+        before = seed.site.start_byte
+        argument = (
+            seed.site.target_argument(argument_index)
+            if seed.site.is_configured_macro_target
+            else seed.site.argument(argument_index)
+        )
+        root = normalise_handle(argument.text) if argument is not None else ""
+        edge_index = len(route.edges) - 1
+        while root:
+            bindings = self._binding_opens(current_id, root, before, dependencies)
+            if bindings:
+                return bindings
+            function = self.functions.get(current_id)
+            if function is None or root not in function.parameters or edge_index < 0:
+                return []
+            edge = route.edges[edge_index]
+            if edge.synthetic_callback:
+                return []
+            site = self.sites.get(edge.site_id)
+            if site is None:
+                return []
+            parameter_index = function.parameters.index(root) + 1
+            actual = site.argument(parameter_index)
+            if actual is None:
+                return []
+            root = normalise_handle(actual.text)
+            current_id = edge.caller_id
+            before = site.start_byte
+            edge_index -= 1
+        return []
 
     def effective_value_sites_for_seed(self, seed: Seed) -> list[EffectiveValueSite]:
         """Return source call sites for configured values, never resolved values."""
@@ -3457,26 +3751,33 @@ class ValueFlowResolver:
         ] = []
         if dependencies:
             for consumer_route in self.routes_for_seed(seed):
-                opening = self._opening_for_route(seed, consumer_route, dependencies)
-                effective_route = (
-                    self._route_for_opening(consumer_route, opening)
-                    if opening is not None
-                    else None
-                )
-                if opening is not None and effective_route is not None:
-                    config = self.function_configs.get(opening.callee_name, {})
-                    indices = tuple(int(item) for item in config.get("indices") or ())
-                    if not indices:
-                        continue
-                    effective.append(
-                        (
-                            opening,
-                            indices,
-                            "VARTRACE",
-                            seed.site,
-                            effective_route,
-                        )
+                openings = (
+                    self._openings_for_route(seed, consumer_route, dependencies)
+                    if self.multi_open
+                    else (
+                        [self._opening_for_route(seed, consumer_route, dependencies)]
                     )
+                )
+                for opening in openings:
+                    effective_route = (
+                        self._route_for_opening(consumer_route, opening)
+                        if opening is not None
+                        else None
+                    )
+                    if opening is not None and effective_route is not None:
+                        config = self.function_configs.get(opening.callee_name, {})
+                        indices = tuple(int(item) for item in config.get("indices") or ())
+                        if not indices:
+                            continue
+                        effective.append(
+                            (
+                                opening,
+                                indices,
+                                "VARTRACE",
+                                seed.site,
+                                effective_route,
+                            )
+                        )
         else:
             effective = [
                 (seed.site, configured_indices, "", seed.site, route)

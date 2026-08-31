@@ -696,10 +696,10 @@ TARGET SITE ID: {target_site_id}
 CURRENT FUNCTION ID: {function_id}
 CURRENT FUNCTION: {function_name}
 FORMAL PARAMETERS (1-based): {parameters}
-CURRENT FUNCTION SOURCE:
+CURRENT FUNCTION SOURCE (starts at file byte {function_start_byte}):
 {function_source}
 
-SELECTED OUTGOING CALL ({start_byte}:{end_byte}):
+SELECTED OUTGOING CALL ({byte_range}):
 {selected_call_text}
 
 REQUESTED CORRELATED BINDINGS:
@@ -708,8 +708,11 @@ REQUESTED CORRELATED BINDINGS:
 PENDING GUARDS:
 {guards}
 
-Use $N only for an existing formal parameter N. Cite byte spans as
-file/start_byte/end_byte. The coordinator will substitute selected caller
+Use $N only for an existing formal parameter N. For each evidence item set
+"snippet" to the exact source text you are citing, copied verbatim from
+CURRENT FUNCTION SOURCE (one line is enough), and set "file" to its file.
+Byte offsets are optional; if you are unsure, set start_byte and end_byte to 0
+and rely on the snippet. The coordinator will substitute selected caller
 arguments simultaneously and evaluate safe formulas.
 MACRO EXPANSION CONTEXT: {macro_context}
 """
@@ -717,8 +720,9 @@ MACRO EXPANSION CONTEXT: {macro_context}
         data={
             "user_prompt": user_prompt,
             "system_prompt": system_prompt,
-            "tools": state.get("TOOL_DEFINITION"),
-            "tool_functions": state.get("TOOLS") or {},
+            "tools": None,
+            "tool_functions": {},
+            "timeout": float(os.environ.get("TRACER_VF_TRANSFER_TIMEOUT", "120")),
             "project_structure": project_structure,
             "function_map": state.get("FUNCTION_MAP"),
             "output_model": TransferAnswerModel,
@@ -736,8 +740,13 @@ MACRO EXPANSION CONTEXT: {macro_context}
                     for index, name in enumerate(request.parameters, start=1)
                 ) or "(void)",
                 "function_source": request.function_source,
-                "start_byte": request.selected_call_start_byte,
-                "end_byte": request.selected_call_end_byte,
+                "function_start_byte": request.function_start_byte,
+                "byte_range": (
+                    "byte range unknown"
+                    if request.selected_call_start_byte < 0
+                    or request.selected_call_end_byte < 0
+                    else f"{request.selected_call_start_byte}:{request.selected_call_end_byte}"
+                ),
                 "selected_call_text": request.selected_call_text,
                 "bindings": binding_text,
                 "guards": guard_text,
@@ -1691,6 +1700,16 @@ async def make_value_flow_calls(
     token_totals = {"Input_tokens": 0, "Output_tokens": 0, "Total_tokens": 0}
     query_stats: list[dict] = []
 
+    # A transfer prompt that has not answered in two minutes is not going to;
+    # run_with_retry's 600s default is tuned for the heavier legacy prompts.
+    transfer_timeout = int(os.environ.get("TRACER_VF_TRANSFER_TIMEOUT", "120"))
+    # P20 (flagged, TRACER_VF_NO_FORK): the transfer prompt is a bounded,
+    # side-effect-free API call, so it does not need a forked child per hop --
+    # each fork copy-on-writes a parent holding every tree, AST and registry.
+    # The fork exists so a hung call can be terminated; llm_calls_transfer now
+    # bounds its own request time instead, which makes that unnecessary.
+    transfer_no_fork = os.environ.get("TRACER_VF_NO_FORK") == "1"
+
     def record_stats(kind: str, site: IndexedSite, stats) -> None:
         """
         Record token usage and query metadata for one LLM call.
@@ -1784,12 +1803,19 @@ async def make_value_flow_calls(
             f"{ORANGE}  LLM transfer{RESET} {request.function_file} "
             f"{request.function_name} -> {request.selected_site_id}"
         )
-        result = await loop.run_in_executor(
-            llm_executor,
-            run_with_retry,
-            llm_calls_transfer,
-            (project_structure, request),
-        )
+        if transfer_no_fork:
+            # Raised exceptions are caught by ValueFlowResolver._await_llm and
+            # counted as llm_exception, exactly as a fork failure would be.
+            result = await loop.run_in_executor(
+                llm_executor, llm_calls_transfer, project_structure, request
+            )
+        else:
+            result = await loop.run_in_executor(
+                llm_executor,
+                partial(run_with_retry, timeout=transfer_timeout, retries=2),
+                llm_calls_transfer,
+                (project_structure, request),
+            )
         if not result:
             return None
         model, stats = result
@@ -1899,7 +1925,10 @@ async def make_value_flow_calls(
             # and comparison tests, but is never a numeric fallback here.
             transfer_resolver=resolve_transfer if llm_ready else disabled_transfer,
             transfer_model_id=os.environ.get("TRACER_LLM_MODEL", TRACER_DEFAULT_MODEL),
-            transfer_prompt_version="valueflow-transfer-v1",
+            # The opaque-grammar flag changes which formulas validate, so an
+            # answer cached with it on must never be served with it off.
+            transfer_prompt_version="valueflow-transfer-v2"
+            + ("-opaque" if os.environ.get("TRACER_VF_GRAMMAR_EXTENDED") == "1" else ""),
             return_use_resolver=resolve_return_use if llm_ready else None,
             cache_path=cache_path,
             path_cap=path_cap,
@@ -1952,6 +1981,7 @@ async def make_value_flow_calls(
         "transfer_cache_hits": resolver.transfer_cache_hits,
         "transfer_cache_misses": resolver.transfer_cache_misses,
         "transfer_diagnostics": list(resolver.transfer_diagnostics),
+        "transfer_rejections": dict(resolver.transfer_rejections),
         "transfer_prompt_version": resolver.transfer_prompt_version,
         "transfer_model_id": resolver.transfer_model_id,
         "Tokens": token_totals,

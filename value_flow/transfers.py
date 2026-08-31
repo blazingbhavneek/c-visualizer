@@ -80,6 +80,7 @@ class TransferRequest:
     bindings: tuple[Binding, ...]
     guards: tuple[str, ...]
     macro_context: str = ""
+    function_start_byte: int = 0   # file offset of function_source[0]
 
 
 def placeholder_indices(text: str) -> tuple[int, ...]:
@@ -182,6 +183,25 @@ def _literal_value(text: str) -> int | str | None:
     return None
 
 
+# Integer and character literals as they may be spelled in source, for the
+# value-based evidence check in validate_formula.  A character literal counts
+# because `'\n'` in source and `10` in a formula denote the same value.
+_EVIDENCE_LITERAL = re.compile(
+    r"(?<![A-Za-z0-9_])(?:0[xX][0-9a-fA-F]+|0[bB][01]+|0[0-7]*|[1-9][0-9]*)[uUlL]*"
+    r"|'(?:\\.|[^'\\])+'"
+)
+
+
+def _evidence_integer_values(evidence: str) -> set[int]:
+    """Every integer VALUE spelled anywhere in the evidence, in any C base."""
+    values: set[int] = set()
+    for token in _EVIDENCE_LITERAL.findall(evidence):
+        parsed = _literal_value(token)
+        if isinstance(parsed, int) and not isinstance(parsed, bool):
+            values.add(parsed)
+    return values
+
+
 _ALLOWED_UNARY = {"+", "-", "~", "!"}
 _ALLOWED_BINARY = {
     "+", "-", "*", "/", "%", "<<", ">>", "&", "|", "^",
@@ -202,6 +222,21 @@ def _operator(node: Any) -> str:
     return ""
 
 
+# P10 (flagged, TRACER_VF_GRAMMAR_EXTENDED): these node types are accepted as
+# opaque leaves but never evaluated -- evaluate_formula's evaluate() returns
+# None for any node kind it doesn't handle, so a binding built from one of
+# these can never become an EXACT value. Widening the grammar can only let
+# the model NAME a source it currently cannot name; it cannot produce a wrong
+# number. call_expression is deliberately excluded: a call has side effects
+# and an unknown return, so UNKNOWN is the honest answer there.
+_OPAQUE_NODES = {
+    "field_expression",
+    "subscript_expression",
+    "pointer_expression",
+    "conditional_expression",
+}
+
+
 def _validate_node(
     node: Any,
     *,
@@ -209,13 +244,14 @@ def _validate_node(
     parameter_count: int,
     visible_names: set[str],
     literals: list[str],
+    allow_opaque: bool = False,
 ) -> None:
     node_type = node.type
     if node_type in {"parenthesized_expression"}:
         children = node.named_children
         if len(children) != 1:
             raise FormulaError("invalid parenthesized expression")
-        _validate_node(children[0], placeholders=placeholders, parameter_count=parameter_count, visible_names=visible_names, literals=literals)
+        _validate_node(children[0], placeholders=placeholders, parameter_count=parameter_count, visible_names=visible_names, literals=literals, allow_opaque=allow_opaque)
         return
     if node_type in {"number_literal", "char_literal", "string_literal"}:
         text = _node_text(node)
@@ -237,13 +273,26 @@ def _validate_node(
     if node_type == "unary_expression":
         if _operator(node) not in _ALLOWED_UNARY or len(node.named_children) != 1:
             raise FormulaError("unsupported unary expression")
-        _validate_node(node.named_children[0], placeholders=placeholders, parameter_count=parameter_count, visible_names=visible_names, literals=literals)
+        _validate_node(node.named_children[0], placeholders=placeholders, parameter_count=parameter_count, visible_names=visible_names, literals=literals, allow_opaque=allow_opaque)
         return
     if node_type == "binary_expression":
         if _operator(node) not in _ALLOWED_BINARY or len(node.named_children) != 2:
             raise FormulaError("unsupported binary expression")
         for child in node.named_children:
-            _validate_node(child, placeholders=placeholders, parameter_count=parameter_count, visible_names=visible_names, literals=literals)
+            _validate_node(child, placeholders=placeholders, parameter_count=parameter_count, visible_names=visible_names, literals=literals, allow_opaque=allow_opaque)
+        return
+    if allow_opaque and node_type in _OPAQUE_NODES:
+        # An opaque leaf: the model may NAME this source, but the expression
+        # is deliberately not evaluable, so it can never become an EXACT
+        # value. Do not identifier-check the descendants -- `cfg` in
+        # `cfg->mode` is a local and is not in visible_names by design. Only
+        # collect nested literals so they still have to be covered by
+        # evidence.
+        for descendant in _walk(node):
+            if descendant.type in {"number_literal", "char_literal", "string_literal"}:
+                text = _node_text(descendant)
+                if _literal_value(text) is not None:
+                    literals.append(text)
         return
     raise FormulaError(f"unsupported expression node {node_type}")
 
@@ -255,6 +304,7 @@ def validate_formula(
     visible_names: set[str] | None = None,
     evidence_texts: tuple[str, ...] = (),
     allow_boolean_literals: bool = False,
+    allow_opaque: bool = False,
 ) -> tuple[dict[str, int], tuple[str, ...]]:
     """Validate a formula and return parser-safe placeholders/literal leaves."""
     node, placeholders = _expression_node(formula)
@@ -265,13 +315,27 @@ def validate_formula(
         parameter_count=parameter_count,
         visible_names=visible_names or set(),
         literals=literals,
+        allow_opaque=allow_opaque,
     )
     evidence = "\n".join(evidence_texts)
+    evidence_values: set[int] | None = None
     for literal in literals:
         if allow_boolean_literals and literal in {"0", "1"}:
             continue
-        if literal not in evidence:
-            raise FormulaError(f"literal {literal} is not covered by evidence")
+        if literal in evidence:
+            continue
+        # P11: source and formula may spell the same number differently --
+        # 0x10 vs 16, 1U vs 1, '\n' vs 10. The requirement is that the number
+        # is GROUNDED in evidence, not that it is spelled the same way, so
+        # compare integer values before rejecting. This is not a relaxation:
+        # an ungrounded number still has no matching value and still fails.
+        value = _literal_value(literal)
+        if isinstance(value, int) and not isinstance(value, bool):
+            if evidence_values is None:
+                evidence_values = _evidence_integer_values(evidence)
+            if value in evidence_values:
+                continue
+        raise FormulaError(f"literal {literal} is not covered by evidence")
     return placeholders, tuple(literals)
 
 

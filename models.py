@@ -31,13 +31,12 @@ class TransferEvidenceModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
     file: str
     start_byte: int = Field(ge=0)
-    end_byte: int = Field(gt=0)
+    end_byte: int = Field(ge=0)
+    snippet: str = ""
 
-    @model_validator(mode="after")
-    def validate_range(self) -> "TransferEvidenceModel":
-        if self.end_byte <= self.start_byte:
-            raise ValueError("end_byte must be greater than start_byte")
-        return self
+    # NOTE: no model_validator. A degenerate or inverted span is repaired in
+    # ValueFlowResolver._validate_transfer_answer, not rejected here. Rejecting
+    # here discards the whole answer including correct bindings.
 
 
 class TransferBindingModel(BaseModel):

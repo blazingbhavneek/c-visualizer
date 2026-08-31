@@ -87,6 +87,11 @@ class OllamaClient:
             #             base_url='http://10.160.152.38:8000/v1'
             #             )
             # )
+            # A caller may bound its own request time.  Without this the SDK
+            # default applies and a hung call can only be stopped by killing
+            # the surrounding process, which is why run_with_retry forks at
+            # all.  Callers that pass nothing keep exactly today's behaviour.
+            timeout = data.get("timeout")
             self.client = OpenAI(
                 api_key=data.get("api_key")
                 or os.environ.get("TRACER_LLM_API_KEY", "EMPTY"),
@@ -94,6 +99,7 @@ class OllamaClient:
                 or os.environ.get(
                     "TRACER_LLM_BASE_URL", TRACER_DEFAULT_BASE_URL
                 ),
+                **({"timeout": float(timeout), "max_retries": 0} if timeout else {}),
             )
         else:
             # self.client = Client(host = data.get('host','http://10.160.144.101:51021'))
@@ -462,15 +468,47 @@ class OllamaClient:
                 print(f"RETRY {attempt+1}/{MAX_RETRY_ATTEMPTS}")
 
                 while iteration <= MAX_ITERATIONS_ALLOWED:
+                    # P24 (flagged, TRACER_VF_STRUCTURED_OUTPUT): for the
+                    # transfer prompt only, ask the endpoint to parse directly
+                    # into the schema so structured fields never have to
+                    # cross a prose round-trip. Falls straight through to
+                    # today's create()+prose->JSON path on any failure
+                    # (unsupported endpoint, schema mismatch, etc).
+                    if (
+                        os.environ.get("TRACER_VF_STRUCTURED_OUTPUT") == "1"
+                        and self.output_model.__name__ == "TransferAnswerModel"
+                        and not self.tools
+                    ):
+                        try:
+                            parsed_response = self.client.chat.completions.parse(
+                                model=self.model,
+                                messages=self.messages,
+                                temperature=self.temp,
+                                response_format=self.output_model,
+                            )
+                            if parsed_response.usage:
+                                INPUT_TOKEN += parsed_response.usage.prompt_tokens
+                                OUTPUT_TOKEN += parsed_response.usage.completion_tokens
+                            parsed_choice = parsed_response.choices[0].message
+                            if parsed_choice.parsed is not None:
+                                final_validated_model = parsed_choice.parsed
+                                ANS_FOUND = True
+                                break
+                        except Exception as e:
+                            print(
+                                f"Structured output parse failed, falling back "
+                                f"to prose->JSON: {e}"
+                            )
                     try:
-                        response = self.client.chat.completions.create(
-                            model=self.model,
-                            messages=self.messages,
-                            tools=self.tools,
-                            tool_choice="auto",
-                            temperature=self.temp,
-                            # max_tokens=self.num_ctx,
-                        )
+                        create_kwargs = {
+                            "model": self.model,
+                            "messages": self.messages,
+                            "temperature": self.temp,
+                        }
+                        if self.tools:
+                            create_kwargs["tools"] = self.tools
+                            create_kwargs["tool_choice"] = "auto"
+                        response = self.client.chat.completions.create(**create_kwargs)
                     except Exception as e:
                         if attempt < MAX_RETRY_ATTEMPTS - 1:
                             print(f"Error communicating with OpenAI: {e}\nRETRYING..")
@@ -504,7 +542,10 @@ class OllamaClient:
                             f"Return ONLY valid JSON string like this json schema "
                             f"inside ```json``` block. JSON_SCHEMA: {json.dumps(format_schema)}.\n"
                         )
-                        if self.output_model.__name__ != "outputModelForReturn":
+                        if self.output_model.__name__ not in {
+                            "outputModelForReturn",
+                            "TransferAnswerModel",
+                        }:
                             format_prompt_content += f"""
                                 "**DON'TS**:"
                                 - For this function we are only tracking these arguments (1 based index) {argument_number_to_track} **don't report any other arguments**
@@ -512,11 +553,11 @@ class OllamaClient:
                                 - If argument's value is string report it without "" like lets say argument 1 is string then 1:value
                                 - If argument's value is int then report it as it is like lets say argument 1 is int then 1: 2003 (If 2003 is the value.)
                                 - If argument's value is not resolved then report as UNRESOLVED
-                                
+
                                 - For call_number we can have both int or NONE
                                 - DONT RETURN A LIST.
                             """
-                        else:
+                        elif self.output_model.__name__ == "outputModelForReturn":
                             format_prompt_content += (
                                 "- **YOU JUST HAVE TO RETURN WHETHER ITS A READ OR WRITE "
                                 "OPERATION ON THE RETURN POINTER NOTHING ELSE.**\n"

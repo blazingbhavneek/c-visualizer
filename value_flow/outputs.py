@@ -117,6 +117,8 @@ def _legacy_rows(
     records: list[ResolvedSeed],
     process_name: str,
     resolver: ValueFlowResolver | None = None,
+    *,
+    keep_partial_rows: bool = False,
 ) -> list[dict]:
     """Write one row per target invocation and distinct argument-path tuple."""
     # `records` are one source fact for one target argument. A target such as
@@ -160,8 +162,11 @@ def _legacy_rows(
             }
             # Dependent handle records use the owning open's indices and do
             # not have a target-side configured bundle to validate here.
-            if expected and set(ordered_indices) != expected:
+            if expected and set(ordered_indices) != expected and not keep_partial_rows:
                 continue
+            # keep_partial_rows on: emitting a partial bundle is more honest
+            # than dropping the invocation -- a missing row is otherwise
+            # indistinguishable from a target that was never found (P18).
         for combination in product(*(choices_by_index[index] for index in ordered_indices)):
             representative = combination[0][0]
             values = [item.fact.value for item, _ in combination]
@@ -347,7 +352,10 @@ def write_outputs(
         )
     )
     path_rows.sort(key=lambda row: (row["fact_id"], int(row["path_index"])))
-    legacy_rows = _legacy_rows(records, process_name, resolver)
+    keep_partial_rows = os.environ.get("TRACER_VF_KEEP_PARTIAL_ROWS") == "1"
+    legacy_rows = _legacy_rows(
+        records, process_name, resolver, keep_partial_rows=keep_partial_rows
+    )
     legacy_rows.sort(
         key=lambda row: (
             row["function_name"],
