@@ -92,6 +92,85 @@ class ValueFlowPipelineTests(unittest.TestCase):
             )
             self.assertEqual(len(snapshot["interactions"]), 1)
 
+    def test_local_backwalk_keeps_launch_and_reachability_separate(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp = Path(temp_dir)
+            project = temp / "valueflow_backwalk_project"
+            project.mkdir()
+            (project / "Makefile").write_text(
+                "SRCS = main.c orphan.c\nINCLUDE =\nLIBS =\n", encoding="utf-8"
+            )
+            (project / "main.c").write_text(
+                "int main(void) { return 0; }\n", encoding="latin-1"
+            )
+            (project / "orphan.c").write_text(
+                "int traced_api(int value);\n"
+                "void orphan(void) { traced_api(17); }\n",
+                encoding="latin-1",
+            )
+            state = State()
+            state.reset()
+            state.set(
+                "FUNCTION_TYPES",
+                {
+                    "traced_api": {
+                        "type": "READF",
+                        "launch": "FORK",
+                        "indices": [1],
+                        "get_upper": True,
+                        "dependent_functions": [],
+                    }
+                },
+            )
+            state.set("FUNCTION_POINTER_ARGS", {})
+            state.set("FUNCTION_MAP", {})
+            state.set("TIME", "valueflow-backwalk-run")
+            state.set("PROJECT_NAME", project.name)
+            results = temp / "results"
+            cache = temp / "project-cache"
+            try:
+                with patch.dict(
+                    os.environ,
+                    {
+                        "VISUALIZER_RESULTS_ROOT": str(results),
+                        "PROJECT_STRUCTURE_CACHE_ROOT": str(cache),
+                    },
+                ):
+                    answers = trace_variable(
+                        project,
+                        summary_config=SummaryConfig(enabled=False),
+                        resolver="valueflow",
+                    )
+            finally:
+                state.reset()
+
+            self.assertIn("traced_api", answers)
+            with (results / f"{project.name}.csv").open(
+                encoding="utf-8-sig", newline=""
+            ) as handle:
+                legacy = list(csv.DictReader(handle))
+            self.assertEqual(legacy[0]["launch_via"], "NO DATA")
+            self.assertEqual(legacy[0]["reachability"], "LOCAL_BACKWALK")
+            with (results / project.name / "facts.csv").open(
+                encoding="utf-8-sig", newline=""
+            ) as handle:
+                facts = list(csv.DictReader(handle))
+            self.assertEqual(facts[0]["launch_via"], "NO DATA")
+            self.assertEqual(facts[0]["link_method"], "LOCAL_BACKWALK")
+            snapshot = json.loads(
+                (
+                    results
+                    / "visualizer"
+                    / project.name
+                    / "runs"
+                    / "valueflow-backwalk-run"
+                    / "graph.json"
+                ).read_text()
+            )
+            self.assertEqual(
+                snapshot["interactions"][0]["reachability"], "LOCAL_BACKWALK"
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

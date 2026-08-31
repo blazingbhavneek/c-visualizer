@@ -6,11 +6,26 @@ from pathlib import Path
 from unittest.mock import patch
 
 from function_summaries import SummaryConfig
-from project_aware import trace_variable
+from project_aware import _write_process_timing, trace_variable
 from state.state import State
 
 
 class NoTargetPipelineTests(unittest.TestCase):
+    def test_process_timing_creates_stats_without_valueflow_outputs(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            results_root = Path(temp_dir) / "results"
+            with patch.dict(
+                os.environ,
+                {"VISUALIZER_RESULTS_ROOT": str(results_root)},
+            ), patch("project_aware.time.perf_counter", return_value=12.5):
+                _write_process_timing("plain_project", 10.0, status="success")
+
+            stats = json.loads(
+                (results_root / "plain_project" / "run_stats.json").read_text()
+            )
+            self.assertEqual(stats["process_wall_seconds"], 2.5)
+            self.assertEqual(stats["process_status"], "success")
+
     def test_project_without_tracked_apis_still_writes_complete_graph(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp = Path(temp_dir)

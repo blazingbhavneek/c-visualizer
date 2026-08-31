@@ -1,7 +1,7 @@
 from pathlib import Path
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 # launch_via = Literal('Event','Fork') # add more types.
 
@@ -25,14 +25,50 @@ class outputModelForReturn(BaseModel):
     )
 
 
-class outputModelOneHop(BaseModel):
-    """A local data-flow answer which can explicitly continue through a parameter."""
+class TransferEvidenceModel(BaseModel):
+    """An exact source span supporting one local value transfer."""
 
     model_config = ConfigDict(extra="forbid")
-    kind: Literal["VALUE", "PARAM", "EXTERNAL", "UNRESOLVED"]
-    value: str | None = None
-    param_index: int | None = Field(default=None, ge=1)
-    source_expr: str | None = None
+    file: str
+    start_byte: int = Field(ge=0)
+    end_byte: int = Field(gt=0)
+
+    @model_validator(mode="after")
+    def validate_range(self) -> "TransferEvidenceModel":
+        if self.end_byte <= self.start_byte:
+            raise ValueError("end_byte must be greater than start_byte")
+        return self
+
+
+class TransferBindingModel(BaseModel):
+    """One requested target argument at a selected local call."""
+
+    model_config = ConfigDict(extra="forbid")
+    target_arg: int = Field(ge=1)
+    kind: Literal["EXPRESSION", "EXTERNAL", "UNKNOWN"]
+    expression: str
+
+
+class TransferArmModel(BaseModel):
+    """One correlated, optionally guarded local transfer alternative."""
+
+    model_config = ConfigDict(extra="forbid")
+    bindings: list[TransferBindingModel]
+    guard: str = "true"
+    evidence: list[TransferEvidenceModel]
+
+
+class TransferAnswerModel(BaseModel):
+    """Strict structured output for a demand-driven value transfer."""
+
+    model_config = ConfigDict(extra="forbid")
+    arms: list[TransferArmModel]
+
+    @model_validator(mode="after")
+    def validate_arms(self) -> "TransferAnswerModel":
+        if not self.arms:
+            raise ValueError("transfer answer must contain at least one arm")
+        return self
 
 
 # endregion
@@ -77,6 +113,10 @@ class Combined(aiDetermined):
         "NO DATA",
     ] = Field(
         description="If there's an callback function involved then Event else Fork"
+    )
+    reachability: str = Field(
+        default="UNKNOWN",
+        description="How target call is reached, separate from launch metadata.",
     )
     call_function: str = Field(
         description="Function that actually intiated the call usually main and in case of events the function passed as event"

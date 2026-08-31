@@ -73,7 +73,7 @@ from models import (
     aiDetermined,
     outputModel,
     outputModelForReturn,
-    outputModelOneHop,
+    TransferAnswerModel,
 )
 from output_paths import process_results_dir, results_root, target_results_dir
 from discovery_index import (
@@ -104,8 +104,8 @@ from visualizer_export import (
     build_complete_file_functions,
 )
 from value_flow.outputs import write_outputs, write_trace_logs
-from value_flow.queries import OneHopAnswer
 from value_flow.resolver import IndexedSite, ValueFlowResolver
+from value_flow.transfers import TransferRequest
 from typing import Any
 
 import argparse
@@ -649,75 +649,99 @@ def llm_calls(
     return ans, stats
 
 
-def llm_calls_one_hop(
-    project_structure: dict[str, str],
-    function_name_to_trace: str,
-    argument_number: int,
-    initial_context: str,
-    expression: str,
+def llm_calls_transfer(
+    project_structure: dict[str, str], request: TransferRequest
 ) -> tuple[type[BaseModel], dict[str, any]]:
-    """Resolve one call-site expression without asking for a main-to-target path."""
+    """Ask for one strict local transfer on one exact route edge.
+
+    The coordinator owns caller selection and later substitution.  This
+    prompt therefore has no legacy ``index:value`` output and cannot directly
+    manufacture a final numeric fact.
+    """
     state = State()
-    data = {
-        "user_prompt": """
-Where does argument {argument_number} of {function_name_to_trace} get its value?
-The expression at that position is: {expression}
+    route_edges = []
+    for edge in request.route.edges:
+        marker = " synthetic callback" if edge.synthetic_callback else ""
+        route_edges.append(f"{edge.caller_id} -[{edge.site_id}{marker}]-> {edge.callee_id}")
+    route_text = "\n".join(route_edges) or "(current function is the route root)"
+    binding_text = "\n".join(
+        f"target argument {item.target_arg}: {item.text}"
+        for item in request.bindings
+    ) or "(none)"
+    guard_text = "\n".join(request.guards) or "true"
+    system_prompt = """
+You are a conservative C value-transfer analyst. Analyze only the selected
+function and selected outgoing call on the already validated route supplied by
+the user. Do not select another call site and do not follow callers; the
+coordinator performs caller substitution.
 
-INITIAL_CONTEXT:
-{initial_context}
-""",
-        "system_prompt": """
-You are a conservative C value-flow analyser. You answer ONE question about ONE
-call site: where the named argument's value comes from. Do not follow callers of
-the enclosing function -- that hop is handled for you.
+For every requested target argument return one binding in every live correlated
+branch arm. An EXPRESSION is a formula over the current function's formal
+parameters, using $1, $2, and so on. It may use integer or character literals,
+strings, visible macro/enum names, parentheses, and the ordinary integer,
+comparison, and logical operators. Do not use local variable names in a
+completed EXPRESSION: resolve them or return EXTERNAL/UNKNOWN. Return every
+live branch alternative and put all requested arguments in the same arm.
 
-Answer with a JSON object using EXACTLY these field names:
+Every arm needs exact byte evidence from the supplied project source. Never
+calculate a final number as a guess. EXTERNAL means visible external/global/
+volatile input; UNKNOWN means the source is unsafe or cannot be determined.
+Return only the TransferAnswer JSON schema.
+"""
+    user_prompt = """
+ROUTE:
+{route}
+TARGET SITE ID: {target_site_id}
 
-  kind         one of "VALUE", "PARAM", "EXTERNAL", "UNRESOLVED"
-  value        the concrete literal, when kind is "VALUE"
-  param_index  the 1-based parameter position, when kind is "PARAM"
-  source_expr  the expression the value came from (always useful)
+CURRENT FUNCTION ID: {function_id}
+CURRENT FUNCTION: {function_name}
+FORMAL PARAMETERS (1-based): {parameters}
+CURRENT FUNCTION SOURCE:
+{function_source}
 
-How to choose kind:
+SELECTED OUTGOING CALL ({start_byte}:{end_byte}):
+{selected_call_text}
 
-- "VALUE": the expression resolves to a concrete literal here. This includes a
-  macro that expands to a literal, and a call to a function whose body you can
-  read that returns a literal or macro. USE find_definition to read any function
-  or macro you do not already see in the context -- a call you have not looked
-  at is NOT automatically external.
-    {{"kind": "VALUE", "value": "0x1002", "source_expr": "pick_file()"}}
+REQUESTED CORRELATED BINDINGS:
+{bindings}
 
-- "PARAM": the value arrives unchanged as a parameter of the enclosing function.
-  Give its 1-based position.
-    {{"kind": "PARAM", "param_index": 1, "source_expr": "file_no"}}
+PENDING GUARDS:
+{guards}
 
-- "EXTERNAL": the value genuinely originates outside the program -- a message or
-  packet field, user input, a device/socket read, or a global written by another
-  process. Only after find_definition has failed to reach a literal.
-    {{"kind": "EXTERNAL", "source_expr": "msg->file_no"}}
-
-- "UNRESOLVED": you cannot tell.
-
-If several control-flow paths reach the call with different values, do not pick
-the last textual assignment; answer "UNRESOLVED" instead.
-""",
-        "tools": state.get("TOOL_DEFINITION"),
-        "tool_functions": state.get("TOOLS"),
-        "project_structure": project_structure,
-        "function_map": state.get("FUNCTION_MAP"),
-        "output_model": outputModelOneHop,
-    }
-    client = OllamaClient(data=data)
+Use $N only for an existing formal parameter N. Cite byte spans as
+file/start_byte/end_byte. The coordinator will substitute selected caller
+arguments simultaneously and evaluate safe formulas.
+MACRO EXPANSION CONTEXT: {macro_context}
+"""
+    client = OllamaClient(
+        data={
+            "user_prompt": user_prompt,
+            "system_prompt": system_prompt,
+            "tools": state.get("TOOL_DEFINITION"),
+            "tool_functions": state.get("TOOLS") or {},
+            "project_structure": project_structure,
+            "function_map": state.get("FUNCTION_MAP"),
+            "output_model": TransferAnswerModel,
+        }
+    )
     return client.start_tool_chain(
         prompt_data={
             "user_prompt": {
-                "argument_number": argument_number,
-                # start_tool_chain reads this key when it re-prompts for a
-                # schema-valid answer; str.format ignores the unused extra.
-                "argument_numbers": [argument_number],
-                "function_name_to_trace": function_name_to_trace,
-                "initial_context": initial_context,
-                "expression": expression,
+                "route": route_text,
+                "target_site_id": request.route.target_site_id,
+                "function_id": request.function_id,
+                "function_name": request.function_name,
+                "parameters": ", ".join(
+                    f"${index}={name}"
+                    for index, name in enumerate(request.parameters, start=1)
+                ) or "(void)",
+                "function_source": request.function_source,
+                "start_byte": request.selected_call_start_byte,
+                "end_byte": request.selected_call_end_byte,
+                "selected_call_text": request.selected_call_text,
+                "bindings": binding_text,
+                "guards": guard_text,
+                "macro_context": request.macro_context,
             },
             "system_prompt": {},
         }
@@ -785,7 +809,7 @@ def write_unique_path_report(
     return path_report
 
 
-def run_with_retry(func, args=(), timeout=300, retries=2):
+def run_with_retry(func, args=(), timeout=600, retries=2):
     if not isinstance(args, (tuple, list)):
         args = (args,)
 
@@ -1608,6 +1632,7 @@ async def make_value_flow_calls(
     file_functions: dict,
     project_structure: dict[str, str],
     project_path: Path,
+    include_roots: tuple[str, ...] = (),
     path_cap: int = 100,
     llm_concurrency: int = 10,
 ) -> list:
@@ -1753,102 +1778,28 @@ async def make_value_flow_calls(
             context_executor, partial(context_for, site, get_upper=get_upper)
         )
 
-    async def resolve_one_hop(
-        site: IndexedSite, argument_number: int, expression: str
-    ) -> OneHopAnswer | None:
-        """
-        Resolve one argument expression at a specific call site.
-
-        Example: for `foo(x)`, resolve what `x` means at that call location.
-        """
-        # The resolver reaches this callback only after its cheap syntax rules
-        # could not explain the expression (literal/macro/local assignment/etc).
-        path, context = await run_context(site, get_upper=True)
-
-        if not path:
-            return None
-
+    async def resolve_transfer(request: TransferRequest):
+        """Run the strict transfer prompt for the resolver's selected edge."""
         print(
-            f"{ORANGE}  LLM one-hop{RESET} {site.file_name}:{site.line} "
-            f"{site.callee_name} arg {argument_number} -> {expression!r}"
+            f"{ORANGE}  LLM transfer{RESET} {request.function_file} "
+            f"{request.function_name} -> {request.selected_site_id}"
         )
-
-        # First try the strict one-hop prompt/schema.  It answers only this
-        # one expression: VALUE, PARAM, EXTERNAL, or UNRESOLVED.
-        # It is designed for small local expression resolution.
         result = await loop.run_in_executor(
             llm_executor,
             run_with_retry,
-            llm_calls_one_hop,
-            (
-                project_structure,
-                site.callee_name,
-                argument_number,
-                context,
-                expression,
-            ),
+            llm_calls_transfer,
+            (project_structure, request),
         )
-
-        if result:
-            model, stats = result
-            record_stats("one_hop", site, stats)
-
-            model_data = model.model_dump() if hasattr(model, "model_dump") else model
-
-            try:
-                return OneHopAnswer(**model_data)
-            except (TypeError, ValueError):
-                pass
-
-        # If the strict one-hop parser fails, retry using the older prompt.
-        # This keeps valueflow compatible with cases the newer schema rejects.
-        fallback = await loop.run_in_executor(
-            llm_executor,
-            run_with_retry,
-            llm_calls,
-            (
-                project_structure,
-                site.callee_name,
-                [argument_number],
-                context,
-                "->".join(re.sub(r"\[([^\[\]]*)\]", "", node) for node in path),
-                True,
-            ),
-        )
-
-        if not fallback:
+        if not result:
             return None
+        model, stats = result
+        selected = resolver.sites.get(request.selected_site_id)
+        if selected is not None:
+            record_stats("transfer", selected, stats)
+        return model
 
-        model, stats = fallback
-        record_stats("legacy_subproblem_fallback", site, stats)
-
-        output = (model.model_dump() if hasattr(model, "model_dump") else model).get(
-            "output", ""
-        )
-
-        # Legacy output is expected as comma-separated "index:value" pairs.
-        # Extract only the requested argument number.
-        for item in output.split(","):
-            if ":" not in item:
-                continue
-
-            index, value = item.split(":", 1)
-
-            if index.strip() != str(argument_number):
-                continue
-
-            cleaned = value.strip().strip('"')
-
-            # Ignore control/status words if the model echoed them as values.
-            if cleaned and cleaned.upper() not in {
-                "UNRESOLVED",
-                "EXTERNAL",
-                "PARAM",
-                "VALUE",
-                "NO TARGET",
-            }:
-                return OneHopAnswer(kind="VALUE", value=cleaned)
-
+    async def disabled_transfer(_request: TransferRequest):
+        """Keep the strict transfer pipeline usable when the endpoint is down."""
         return None
 
     async def resolve_return_use(site: IndexedSite, function_name: str) -> str | None:
@@ -1894,52 +1845,6 @@ async def make_value_flow_calls(
             "output"
         )
 
-    async def resolve_handle_with_llm(
-        site: IndexedSite, argument_number: int, dependencies: tuple[str, ...]
-    ) -> list[OneHopAnswer] | None:
-        """
-        Resolve handle-style relationships using dependency/open-family functions.
-
-        Example: a target uses a handle, and the handle may have been created by
-        one of the configured dependent functions.
-        """
-        # Normal handle matching is syntactic: find the earlier open using the
-        # same fcb/handle variable. This callback is only the last fallback.
-        path, context = await run_context(site, get_upper=True)
-
-        if not path:
-            return None
-
-        dependency_text = ", ".join(dependencies)
-
-        result = await loop.run_in_executor(
-            llm_executor,
-            run_with_retry,
-            llm_calls_one_hop,
-            (
-                project_structure,
-                site.callee_name,
-                max(1, argument_number),
-                context,
-                f"handle binding for argument {argument_number}; resolve the configured open family {dependency_text}",
-            ),
-        )
-
-        if not result:
-            return None
-
-        model, stats = result
-        record_stats("handle_link", site, stats)
-
-        data = model.model_dump() if hasattr(model, "model_dump") else model
-
-        try:
-            answer = OneHopAnswer(**data)
-        except (TypeError, ValueError):
-            return None
-
-        return [answer] if answer.kind == "VALUE" else None
-
     resolved_count = [0]
 
     def report_seed(seed, rows, seconds: float) -> None:
@@ -1960,10 +1865,9 @@ async def make_value_flow_calls(
             f" -> {values or 'no target'}"
         )
 
-    # The resolver is useful without an LLM.  It can still resolve literals,
-    # macros, assignments, parameters, and many handle bindings syntactically.
-    # Check whether the optional LLM endpoint is available.
-    # If unavailable, resolver still runs syntax/static-only paths.
+    # Check whether the optional LLM endpoint is available.  If it is down,
+    # the same route-guided engine remains active with direct source constants
+    # and conservative unresolved results for semantic transfers.
     llm_ready, llm_status = llm_endpoint_status()
 
     print(
@@ -1975,23 +1879,28 @@ async def make_value_flow_calls(
     # This avoids repeating expensive identical prompts across runs.
     cache_path = process_results_dir(process_name) / "query_cache.json"
 
-    # Hand the prepared project index and the three optional LLM callbacks to
-    # the actual value resolver. From this point, resolver.run() owns tracing.
+    # Hand the prepared project index and the strict transfer/return callbacks
+    # to the resolver. From this point, resolver.run() owns tracing.
     try:
         resolver = ValueFlowResolver(
             graph=graph,
             registry=registry,
             trees=trees,
             project_structure=project_structure,
+            include_roots=include_roots,
             main_file_name=main_file_name,
             entry_function_name=entry_function_name,
             entry_points=entry_points,
             function_configs=valueflow_configs,
             macros=state.get("BUILDER_MACROS") or {},
             file_macros=state.get("MACROS") or {},
-            one_hop_resolver=resolve_one_hop if llm_ready else None,
+            # Valueflow mode uses only the strict route transfer contract.  The
+            # legacy one-hop callback remains available to legacy resolver mode
+            # and comparison tests, but is never a numeric fallback here.
+            transfer_resolver=resolve_transfer if llm_ready else disabled_transfer,
+            transfer_model_id=os.environ.get("TRACER_LLM_MODEL", TRACER_DEFAULT_MODEL),
+            transfer_prompt_version="valueflow-transfer-v1",
             return_use_resolver=resolve_return_use if llm_ready else None,
-            handle_llm_resolver=resolve_handle_with_llm if llm_ready else None,
             cache_path=cache_path,
             path_cap=path_cap,
             llm_concurrency=llm_concurrency,
@@ -2039,6 +1948,12 @@ async def make_value_flow_calls(
         "fact_count": len(records),
         "answered_query_count": len(resolver.results),
         "llm_query_count": len(query_stats),
+        "transfer_request_count": resolver.transfer_request_count,
+        "transfer_cache_hits": resolver.transfer_cache_hits,
+        "transfer_cache_misses": resolver.transfer_cache_misses,
+        "transfer_diagnostics": list(resolver.transfer_diagnostics),
+        "transfer_prompt_version": resolver.transfer_prompt_version,
+        "transfer_model_id": resolver.transfer_model_id,
         "Tokens": token_totals,
         "queries": query_stats,
     }
@@ -2167,7 +2082,20 @@ async def make_value_flow_calls(
                     "ans": [record.fact.value],
                 },
                 "process_name": process_name,
-                "launch_via": record.seed.launch_via,
+                "launch_via": (
+                    "NO DATA"
+                    if record.seed.local_backwalk
+                    else record.seed.launch_via
+                ),
+                "reachability": (
+                    "LOCAL_BACKWALK"
+                    if record.seed.local_backwalk
+                    else (
+                        resolver.reachability_kind(record.seed.site.caller_id)
+                        or (record.fact.metadata or {}).get("reachability")
+                        or "UNKNOWN"
+                    )
+                ),
                 "call_function": record.seed.call_function,
                 "function_name": record.seed.target_function,
                 "type": record.operation,
@@ -2698,6 +2626,11 @@ def trace_variable(
                     file_functions=FILE_FUNCTIONS,
                     project_structure=PROJECT_STRUCTURE,
                     project_path=project_path,
+                    include_roots=tuple(
+                        (STATE.get("PREPROCESSOR_CONFIG") or {}).get(
+                            "include_dirs", ()
+                        )
+                    ),
                     path_cap=valueflow_path_cap,
                     llm_concurrency=valueflow_concurrency,
                 )
@@ -2789,6 +2722,34 @@ class Tee:
     def flush(self):
         for s in self.streams:
             s.flush()
+
+
+def _write_process_timing(
+    process_name: str,
+    started_at: float,
+    *,
+    status: str,
+) -> None:
+    """Persist outer process timing even when tracing exits early or fails."""
+    stats_path = process_results_dir(process_name) / "run_stats.json"
+    stats = {}
+    if stats_path.is_file():
+        try:
+            stats = json.loads(stats_path.read_text(encoding="utf-8"))
+        except (OSError, TypeError, ValueError):
+            stats = {}
+
+    stats["process_wall_seconds"] = round(time.perf_counter() - started_at, 3)
+    stats["process_status"] = status
+    try:
+        stats_path.parent.mkdir(parents=True, exist_ok=True)
+        stats_path.write_text(
+            json.dumps(stats, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+    except (OSError, TypeError, ValueError) as exc:
+        # Timing must never hide the original process result or failure.
+        print(f"PROCESS TIMING WRITE FAILED for {process_name}: {exc}")
+
 
 # Run the tracer
 if __name__ == "__main__":
@@ -3025,6 +2986,8 @@ if __name__ == "__main__":
 
     for project_path in projects_to_run:
         output_process_name = process_names[project_path.resolve()]
+        process_started_at = time.perf_counter()
+        process_status = "success"
 
         # First, we try to recursively find "json_data" directory, which contains the target functions 
         # (TODO: Find what other thing it contains)
@@ -3076,6 +3039,7 @@ if __name__ == "__main__":
                 graph_paths.append(Path(graph_path))
 
         except (Exception, SystemExit) as exc:
+            process_status = "failed"
             graph_path = STATE.get("VISUALIZER_GRAPH_PATH")
             if graph_path and Path(graph_path).is_file() and Path(graph_path) not in graph_paths:
                 graph_paths.append(Path(graph_path))
@@ -3095,6 +3059,11 @@ if __name__ == "__main__":
             print(f"PROCESS FAILED; CONTINUING: {output_process_name}: {exc}")
 
         finally:
+            _write_process_timing(
+                output_process_name,
+                process_started_at,
+                status=process_status,
+            )
             # A resolver may have written its discovery index immediately
             # before reporting an error.  Keep that evidence in the aggregate
             # batch index, but exclude stale output from an earlier run.

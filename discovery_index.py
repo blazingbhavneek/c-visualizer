@@ -546,6 +546,12 @@ def _classify_valueflow_fact(
         return STATUS_UNRESOLVED, ""
 
     if origin in {"CONST", "MACRO"}:
+        # A source-grounded constant behind an unresolved route guard is
+        # evidence, not one exact runtime value.  The resolver keeps the guard
+        # in metadata so the discovery index can remain conservative without
+        # changing the CSV schema.
+        if (fact.metadata or {}).get("guards"):
+            return STATUS_UNRESOLVED, value
         if resource in {"mfs_file", "mfs_queue"}:
             if to_decimal(value) is not None and operation:
                 return STATUS_EXACT, value

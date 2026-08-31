@@ -217,6 +217,37 @@ class MakefileContext:
         }
 
 
+def _get_project_include_dirs(
+    project_path: Path,
+    info: dict[str, list[Path] | Path | None],
+) -> list[Path]:
+    """Return the include roots used while resolving this Makefile project."""
+    include_dirs = list(info.get("INCLUDES", []))
+    include_dirs.append(project_path.parent)
+    include_dirs.append(project_path.parent.parent)
+
+    # Add shared include roots if present in parent folders.
+    shared_include = next(
+        (
+            parent / "include"
+            for parent in project_path.parents
+            if (parent / "include").is_dir()
+        ),
+        None,
+    )
+
+    if shared_include:
+        include_dirs.append(shared_include)
+
+        modern_include = shared_include.parent / "modern" / "include"
+        if modern_include.is_dir():
+            include_dirs.append(modern_include)
+
+        include_dirs.append(shared_include.parent)
+
+    return list(dict.fromkeys(path.resolve() for path in include_dirs))
+
+
 def load_project_structure_cache(path: Path | str):
     """Load a v6 ``(structure, main_files, srcs_paths)`` cache.
 
@@ -253,7 +284,9 @@ def save_project_structure_cache(
         pickle.dump((structure, main_files, list(srcs_paths)), f)
 
 
-def get_project_preprocessor_flags(project_path: Path) -> dict[str, tuple[str, ...]]:
+def get_project_preprocessor_flags(
+    project_path: Path,
+) -> dict[str, tuple[str, ...]]:
     """Read compile macro flags without resolving the complete file graph."""
     project_path = Path(project_path)
     makefile_input = project_path / "Makefile"
@@ -268,7 +301,12 @@ def get_project_preprocessor_flags(project_path: Path) -> dict[str, tuple[str, .
 
     context = MakefileContext(makefile_input)
     context.parse_file(makefile_input)
-    return context.get_preprocessor_flags()
+    info = context.get_final_info()
+    flags = context.get_preprocessor_flags()
+    flags["include_dirs"] = tuple(
+        str(path) for path in _get_project_include_dirs(project_path, info)
+    )
+    return flags
 
 
 @time_it(message="")
@@ -377,28 +415,7 @@ def return_project_mapping(
     # Include local library files after project files.
     _merge_files(files, get_local_library_files())
 
-    include_dirs = list(info.get("INCLUDES", []))
-    include_dirs.append(project_path.parent)
-    include_dirs.append(project_path.parent.parent)
-
-    # Add shared include roots if present in parent folders.
-    shared_include = next(
-        (
-            parent / "include"
-            for parent in project_path.parents
-            if (parent / "include").is_dir()
-        ),
-        None,
-    )
-
-    if shared_include:
-        include_dirs.append(shared_include)
-
-        modern_include = shared_include.parent / "modern" / "include"
-        if modern_include.is_dir():
-            include_dirs.append(modern_include)
-
-        include_dirs.append(shared_include.parent)
+    include_dirs = _get_project_include_dirs(project_path, info)
 
     combined_dependency, file_wise_dependency = resolve(
         files=files,

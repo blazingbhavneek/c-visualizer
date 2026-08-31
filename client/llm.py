@@ -164,7 +164,7 @@ class OllamaClient:
             print("Error no system prompt_data")
             return (None, None)
         MAX_RETRY_ATTEMPTS = 5
-        MAX_ITERATIONS_ALLOWED = 50
+        MAX_ITERATIONS_ALLOWED = 100
         ANS_FOUND = False
         INPUT_TOKEN = 0
         OUTPUT_TOKEN = 0
@@ -250,7 +250,10 @@ class OllamaClient:
                             f"Return ONLY valid JSON string like this json schema "
                             f"inside ```json``` block. JSON_SCHEMA: {json.dumps(format_schema)}.\n"
                         )
-                        if self.output_model.__name__ != "outputModelForReturn":
+                        if self.output_model.__name__ not in {
+                            "outputModelForReturn",
+                            "TransferAnswerModel",
+                        }:
                             format_prompt_content += f"""
                                 "**DON'TS**:"
                                 - For this function we are only tracking these arguments (1 based index) {argument_number_to_track} **don't report any other arguments**
@@ -262,7 +265,7 @@ class OllamaClient:
                                 - For call_number we can have both int or NONE
                                 - DONT RETURN A LIST.
                             """
-                        else:
+                        elif self.output_model.__name__ == "outputModelForReturn":
                             format_prompt_content += (
                                 "- **YOU JUST HAVE TO RETURN WHETHER ITS A READ OR WRITE "
                                 "OPERATION ON THE RETURN POINTER NOTHING ELSE.**\n"

@@ -45,6 +45,7 @@ LEGACY_COLUMNS = [
     "call_number",
     "target_number->path_str",
     "launch_via",
+    "reachability",
     "call_function",
     "type",
     "function_name_src->path",
@@ -95,7 +96,28 @@ def _target_component(value: str) -> str:
     return text
 
 
-def _legacy_rows(records: list[ResolvedSeed], process_name: str) -> list[dict]:
+def _output_launch_via(record: ResolvedSeed) -> str:
+    """Keep launch metadata separate from local-backwalk provenance."""
+    return "NO DATA" if record.seed.local_backwalk else record.seed.launch_via
+
+
+def _output_reachability(
+    record: ResolvedSeed, resolver: ValueFlowResolver | None = None
+) -> str:
+    if record.seed.local_backwalk:
+        return "LOCAL_BACKWALK"
+    if resolver is not None:
+        reachability = resolver.reachability_kind(record.seed.site.caller_id)
+        if reachability:
+            return reachability
+    return str((record.fact.metadata or {}).get("reachability") or "UNKNOWN")
+
+
+def _legacy_rows(
+    records: list[ResolvedSeed],
+    process_name: str,
+    resolver: ValueFlowResolver | None = None,
+) -> list[dict]:
     """Write one row per target invocation and distinct argument-path tuple."""
     # `records` are one source fact for one target argument. A target such as
     # pmf_setsem(process, index) needs both configured arguments combined into
@@ -106,9 +128,16 @@ def _legacy_rows(records: list[ResolvedSeed], process_name: str) -> list[dict]:
         key = (
             record.seed.site.site_id,
             record.operation,
-            record.seed.launch_via,
+            _output_launch_via(record),
+            _output_reachability(record, resolver),
             record.seed.call_function,
             record.call_number,
+            # New transfer records carry one correlation identity for the
+            # complete target-argument bundle.  Keeping it in the grouping
+            # key prevents values from two unrelated route arms from forming
+            # a Cartesian product.  Records created by older callers have no
+            # identity and intentionally retain the compatibility fallback.
+            (record.fact.metadata or {}).get("correlation_id") or "__legacy__",
         )
         grouped.setdefault(key, []).append(record)
 
@@ -124,6 +153,15 @@ def _legacy_rows(records: list[ResolvedSeed], process_name: str) -> list[dict]:
                 )
 
         ordered_indices = sorted(choices_by_index)
+        correlation_id = (group[0].fact.metadata or {}).get("correlation_id")
+        if correlation_id:
+            expected = {
+                int(index) for index in (group[0].seed.config.get("indices") or [])
+            }
+            # Dependent handle records use the owning open's indices and do
+            # not have a target-side configured bundle to validate here.
+            if expected and set(ordered_indices) != expected:
+                continue
         for combination in product(*(choices_by_index[index] for index in ordered_indices)):
             representative = combination[0][0]
             values = [item.fact.value for item, _ in combination]
@@ -142,7 +180,8 @@ def _legacy_rows(records: list[ResolvedSeed], process_name: str) -> list[dict]:
                     "target_number->ans": target_value,
                     "call_number": _display_call_number(representative.call_number),
                     "target_number->path_str": path,
-                    "launch_via": representative.seed.launch_via,
+                    "launch_via": _output_launch_via(representative),
+                    "reachability": _output_reachability(representative, resolver),
                     "call_function": representative.seed.call_function,
                     "type": representative.operation,
                     "function_name_src->path": representative.seed.function_source_file,
@@ -198,6 +237,9 @@ def write_trace_logs(
             "",
             "chain (target -> source):",
         ]
+        transfer_chain = (fact.metadata or {}).get("transfer_chain") or []
+        if transfer_chain:
+            lines.extend(["", "transfer chain (local formulas):", *[f"  {item}" for item in transfer_chain]])
         for position, step in enumerate(steps, 1):
             timing = resolver.timings.get(step, {})
             lines.append(
@@ -271,7 +313,7 @@ def write_outputs(
                 "source_line": fact.source_line,
                 "source_expr": fact.source_expr,
                 "type": record.operation,
-                "launch_via": record.seed.launch_via,
+                "launch_via": _output_launch_via(record),
                 "call_function": record.seed.call_function,
                 "call_number": _display_call_number(record.call_number),
                 "link_method": fact.link_method,
@@ -305,7 +347,7 @@ def write_outputs(
         )
     )
     path_rows.sort(key=lambda row: (row["fact_id"], int(row["path_index"])))
-    legacy_rows = _legacy_rows(records, process_name)
+    legacy_rows = _legacy_rows(records, process_name, resolver)
     legacy_rows.sort(
         key=lambda row: (
             row["function_name"],

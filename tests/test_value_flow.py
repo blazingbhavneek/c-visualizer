@@ -28,10 +28,12 @@ class ValueFlowTests(unittest.TestCase):
         main_file_name: str = "main.c",
         entry_function_name: str = "main",
         entry_points: list[tuple[str, str]] | None = None,
+        include_roots: tuple[Path, ...] = (),
+        path_overrides: dict[str, Path] | None = None,
     ) -> ValueFlowResolver:
         project_structure = {}
         for name, source in files.items():
-            path = root / name
+            path = (path_overrides or {}).get(name, root / name)
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(source, encoding="latin-1")
             project_structure[name] = path
@@ -62,6 +64,7 @@ class ValueFlowTests(unittest.TestCase):
             project_structure={
                 key: str(value) for key, value in project_structure.items()
             },
+            include_roots=include_roots,
             main_file_name=main_file_name,
             entry_function_name=entry_function_name,
             entry_points=entry_points,
@@ -214,6 +217,43 @@ class ValueFlowTests(unittest.TestCase):
             self.assertEqual(records[0].fact.origin_kind, "CONST")
             self.assertEqual(records[0].fact.resolved_by, "SYNTAX")
             self.assertEqual(called, [])
+
+    def test_include_root_resolves_bare_project_map_key_with_duplicate_header(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            include_root = root / "include"
+            current_header = include_root / "Dyn" / "Foo.h"
+            archive_header = root / "archive" / "Dyn" / "Foo.h"
+            resolver = self.build_resolver(
+                root,
+                {
+                    "Foo.h": "enum FileNos { CURRENT_FNO = 1234 };\n",
+                    "archive/Foo.h": "enum FileNos { CURRENT_FNO = 9999 };\n",
+                    "main.c": (
+                        "#include <Dyn/Foo.h>\n"
+                        "void target(int value);\n"
+                        "int main(void) { target(CURRENT_FNO); return 0; }\n"
+                    ),
+                },
+                {
+                    "target": {
+                        "type": "READF",
+                        "indices": [1],
+                        "dependent_functions": [],
+                    }
+                },
+                include_roots=(include_root,),
+                path_overrides={
+                    "Foo.h": current_header,
+                    "archive/Foo.h": archive_header,
+                },
+            )
+
+            records = asyncio.run(resolver.run())
+
+            self.assertEqual(resolver.include_graph["main.c"], ("Foo.h",))
+            self.assertEqual(records[0].fact.value, "1234")
+            self.assertEqual(records[0].fact.resolved_by, "SYNTAX")
 
     def test_unrelated_nearby_open_is_not_a_handle_resolution(self):
         with tempfile.TemporaryDirectory() as temp_dir:
