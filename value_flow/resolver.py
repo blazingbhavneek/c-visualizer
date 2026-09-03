@@ -60,7 +60,7 @@ _RUNTIME_INPUT_CALLS = frozenset(
 # Bump this whenever resolution semantics change.  Existing caches may contain
 # facts produced by the old proximity fallback or by an LLM being treated as
 # an exact source, so those facts must not be reused after this change.
-RESOLVER_VERSION = "valueflow-bounded-table-index-v14"
+RESOLVER_VERSION = "valueflow-bounded-table-index-v15"
 
 # A cross-function lookup has no reliable caller-local close ordering.  Keep
 # this above all source offsets and use it to distinguish that lookup from a
@@ -2119,7 +2119,7 @@ class ValueFlowResolver:
             if not root:
                 continue
             for opening in opens:
-                if any(
+                if self._opening_binds_handle(opening, root) or any(
                     normalise_handle(candidate.text) == root
                     for candidate in (
                         opening.target_arguments
@@ -2322,6 +2322,50 @@ class ValueFlowResolver:
             parent = parent.parent
         return False
 
+    def _opening_binds_handle(self, site: IndexedSite, root: str) -> bool:
+        """Return whether an opening call's return value is assigned to root.
+
+        Handle ownership is described by the configured dependency function;
+        the source-level binding itself is ordinary C syntax.  This keeps the
+        rule generic for every OPENF function in the JSON configuration.
+        """
+        node = site.ast_node
+        if node is None:
+            return False
+
+        parent = node.parent
+        while parent is not None and parent.type in {
+            "parenthesized_expression",
+            "cast_expression",
+        }:
+            parent = parent.parent
+        if parent is None:
+            return False
+
+        if parent.type == "assignment_expression":
+            left = parent.child_by_field_name("left")
+            right = parent.child_by_field_name("right")
+            if (
+                left is not None
+                and right is not None
+                and right.start_byte <= node.start_byte
+                and node.end_byte <= right.end_byte
+            ):
+                return normalise_handle(node_text(left, site.source)) == root
+
+        if parent.type == "init_declarator":
+            declarator = parent.child_by_field_name("declarator")
+            value = parent.child_by_field_name("value")
+            if (
+                declarator is not None
+                and value is not None
+                and value.start_byte <= node.start_byte
+                and node.end_byte <= value.end_byte
+            ):
+                target = _extract_declarator_identifier(declarator, site.source)
+                return bool(target) and normalise_handle(target) == root
+        return False
+
     def _binding_opens(
         self, caller_id: str, root: str, before_byte: int, dependencies: tuple[str, ...]
     ) -> list[IndexedSite]:
@@ -2330,12 +2374,15 @@ class ValueFlowResolver:
             for site in self.sites_by_caller.get(caller_id, [])
             if site.callee_name in dependencies
             and site.start_byte < before_byte
-            and any(
-                normalise_handle(argument.text) == root
-                for argument in (
-                    site.target_arguments
-                    if site.is_configured_macro_target
-                    else site.arguments
+            and (
+                self._opening_binds_handle(site, root)
+                or any(
+                    normalise_handle(argument.text) == root
+                    for argument in (
+                        site.target_arguments
+                        if site.is_configured_macro_target
+                        else site.arguments
+                    )
                 )
             )
         ]
@@ -2366,6 +2413,17 @@ class ValueFlowResolver:
         if close_sites:
             last_close = max(item.start_byte for item in close_sites)
             candidates = [item for item in candidates if item.start_byte > last_close]
+        # A common C pattern reuses one descriptor variable for a later open
+        # inside a guarded block (`fd = open(A); if (...) fd = open(B);`).  For
+        # return-bound openings, the later assignment is the reaching binding
+        # at a later consumer.  Keep branch alternatives ambiguous when the
+        # opens are not ordinary assignments, preserving the old behavior for
+        # address-based handle APIs.
+        return_bindings = [
+            item for item in candidates if self._opening_binds_handle(item, root)
+        ]
+        if len(return_bindings) > 1 and len(return_bindings) == len(candidates):
+            candidates = [max(return_bindings, key=lambda item: item.start_byte)]
         return candidates
 
     def _locally_provable(self, site: IndexedSite) -> bool:

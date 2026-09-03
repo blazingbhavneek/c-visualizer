@@ -849,7 +849,7 @@ def llm_endpoint_status(timeout: float = 10.0) -> tuple[bool, str]:
     model = os.environ.get("TRACER_LLM_MODEL", TRACER_DEFAULT_MODEL)
     try:
         client = OpenAI(
-            api_key=os.environ.get("TRACER_LLM_API_KEY", "EMPTY"),
+            api_key=os.environ.get("TRACER_LLM_API_KEY") or "EMPTY",
             base_url=base_url,
             timeout=timeout,
             max_retries=0,
@@ -2271,7 +2271,7 @@ def trace_variable(
         str(project_path.resolve()).encode("utf-8")
     ).hexdigest()[:16]
     project_structure_path = pickle_dir / (
-        f"{project_path.name}_{project_key}_include_v6.pkl"
+        f"{project_path.name}_{project_key}_include_v7.pkl"
     )
 
     PROJECT_STRUCTURE = None

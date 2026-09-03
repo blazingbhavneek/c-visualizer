@@ -74,6 +74,18 @@ class MakefileContext:
             resolved_path = resolved_path.parent / f"{resolved_path.stem}.c"
 
         if not resolved_path.exists():
+            # Some projects are checked out below a larger Git repository.
+            # Their Makefiles use $(shell git rev-parse ...) first, which can
+            # point at the outer checkout even though the project's shared
+            # make fragments live in an ancestor directory.  Recover nested
+            # share/* includes without changing the project's Makefiles.
+            if tag == "INCLUDE_DIRECTIVE":
+                include_name = Path(expanded).name
+                for ancestor in (self.root_dir, *self.root_dir.parents):
+                    candidate = ancestor / "share" / include_name
+                    if candidate.is_file():
+                        return candidate.resolve()
+
             self.unresolved_log.append((tag, raw_token, str(resolved_path)))
             return None
 
@@ -404,11 +416,15 @@ def return_project_mapping(
             elif path.is_file():
                 _merge_files(files, {path.name: path})
 
-    # Fallback if Makefile parsing did not produce source files.
-    if not files:
-        files = get_c_and_h_files(project_path)
+    # Fallback if the Makefile uses unsupported GNU Make source functions
+    # (for example base.mk's $(call rwildcard,...)).  Include-derived files
+    # may already have populated ``files``, so checking only ``not files``
+    # would omit the process sources and leave its entry roots unknown.
+    if not srcs_paths:
+        local_files = get_c_and_h_files(project_path)
+        files.update(local_files)
         potential_main_files = [
-            name for name in files
+            name for name in local_files
             if name.endswith(".c")
         ]
 
