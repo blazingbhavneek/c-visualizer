@@ -8,50 +8,57 @@ value traveled from `main` down to the call.
 
 ## ACT 1 — Read the project (`project_aware.py`, function `trace_variable`)
 
-This one function drives everything. Steps in order:
+`trace_variable` — `project_aware.py:2233`. This one function drives everything.
+Steps in order:
 
 **1. Find all project files.**
-`return_project_mapping(...)` -> `PROJECT_STRUCTURE` = dict `{filename: full path}`
+`return_project_mapping(...)` — `makefile_resolver/makefile_resolver.py:313` ->
+`PROJECT_STRUCTURE` = dict `{filename: full path}`
 of every `.c`/`.h` involved. Cached to a `.pkl` so next run skips this. Also
 returns `potential_main_files` (files that might hold `main`).
 
 **2. Parse every file into a syntax tree.**
-`Preprocess.preprocess(...)` -> `trees` = dict
+`Preprocess.preprocess(...)` — `helpers/Preprocess/preprocess.py:350` (class),
+`:614` (method) -> `trees` = dict
 `{filename: (tree-sitter tree, cleaned source bytes)}`. Tree-sitter turns C text
 into a structured tree the code can walk.
 
 **3. Per-file bookkeeping.**
-Loop over files: `extract_all_macros` -> `macros`, `extract_includes` ->
-`file_includes`, `get_local_function_definitions` -> `FILE_FUNCTIONS`
+Loop over files: `extract_all_macros` (`helpers/Preprocess/preprocess.py:276`) ->
+`macros`, `extract_includes` (`helpers/Preprocess/preprocess.py:318`) ->
+`file_includes`, `get_local_function_definitions`
+(`helpers/extract_functions_from_c.py:8`) -> `FILE_FUNCTIONS`
 (`{file: {funcname: def}}`). Also picks the real entry point(s) -> `entry_points`
 list of `(file, funcname)`.
 
 **4. Build the call graph.**
-`build_complete_call_graph(...)` -> `graph` (who calls whom, with call-site info)
+`build_complete_call_graph(...)` — `visualizer_export.py:66` -> `graph` (who calls whom, with call-site info)
 + `registry` (every function as a node). This is the map the backward walk uses.
 
 **5. Snapshot for the visualizer.**
-`VisualizerCollector` captures source + call graph, writes a checkpoint file.
-(Optional `summarize_collector` adds LLM summaries per function.) If
+`VisualizerCollector` (`visualizer_export.py:248`) captures source + call graph,
+writes a checkpoint file. (Optional `summarize_collector` —
+`function_summaries.py:576` — adds LLM summaries per function.) If
 `index_only=True`, stop here.
 
 **6. Find which targets actually appear.**
-`identify_funs_to_trace(...)` -> `functions_identified` = subset of the target
+`identify_funs_to_trace(...)` — `project_aware.py:223` -> `functions_identified` = subset of the target
 config JSON that is actually called in this project, with which argument numbers
 to trace.
 
 **7. Inventory the exact target call sites.**
-`build_target_site_inventory(...)` (in `discovery_index.py`) -> `target_sites` =
+`build_target_site_inventory(...)` — `discovery_index.py:386` -> `target_sites` =
 flat list of "here is target X, argument N, at file:line". Used later for
 reporting even if resolution fails.
 
 **8. Launch the resolver.**
-`resolver == "valueflow"` -> calls `make_value_flow_calls(...)`. (Old path:
-`make_llm_calls_for_function` per function — legacy fallback, ignore.)
+`resolver == "valueflow"` -> calls `make_value_flow_calls(...)` —
+`project_aware.py:1709`. (Old path: `make_llm_calls_for_function` —
+`project_aware.py:959` — per function, legacy fallback, ignore.)
 
 ---
 
-## ACT 2 — Set up the resolver (`project_aware.py`, `make_value_flow_calls`)
+## ACT 2 — Set up the resolver (`project_aware.py`, `make_value_flow_calls` — `project_aware.py:1709`)
 
 **9. Get the AI helpers ready.**
 
@@ -80,15 +87,17 @@ For stuck spots like these, the code asks a local AI model (Ollama). Step 9 just
 builds the little "ask the AI" functions and hands them to the resolver. The
 resolver decides *when* to use them.
 
-**9a. Is the AI even running?** `llm_endpoint_status()` pokes the model server
-once.
+**9a. Is the AI even running?** `llm_endpoint_status()` — `project_aware.py:839` —
+pokes the model server once.
 - If it answers: plug in the real AI helpers below.
 - If it's down: plug in dummy helpers that always say "don't know". The analysis
   still finishes; the stuck spots are just left marked unresolved. The startup
   log prints `VALUE-FLOW LLM DISABLED (syntax-only run)`.
 
 **9b. Grab the surrounding code.** Before asking the AI anything, you show it the
-relevant C. `context_for` / `run_context` build a text blob for one call site.
+relevant C. `context_for` (`project_aware.py:1820`) / `run_context`
+(`project_aware.py:1855`) build a text blob for one call site (via
+`parseFiles.parse_for_path` — `parser/parser_files.py:195`).
 It's not just the one function — it also has:
 
 - each function along the path from the caller down to the target, trimmed to
@@ -110,7 +119,8 @@ void DioGetPtr(int filenum) {
 That blob gets pasted into the AI prompt. (Runs on a side thread so it doesn't
 freeze everything else.)
 
-**9c. Helper #1 — "where did this argument come from?"** (`resolve_transfer`)
+**9c. Helper #1 — "where did this argument come from?"** (`resolve_transfer` —
+`project_aware.py:1869`, wraps `llm_calls_transfer` — `project_aware.py:700`)
 The resolver calls this about **one specific call**. It sends the AI: the
 function's code, its parameters (renamed `$1`, `$2`, `$3`... so the AI can't leak
 local variable names), and the exact call line in question. The AI must reply in
@@ -126,7 +136,8 @@ After the AI answers, the code does **not** just trust it — it checks the form
 actually matches the real source line (Act 4). If the AI times out (120s) or the
 server is down, the answer is just "don't know".
 
-**9d. Helper #2 — "is the return value read or written?"** (`resolve_return_use`)
+**9d. Helper #2 — "is the return value read or written?"** (`resolve_return_use` —
+`project_aware.py:1900`, wraps `llm_calls` — `project_aware.py:421`)
 Used when a target's config says to follow the *return value* instead of an
 argument. It shows the AI the code after the call and asks: does the program read
 from what came back, or write into it? The AI replies READ / WRITE / NOTHING, and
@@ -142,7 +153,10 @@ that becomes the operation recorded for that call.
 > cache means it's only computed once.
 >
 > **How it makes sure the right open goes with the right read/close**
-> (`_binding_opens`, `_handle_candidates`, `normalise_handle`):
+> (`_binding_opens` — `value_flow/resolver.py:2325`; `_handle_candidates` —
+> `value_flow/resolver.py:2097`; `normalise_handle` —
+> `value_flow/handles.py:38`; whole-path search: `_handle_openings_backward` —
+> `value_flow/resolver.py:5630`):
 >
 > 1. **Same handle name.** The handle text is cleaned up first — `&fcb`,
 >    `(fcb)`, `fcb[2]` all become `fcb`. But a struct field keeps its owner:
@@ -179,30 +193,32 @@ that becomes the operation recorded for that call.
 (9b), the other does the actual waiting-on-the-AI. They're kept apart so a pile
 of code-grabbing jobs can't block the AI calls, and vice versa.
 
-**10. Build `ValueFlowResolver`** (`value_flow/resolver.py`, `__init__`). Runs its
-indexing in this order (see the "read these in this order" comment at line ~527):
+**10. Build `ValueFlowResolver`** (`value_flow/resolver.py:311`, `__init__` at
+`:323`). Runs its indexing in this order (see the "read these in this order"
+comment at line ~527):
 
-| Method | Builds | Result |
-|---|---|---|
-| `_build_function_index` | every function def + its parameter names | `self.functions` |
-| `_build_file_static_index` | file-scope `static` variables | |
-| `_build_call_index` | turns each call site into an `IndexedSite` (call + AST args + stable byte-ID) | `self.sites` |
-| `_build_callback_edges` | fake edges for framework callbacks | |
-| `_compute_reachability` | which functions are reachable from an entry point, directly vs only via callback | `self.reachable` |
-| `_enumerate_seeds` | one `Seed` per concrete target call site (2 calls to `mdm_open` = 2 seeds) | `self.seeds` |
-| `_load_cache` | load previously-answered sub-questions from `query_cache.json` | `self.results` |
+| Method | Line | Builds | Result |
+|---|---|---|---|
+| `_build_function_index` | `resolver.py:553` | every function def + its parameter names | `self.functions` |
+| `_build_file_static_index` | `resolver.py:625` | file-scope `static` variables | |
+| `_build_call_index` | `resolver.py:781` | turns each call site into an `IndexedSite` (call + AST args + stable byte-ID) | `self.sites` |
+| `_build_callback_edges` | `resolver.py:873` | fake edges for framework callbacks | |
+| `_compute_reachability` | `resolver.py:936` | which functions are reachable from an entry point, directly vs only via callback | `self.reachable` |
+| `_enumerate_seeds` | `resolver.py:1076` | one `Seed` per concrete target call site (2 calls to `mdm_open` = 2 seeds) | `self.seeds` |
+| `_load_cache` | `resolver.py:1127` | load previously-answered sub-questions from `query_cache.json` | `self.results` |
 
-A `Seed` = "target function X, at this exact call site, with this config (which
-args, dependent open/close funcs), launched via Y."
+A `Seed` (`value_flow/resolver.py:203`) = "target function X, at this exact call
+site, with this config (which args, dependent open/close funcs), launched via Y."
 
 ---
 
-## ACT 3 — Resolve every seed (`resolver.run`)
+## ACT 3 — Resolve every seed (`resolver.run` — `value_flow/resolver.py:2658`)
 
 **11. `run()` sorts the seeds into two piles, then works both piles at the same
 time.**
 
-- **fast pile** (`_seed_is_fast`): every value it needs is *right there* at the
+- **fast pile** (`_seed_is_fast` — `value_flow/resolver.py:2789`): every value it
+  needs is *right there* at the
   call — a plain number or a `#define`. Example: `pmf_setsem("svm300d", 0)`, or
   `pmf_setsem(NAME, 0)` where `NAME` is `#define NAME "svm300d"`. Nothing to
   chase.
@@ -212,7 +228,7 @@ time.**
 The two piles get **separate worker queues** running concurrently: the fast pile
 gets up to 10 workers, the slow pile up to `llm_concurrency`. They run together
 (`asyncio.gather`), so a fast seed never waits behind a slow LLM-bound one. Each
-seed goes to `_resolve_seed(seed)`.
+seed goes to `_resolve_seed(seed)` — `value_flow/resolver.py:2771`.
 
 > **TODO / possible optimization:** right now `run()` does one upfront pass over
 > *all* seeds to sort them (`_seed_is_fast`) before any resolution starts. Could
@@ -223,7 +239,7 @@ seed goes to `_resolve_seed(seed)`.
 **12. `_resolve_seed` picks how to trace this one seed** — three cases:
 
 **Case A — nothing to trace, or provable on the spot** -> `_resolve_seed_from_`
-`queries` (plain query engine, no AI).
+`queries` (`value_flow/resolver.py:2812` — plain query engine, no AI).
 - *Nothing to trace:* the target's config lists no argument to resolve, e.g.
   `pmf_yield()` — we only care that it's reached.
 - *Provable on the spot:* the value is a literal, a macro, or a local variable
@@ -234,8 +250,8 @@ seed goes to `_resolve_seed(seed)`.
   ```
 
 **Case B — needs a real backward walk and the AI is up** -> `_resolve_seed_with_`
-`transfers` (follows the call route backward, asks the AI about any math on the
-way, double-checks its answers).
+`transfers` (`value_flow/resolver.py:5771` — follows the call route backward,
+asks the AI about any math on the way, double-checks its answers).
 ```c
 void w(int fno) { open(fno + 1); }
 ...
@@ -251,9 +267,9 @@ spots — those come back `UNRESOLVED`.
 > `_resolve_seed` forks to one or the other *per seed*; a seed goes down one
 > road, never both.
 >
-> | | **Query engine** (`_resolve_seed_from_queries`) | **Transfer engine** (`_resolve_seed_with_transfers`) |
+> | | **Query engine** (`_resolve_seed_from_queries` — `resolver.py:2812`) | **Transfer engine** (`_resolve_seed_with_transfers` — `resolver.py:5771`) |
 > |---|---|---|
-> | core method | `_resolve_expression` (the ladder in step 14) | routes + per-hop LLM formulas (Act 4) |
+> | core method | `_resolve_expression` — `resolver.py:1321` (the ladder in step 14) | routes + per-hop LLM formulas (Act 4) |
 > | uses the AI? | no | yes, one small question per call-hop |
 > | handles | literals, macros, enums, constant tables, plain rename chains, parameter -> caller fan-out | "value went through math across functions" |
 > | picked when | seed is "fast" / fully locally provable, **or** the AI is down (fallback) | value is not locally provable **and** the AI is up |
@@ -277,15 +293,16 @@ spots — those come back `UNRESOLVED`.
 > of this — the per-hop formula loop exists, but the "what counts as a
 > transformation" vocabulary is too narrow.
 
-**13. Both strategies ask "questions" via `resolve(query)`** (`resolver.py:1189`).
+**13. Both strategies ask "questions" via `resolve(query)`**
+(`value_flow/resolver.py:1188`; dispatch `_resolve_uncached` at `:1232`).
 Question types (`value_flow/queries.py`):
 
-| Query | Means | Answered by |
-|---|---|---|
-| `ArgQuery` | "at this one specific call, what got passed in slot N?" | `_resolve_argument` |
-| `ParamQuery` | "this function has a parameter N — what values can ever arrive in it?" | `_resolve_parameter` |
-| `HandleQuery` | "which `open` created the handle used here?" | `_resolve_handle` |
-| `ReturnUseQuery` | "is this returned resource read or written after?" | LLM `resolve_return_use` |
+| Query | Def | Means | Answered by |
+|---|---|---|---|
+| `ArgQuery` | `queries.py:46` | "at this one specific call, what got passed in slot N?" | `_resolve_argument` — `resolver.py:1260` |
+| `ParamQuery` | `queries.py:66` | "this function has a parameter N — what values can ever arrive in it?" | `_resolve_parameter` — `resolver.py:2004` |
+| `HandleQuery` | `queries.py:80` | "which `open` created the handle used here?" | `_resolve_handle` — `resolver.py:2156` |
+| `ReturnUseQuery` | `queries.py:99` | "is this returned resource read or written after?" | `_resolve_return_use` — `resolver.py:2500` (LLM via `resolve_return_use`) |
 
 **`ArgQuery` vs `ParamQuery` — the difference:**
 
@@ -300,8 +317,9 @@ void b() { wrapper(20); }    // <- 20 is an ARGUMENT at this call
 
 - `ArgQuery(call in a(), slot 1)` -> looks at *that one line* -> answer: `10`.
 - `ParamQuery(wrapper, param 1)` -> "what can `fno` be?" -> `_resolve_parameter`
-  finds every place `wrapper` is called (here: `a` and `b`), fires an `ArgQuery`
-  at each one, and collects **all** answers -> `{10, 20}`.
+  (`resolver.py:2004`) finds every place `wrapper` is called (here: `a` and
+  `b`), fires an `ArgQuery` at each one, and collects **all** answers ->
+  `{10, 20}`.
 
 So `ArgQuery` is one exact spot; `ParamQuery` is "spread out to every caller and
 gather what they pass." The backward walk bounces between the two: tracing
@@ -312,18 +330,20 @@ parameter too -> another `ParamQuery`, and so on up to `main`.
 Every query has a stable `token()` string -> cached in `self.results`, so if two
 paths hit the same "what can `wrapper`'s param 1 be?" it's only computed once.
 
-**14. The core walk — `_resolve_argument` -> `_resolve_expression`**
-(`resolver.py:1341`). Takes the argument expression and tries sources
-cheapest->least-certain:
+**14. The core walk — `_resolve_argument` (`resolver.py:1260`) ->
+`_resolve_expression` (`resolver.py:1321`).** Takes the argument expression and
+tries sources cheapest->least-certain:
 
 1. literal (`0`, `"svm300d"`) -> `Fact(origin_kind="CONST")` — done.
-2. macro / enum name -> `_resolve_macro` -> a `#define` gives `Fact("MACRO")`, an
-   enum constant gives `Fact("CONST")` (tagged `termination_reason="ENUM"`).
+2. macro / enum name -> `_resolve_macro` (`resolver.py:6632`) -> a `#define`
+   gives `Fact("MACRO")`, an enum constant gives `Fact("CONST")` (tagged
+   `termination_reason="ENUM"`).
 
    > **Next level — how enums are handled.** At startup `_build_enum_index`
-   > walks every file's syntax tree looking for `enum { ... }` blocks and works
-   > out each name's integer value — following `= 5`, auto-increment, and simple
-   > expressions like `A | B` via `_evaluate_enum_expression`. Example source:
+   > (`resolver.py:6368`) walks every file's syntax tree looking for
+   > `enum { ... }` blocks and works out each name's integer value — following
+   > `= 5`, auto-increment, and simple expressions like `A | B` via
+   > `_evaluate_enum_expression` (`resolver.py:6487`). Example source:
    > ```c
    > enum FileNo {
    >     FNO_HEALTH = 0x120,   // -> 288
@@ -359,15 +379,16 @@ cheapest->least-certain:
 
    > This shortcut is only taken if the argument is the **bare** parameter
    > name (`target(fno)`, not `target(fno + 1)`) **and**
-   > `_parameter_fast_path_safe` has explicitly checked that `fno` is never
+   > `_parameter_fast_path_safe` (`resolver.py:6697`) has explicitly checked
+   > that `fno` is never
    > reassigned (`fno = ...`) and its address is never taken (`&fno`)
    > anywhere in the function. If either check fails, the shortcut is skipped
    > and step 5 (reaching-definitions) traces the real last assignment
    > instead. (Regex-based, so it can still miss aliased-pointer mutation or
    > a write hidden behind a macro.)
-5. it's a local variable -> `_local_reaching_definitions` /
-   `_collect_switch_values` / `_collect_branch_values` find what was assigned to
-   it.
+5. it's a local variable -> `_local_reaching_definitions` (`resolver.py:6725`) /
+   `_collect_switch_values` (`resolver.py:6807`) / `_collect_branch_values`
+   (`resolver.py:6892`) find what was assigned to it.
 
    > The value is a variable set earlier in *this same function*. Look upward
    > from the call for the last line that assigned it. If it was set inside an
@@ -380,8 +401,10 @@ cheapest->least-certain:
    > Only follows plain assignments (`m = OTHER_CONST`, `m = n`). If the
    > assignment has math in it, that part is handed off (see 8).
 
-6. it comes from a table lookup -> `_resolve_table_expression`,
-   `_constant_table_values`, `_indexed_table_facts`, `_bounded_table_indices`.
+6. it comes from a table lookup -> `_resolve_table_expression`
+   (`resolver.py:1487`), `_constant_table_values` (`resolver.py:1669`),
+   `_indexed_table_facts` (`resolver.py:3330`), `_bounded_table_indices`
+   (`resolver.py:3465`).
 
    > The value is `arr[i]` or `tbl[i].field`. Read the array's initializer
    > straight from the source.
@@ -393,8 +416,9 @@ cheapest->least-certain:
    > target(FNO[k]);     // k unknown but 0..2 -> { 10, 20, 30 }
    > ```
 
-7. it comes from a wrapper's output arg -> `_wrapper_output_facts` (guided by
-   `value_flow/value_rules.py`).
+7. it comes from a wrapper's output arg -> `_wrapper_output_facts`
+   (`resolver.py:1744`), guided by `DEFAULT_VALUE_RULES` —
+   `value_flow/value_rules.py:17`.
 
    > Some functions don't *return* the value — they write it into a pointer
    > argument. `value_rules.py` is a hardcoded list saying e.g. "for
@@ -412,11 +436,13 @@ cheapest->least-certain:
    > can't be finished here — handed to the transfer engine, which builds the
    > formula and substitutes each caller's value.
 
-9. LLM guess -> `Fact("LLM_CANDIDATE")` (evidence only, never treated as exact).
+9. LLM guess (`_call_one_hop` — `resolver.py:2089`, via `_await_llm` —
+   `resolver.py:2066`) -> `Fact("LLM_CANDIDATE")` (evidence only, never treated
+   as exact).
 10. nothing works -> `Fact("UNKNOWN_INDIRECT"/"UNRESOLVED")`.
 
-Each `Fact` (`queries.py`) records: the value, origin kind, source
-file/line/expr, and the query token (so the path back can be rebuilt).
+Each `Fact` (`value_flow/queries.py:111`) records: the value, origin kind,
+source file/line/expr, and the query token (so the path back can be rebuilt).
 
 > **Which of steps 1–10 use the AI?** Almost none. Steps 1–7 and 10 are pure
 > code. Only **step 8** is the transfer engine (per-hop LLM formulas, Act 4).
@@ -426,14 +452,15 @@ file/line/expr, and the query token (so the path back can be rebuilt).
 > resolver) — so in practice they never fire. This whole ladder is the cheap
 > code-only engine; the AI lives in step 8 / Act 4.
 
-**15. Handle pairing** (`_resolve_handle`, uses `value_flow/handles.py`):
-`close(&fcb)` -> `normalise_handle` turns `&fcb`, `(fcb)`, `fcb[i]` all into key
+**15. Handle pairing** (`_resolve_handle` — `value_flow/resolver.py:2156`, uses
+`value_flow/handles.py`): `close(&fcb)` -> `normalise_handle`
+(`value_flow/handles.py:38`) turns `&fcb`, `(fcb)`, `fcb[i]` all into key
 `fcb` -> finds the matching `open(&fcb, FILE_NO)` in the same function /
 parameter / global -> then resolves `FILE_NO` normally.
 
 ---
 
-## ACT 4 — Transfers: value crossing a call (`value_flow/transfers.py`)
+## ACT 4 — Transfers: value crossing a call (`value_flow/transfers.py`; walk driven from `value_flow/resolver.py`)
 
 Used when the value isn't sitting right there at the call — it's a parameter
 with some math on it, or it keeps changing as it's handed from function to
@@ -457,8 +484,10 @@ void wrapper(int base) {
 ```
 
 **16. Find the paths and write the first recipe.**
-`routes_for_seed` lists every call chain that ends at this `target` call. Here
-there's one: `handler -> wrapper -> target`.
+`routes_for_seed` (`value_flow/resolver.py:2883`) lists every call chain that
+ends at this `target` call. Here there's one: `handler -> wrapper -> target`.
+Each path is a `RouteGuide` (`value_flow/transfers.py:52`); the recipe-in-
+progress is a `RouteArm` (`value_flow/transfers.py:38`).
 
 Starting recipe, taken straight from the call: **"arg 1 = `base + 1`"**.
 Also note the `if` around the call as a condition that must be true:
@@ -474,12 +503,17 @@ the recipe by itself — it needs to know what its callers pass. The recipe stay
 **"arg 1 = (what the caller passed) + 1"**, condition **"(what the caller
 passed) > 0"**.
 
-> This step is where the **AI** gets asked — but only if the recipe is too
-> complicated for plain code (a helper call like `x = lookup(base)`, or a value
-> built up over many lines). The AI is shown just this one function and asked
-> "what's the recipe for this argument?". Its answer is then matched against the
-> real code lines; if it doesn't match, it's thrown out. Simple `base + 1` here
-> needs no AI.
+> This step is `_settle_transfer_arm` (`value_flow/resolver.py:3813`). It's
+> where the **AI** gets asked — but only if the recipe is too complicated for
+> plain code (a helper call like `x = lookup(base)`, or a value built up over
+> many lines). The AI is shown just this one function (request built as a
+> `TransferRequest` — `value_flow/transfers.py:80`) and asked "what's the
+> recipe for this argument?". Its answer is checked against the real code
+> lines by `_validate_transfer_answer` (`value_flow/resolver.py:4050`) — the
+> formula grammar itself is `validate_formula` / `evaluate_formula`
+> (`value_flow/transfers.py:313` / `:355`); if it doesn't match, it's thrown
+> out. Substituting the caller's value at each edge is `_substitute_arm`
+> (`value_flow/resolver.py:4493`). Simple `base + 1` here needs no AI.
 
 *Cross into `handler`.* `handler` calls `wrapper(FNO_BASE)`, so "what the caller
 passed" = `FNO_BASE`. Fill that in: recipe **"arg 1 = `FNO_BASE + 1`"**,
@@ -488,15 +522,19 @@ condition **"`FNO_BASE > 0`"**.
 *Still in `handler`.* `FNO_BASE` is a `#define` for `100`. Fill that in: recipe
 **"arg 1 = `100 + 1`"**, condition **"`100 > 0`"**. `handler` is the top — done.
 
-**Conditions are checked as they fill in.** `100 > 0` is true, so this path is
-real — keep it. If `handler` had instead called `wrapper(-5)`, the condition
-would become `-5 > 0`, which is false, so the `if` would have skipped the
+**Conditions are checked as they fill in** (`_evaluate_arm_guards` —
+`value_flow/resolver.py:4398`; `_guards_contradict` —
+`value_flow/resolver.py:4476`). `100 > 0` is true, so this path is real — keep
+it. If `handler` had instead called `wrapper(-5)`, the condition would become
+`-5 > 0`, which is false, so the `if` would have skipped the
 `target` call on this path — the whole path is **dropped** and produces no
 answer. This is how the engine avoids reporting values that an `if` actually
 blocks.
 
-**18. Compute the number and save it.** `100 + 1` = **`101`**.
-`_fact_from_transfer_binding` saves a `Fact`: `value = "101"`, plus the
+**18. Compute the number and save it.** `evaluate_formula`
+(`value_flow/transfers.py:355`) turns `100 + 1` into **`101`**.
+`_fact_from_transfer_binding` (`value_flow/resolver.py:4734`) saves a `Fact`:
+`value = "101"`, plus the
 supporting info — the exact code lines that prove it (`target(base + 1)`,
 `wrapper(FNO_BASE)`, the `#define`), the conditions, the path
 `handler -> wrapper -> target`, and — if this call turned out to have more than
@@ -506,31 +544,34 @@ one possible number — a shared id linking them as one set.
 
 ## ACT 5 — Package results
 
-**19. Provenance / paths** (`resolver.py`): `_add_provenance` linked each child
-query to its parent during the walk. Now `paths_for_fact` / `provenance_tokens` /
-`legacy_path_labels` walk that chain forward -> the readable path
-`main -> foo -> wrapper -> target`.
+**19. Provenance / paths** (`value_flow/resolver.py`): `_add_provenance`
+(`resolver.py:6045`) linked each child query to its parent during the walk. Now
+`paths_for_fact` (`resolver.py:6083`) / `provenance_tokens` (`resolver.py:6154`)
+/ `legacy_path_labels` (`resolver.py:6173`) walk that chain forward -> the
+readable path `main -> foo -> wrapper -> target`.
 
-**20. `resolver.run()` returns `records`** = list of `ResolvedSeed` (one per
-value/path): `{seed, fact, route, legacy_labels, paths, call_number,
-operation}`.
+**20. `resolver.run()` returns `records`** = list of `ResolvedSeed`
+(`value_flow/resolver.py:227`), one per value/path: `{seed, fact, route,
+legacy_labels, paths, call_number, operation}`.
 
-**21. Classify status** (`value_flow/status.py`, `classify_records`): groups all
-records for one (site, arg), collapses to a single verdict:
+**21. Classify status** (`classify_records` — `value_flow/status.py:68`): groups
+all records for one (site, arg), collapses to a single verdict:
 - `RESOLVED` (one exact literal), `RUNTIME` (several possible literals = a
   value-set, gets a `set_id`), `EXTERNAL`, `UNRESOLVED`, `NO_TARGET`.
 
 **22. Write outputs** (`value_flow/outputs.py`):
-- `write_outputs` -> `facts.csv` (each value), `paths.csv` (proof paths),
-  top-level `<project>.csv` (the feed the visualizer reads), `run_stats.json`.
-- `write_trace_logs` -> per-path debug logs.
+- `write_outputs` (`value_flow/outputs.py:331`) -> `facts.csv` (each value),
+  `paths.csv` (proof paths), top-level `<project>.csv` (the feed the visualizer
+  reads), `run_stats.json`.
+- `write_trace_logs` (`value_flow/outputs.py:254`) -> per-path debug logs.
 
 **23. Back in `trace_variable`:**
-- `valueflow_records_to_facts` (`discovery_index.py`) -> `discovery_facts`, then
-  `write_discovery_index` -> `index/` folder (machine-readable inventory +
-  evidence).
-- `collector.rehydrate_interactions(...)` -> reads the CSV back, adds the
-  resolved connections into the visualizer graph, `collector.write()` again.
+- `valueflow_records_to_facts` (`discovery_index.py:776`) -> `discovery_facts`,
+  then `write_discovery_index` (`discovery_index.py:1574`) -> `index/` folder
+  (machine-readable inventory + evidence).
+- `collector.rehydrate_interactions(...)` (`visualizer_export.py:620`) -> reads
+  the CSV back, adds the resolved connections into the visualizer graph,
+  `collector.write()` again.
 - patches final timings into `run_stats.json`.
 - returns `answers` (legacy-shaped dict
   `{target_function: [(Combined, Stats), ...]}`).
@@ -539,14 +580,20 @@ records for one (site, arg), collapses to a single verdict:
 
 ## One-line-per-file recap
 
-| File | Job |
-|---|---|
-| `project_aware.py` `trace_variable` | orchestrator: parse project, build call graph, run resolver, write everything |
-| `project_aware.py` `make_value_flow_calls` | wires LLM callbacks + builds `ValueFlowResolver` + calls `.run()` |
-| `value_flow/resolver.py` | the engine: index code, enumerate seeds, walk backward, produce `ResolvedSeed` records |
-| `value_flow/queries.py` | the question shapes (`ArgQuery`/`ParamQuery`/`HandleQuery`/`ReturnUseQuery`) and the answer shape (`Fact`) |
-| `value_flow/handles.py` | normalize handle expressions so `close` finds its `open` |
-| `value_flow/transfers.py` | formula parse/eval + route/guard model for values crossing calls |
-| `value_flow/value_rules.py` | hardcoded per-wrapper rules (which arg/table a known function writes) |
-| `value_flow/status.py` | final verdict per target arg (RESOLVED / RUNTIME / EXTERNAL / UNRESOLVED) |
-| `value_flow/outputs.py` | write CSVs and logs |
+| File / symbol | Line | Job |
+|---|---|---|
+| `project_aware.py` `trace_variable` | 2233 | orchestrator: parse project, build call graph, run resolver, write everything |
+| `project_aware.py` `make_value_flow_calls` | 1709 | wires LLM callbacks + builds `ValueFlowResolver` + calls `.run()` |
+| `project_aware.py` `llm_calls` / `llm_calls_transfer` | 421 / 700 | the actual LLM prompts (return-use classifier / transfer formula) |
+| `value_flow/resolver.py` `ValueFlowResolver` | 311 | the engine: index code, enumerate seeds, walk backward, produce `ResolvedSeed` records |
+| &nbsp;&nbsp;• query engine | `run` 2658, `_resolve_seed` 2771, `_resolve_seed_from_queries` 2812, `resolve` 1188, `_resolve_expression` 1321 | cheap code-only backwalk |
+| &nbsp;&nbsp;• transfer engine | `_resolve_seed_with_transfers` 5771, `routes_for_seed` 2883, `_settle_transfer_arm` 3813, `_validate_transfer_answer` 4050, `_substitute_arm` 4493 | route + per-hop LLM formula backwalk |
+| &nbsp;&nbsp;• handles | `_resolve_handle` 2156, `_binding_opens` 2325, `_handle_openings_backward` 5630 | pair `read`/`close` to their `open` |
+| &nbsp;&nbsp;• indexes | `_build_function_index` 553, `_build_call_index` 781, `_compute_reachability` 936, `_enumerate_seeds` 1076, `_build_enum_index` 6368 | built once at startup |
+| `value_flow/queries.py` | `ArgQuery` 46, `ParamQuery` 66, `HandleQuery` 80, `ReturnUseQuery` 99, `Fact` 111 | the question shapes and the answer shape |
+| `value_flow/handles.py` | `strip_outer_parens` 9, `normalise_handle` 38 | normalize handle expressions so `close` finds its `open` |
+| `value_flow/transfers.py` | `RouteArm` 38, `RouteGuide` 52, `TransferRequest` 80, `validate_formula` 313, `evaluate_formula` 355 | formula parse/eval + route/guard model for values crossing calls |
+| `value_flow/value_rules.py` | `DEFAULT_VALUE_RULES` 17 | hardcoded per-wrapper rules (which arg/table a known function writes) |
+| `value_flow/status.py` | `classify_records` 68 | final verdict per target arg (RESOLVED / RUNTIME / EXTERNAL / UNRESOLVED) |
+| `value_flow/outputs.py` | `write_outputs` 331, `write_trace_logs` 254 | write CSVs and logs |
+| `discovery_index.py` | `build_target_site_inventory` 386, `valueflow_records_to_facts` 776, `write_discovery_index` 1574 | target call-site inventory + machine-readable index output |
