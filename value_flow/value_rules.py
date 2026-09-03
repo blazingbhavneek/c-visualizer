@@ -15,11 +15,25 @@ from typing import Any
 # source.  Callers may add fixture/project-specific rules through the resolver
 # constructor.
 DEFAULT_VALUE_RULES: dict[str, dict[str, Any]] = {
-    "DynREGetSchfno": {"kind": "return_table"},
-    "DynREGetSchKKfno": {"kind": "return_table"},
-    "DynREGetSchKKLCfno": {"kind": "return_table"},
-    "DynREGetPfmfno": {"kind": "return_table"},
-    "Dxi_UpTbnFileOpen": {"kind": "writes_table"},
+    "DynREGetSchfno": {"kind": "return_table", "member_index": 0},
+    "DynREGetSchKKfno": {"kind": "return_table", "member_index": 0},
+    "DynREGetSchKKLCfno": {"kind": "return_table", "member_index": 1},
+    "DynREGetPfmfno": {"kind": "return_table", "member_index": 1},
+    "Dxi_UpTbnFileOpen": {
+        "kind": "writes_table",
+        "indexed_local_table": True,
+        "target_argument": 3,
+    },
+    "Dxi_UpTbn2FileOpen": {
+        "kind": "writes_table",
+        "indexed_local_table": True,
+        "target_argument": 3,
+    },
+    "Dxi_UpTbn3FileOpen": {
+        "kind": "writes_table",
+        "indexed_local_table": True,
+        "target_argument": 3,
+    },
     "Dxi_DnTbnFileOpen": {"kind": "writes_table"},
     "Dxi_UpTbnFileOpen2": {"kind": "writes_table"},
     "Dxi_DnTbnFileOpen2": {"kind": "writes_table"},

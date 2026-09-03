@@ -9,9 +9,9 @@ build-index operation/lock vocabulary.  The c-visualizer resolvers ignore the
 ``discovery`` block; only the discovery-index adapter consumes it, so a spec
 without the block still runs (with no exact build-index mapping).
 
-The canonical comparison spec for the 33 build-index targets lives in
+The canonical comparison spec for the 39 build-index targets lives in
 ``target_specs/build_index_targets.json``.  It is a compatibility copy of the
-outer repository's ``valueflow/registry.py`` (REGISTRY_VERSION 1.1); the
+outer repository's registry plus six reviewed wrappers (version 1.2); the
 nested repository must stay runnable on its own, so nothing here imports that
 Python package.
 """
@@ -39,8 +39,8 @@ LOCK_MAP = {
 # registry default.
 OPEN_LOCK = "OPEN_LOCK"
 
-# The authoritative 33-target registry (valueflow/registry.py, REGISTRY
-# VERSION 1.1), as (name, family) pairs.  Family drives the structural
+# The authoritative build-index registry plus reviewed semantic wrappers, as
+# (name, family) pairs. Family drives the structural
 # validation below; the exact argument positions are checked per family.
 EXPECTED_TARGETS: dict[str, str] = {
     # opens: FNO at index 2 (_H) / 3 (non _H); lock macro at lock_arg
@@ -74,6 +74,12 @@ EXPECTED_TARGETS: dict[str, str] = {
     "mpf_mfs_addque": "queue",
     "mpf_mfs_delque_H": "queue",
     "mpf_mfs_delque": "queue",
+    "Dac_EnqSem": "queue",
+    "Dac_EnqSem2": "queue",
+    "SimEnqueSem": "queue",
+    "MsgEnqSem": "queue",
+    "DxiEnqEvent": "queue",
+    "DxiEnqEvent2": "queue",
     # forkproc
     "pmf_forkproc_H": "fork",
     "pmf_forkproc_setonsub_H": "fork",
@@ -116,6 +122,12 @@ QUEUE_POSITIONS = {
     "mpf_mfs_addque": (2, "ADDQUE"),
     "mpf_mfs_delque_H": (1, "DELQUE"),
     "mpf_mfs_delque": (2, "DELQUE"),
+    "Dac_EnqSem": (2, "ADDQUE"),
+    "Dac_EnqSem2": (2, "ADDQUE"),
+    "SimEnqueSem": (3, "ADDQUE"),
+    "MsgEnqSem": (2, "ADDQUE"),
+    "DxiEnqEvent": (2, "ADDQUE"),
+    "DxiEnqEvent2": (2, "ADDQUE"),
 }
 
 # Record API -> canonical build-index operation, from the registry.

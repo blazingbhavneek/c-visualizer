@@ -71,14 +71,12 @@ def extract_includes(file_path: Path):
     includes = []
     root_node = tree.root_node
 
-    def traverse(node):
+    stack = [root_node]
+    while stack:
+        node = stack.pop()
         if node.type == "preproc_include":
             includes.append(node.text.decode("latin-1", "ignore").strip())
-
-        for child in node.children:
-            traverse(child)
-
-    traverse(root_node)
+        stack.extend(reversed(node.children))
     return includes
 
 
@@ -214,7 +212,7 @@ def resolve(
             continue
 
         # ---- get raw include lines from user's function ------
-        raw_lines: list[str] = extract_includes(current_path)
+        raw_lines: list[str] = extract_includes(current_path) or []
         deps: list[str] = []
 
         for line in raw_lines:

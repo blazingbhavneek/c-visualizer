@@ -1,7 +1,7 @@
 """Validation tests for the build-index-compatible target spec.
 
 A target-file typo must fail early and must never silently reduce the
-detected target set, so every structural rule of the 33-target registry is
+detected target set, so every structural rule of the 39-target registry is
 checked here without any live model or C source.
 """
 
@@ -32,8 +32,8 @@ class TargetCompatibilityTests(unittest.TestCase):
     def setUpClass(cls):
         cls.spec = load_target_spec(SPEC_PATH)
 
-    def test_exactly_33_target_names_match_the_registry(self):
-        self.assertEqual(len(EXPECTED_TARGETS), 33)
+    def test_exactly_39_target_names_match_the_registry(self):
+        self.assertEqual(len(EXPECTED_TARGETS), 39)
         self.assertEqual(set(self.spec["targets"]), set(EXPECTED_TARGETS))
         self.assertEqual(validate_target_spec(self.spec), [])
 
@@ -84,6 +84,24 @@ class TargetCompatibilityTests(unittest.TestCase):
                 self.assertEqual(
                     entry["discovery"]["arg_operations"]["1"], "FORKPROC"
                 )
+
+    def test_reviewed_queue_wrappers_keep_canonical_metadata(self):
+        wrapper_positions = {
+            "Dac_EnqSem": 2,
+            "Dac_EnqSem2": 2,
+            "SimEnqueSem": 3,
+            "MsgEnqSem": 2,
+            "DxiEnqEvent": 2,
+            "DxiEnqEvent2": 2,
+        }
+        for name, index in wrapper_positions.items():
+            entry = self.spec["targets"][name]
+            self.assertEqual(entry["type"], "QUEUEF")
+            self.assertEqual(entry["launch"], "FORK")
+            self.assertEqual(entry["indices"], [index])
+            self.assertTrue(entry["get_upper"])
+            self.assertTrue(entry["semantic_wrapper"])
+            self.assertEqual(entry["canonical_target"], "mpf_mfs_addque")
 
     def test_handle_targets_have_a_valid_handle_index(self):
         for name, entry in self.spec["targets"].items():

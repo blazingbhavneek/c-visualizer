@@ -35,6 +35,7 @@ OriginKind: TypeAlias = Literal[
     "LLM_CANDIDATE",
     "EXTERNAL_ENTRY",
     "EXTERNAL_DATA",
+    "RUNTIME_DATA",
     "UNKNOWN_INDIRECT",
     "RECURSIVE",
     "UNRESOLVED",

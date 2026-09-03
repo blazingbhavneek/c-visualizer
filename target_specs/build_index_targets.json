@@ -1,9 +1,9 @@
 {
   "schema": "c-visualizer/target-spec",
   "schema_version": 1,
-  "version": "build-index-registry-1.1",
-  "source_registry": "forkproc_checker/valueflow/registry.py (REGISTRY_VERSION 1.1)",
-  "note": "Compatibility copy of the 33 build-index targets. 'type', 'launch', 'indices', 'get_upper', 'dependent_functions', 'handle_index', 'close_functions' are consumed by the c-visualizer resolvers; 'discovery' is comparison-only metadata consumed by the discovery-index adapter.",
+  "version": "build-index-registry-1.2",
+  "source_registry": "forkproc_checker/valueflow/registry.py (REGISTRY_VERSION 1.1) plus reviewed semantic wrappers",
+  "note": "Compatibility registry for the 39 build-index and reviewed semantic-wrapper targets. 'type', 'launch', 'indices', 'get_upper', 'dependent_functions', 'handle_index', 'close_functions' are consumed by the c-visualizer resolvers; 'discovery' is comparison-only metadata consumed by the discovery-index adapter.",
   "lock_map": {
     "MPF_MFS_READLOCK": "READ",
     "MPF_MFS_WRITELOCK": "WRITE",
@@ -167,6 +167,36 @@
       "type": "QUEUEF", "launch": "FORK", "indices": [2], "get_upper": true,
       "dependent_functions": [],
       "discovery": { "resource": "mfs_queue", "arg_operations": { "2": "DELQUE" } }
+    },
+    "Dac_EnqSem": {
+      "type": "QUEUEF", "launch": "FORK", "indices": [2], "get_upper": true,
+      "dependent_functions": [], "semantic_wrapper": true, "canonical_target": "mpf_mfs_addque",
+      "discovery": { "resource": "mfs_queue", "arg_operations": { "2": "ADDQUE" } }
+    },
+    "Dac_EnqSem2": {
+      "type": "QUEUEF", "launch": "FORK", "indices": [2], "get_upper": true,
+      "dependent_functions": [], "semantic_wrapper": true, "canonical_target": "mpf_mfs_addque",
+      "discovery": { "resource": "mfs_queue", "arg_operations": { "2": "ADDQUE" } }
+    },
+    "SimEnqueSem": {
+      "type": "QUEUEF", "launch": "FORK", "indices": [3], "get_upper": true,
+      "dependent_functions": [], "semantic_wrapper": true, "canonical_target": "mpf_mfs_addque",
+      "discovery": { "resource": "mfs_queue", "arg_operations": { "3": "ADDQUE" } }
+    },
+    "MsgEnqSem": {
+      "type": "QUEUEF", "launch": "FORK", "indices": [2], "get_upper": true,
+      "dependent_functions": [], "semantic_wrapper": true, "canonical_target": "mpf_mfs_addque",
+      "discovery": { "resource": "mfs_queue", "arg_operations": { "2": "ADDQUE" } }
+    },
+    "DxiEnqEvent": {
+      "type": "QUEUEF", "launch": "FORK", "indices": [2], "get_upper": true,
+      "dependent_functions": [], "semantic_wrapper": true, "canonical_target": "mpf_mfs_addque",
+      "discovery": { "resource": "mfs_queue", "arg_operations": { "2": "ADDQUE" } }
+    },
+    "DxiEnqEvent2": {
+      "type": "QUEUEF", "launch": "FORK", "indices": [2], "get_upper": true,
+      "dependent_functions": [], "semantic_wrapper": true, "canonical_target": "mpf_mfs_addque",
+      "discovery": { "resource": "mfs_queue", "arg_operations": { "2": "ADDQUE" } }
     },
 
     "pmf_forkproc_H": {

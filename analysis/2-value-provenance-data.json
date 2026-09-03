@@ -1,0 +1,498 @@
+{
+  "inputs": {
+    "results_dir": "/home/seigyo/c-parse/source_research_tool-linux/forkproc_checker/c-visualizer/results_backup/csv_results7",
+    "aggregate_index": "/home/seigyo/c-parse/source_research_tool-linux/forkproc_checker/c-visualizer/results_backup/csv_results7/index",
+    "legacy_index": "/home/seigyo/c-parse/source_research_tool-linux/forkproc_checker/index_baseline",
+    "source_root": "/home/chukyu",
+    "target_registry_version": "build-index-registry-1.2"
+  },
+  "run": {
+    "metadata_counts": {
+      "processes_requested": 4,
+      "processes_included": 4,
+      "processes_failed": 0,
+      "evidence_facts": 1274,
+      "forkproc_callers": 0,
+      "mfs_file_access_entries": 15,
+      "mfs_queue_access_entries": 5,
+      "mfs_dynamic_addque_entries": 2,
+      "cross_process_caller_rows": 0,
+      "out_of_process_scope_rows": 33,
+      "unresolved_owner_rows": 0
+    },
+    "fact_meta": {
+      "all_rows": 1274,
+      "included_rows": 957,
+      "excluded_rows": 317,
+      "sites": 144,
+      "status_rows": {
+        "DYNAMIC": 647,
+        "EXACT": 248,
+        "EXTERNAL": 19,
+        "UNRESOLVED": 43
+      },
+      "status_sites": {
+        "DYNAMIC": 52,
+        "EXACT": 75,
+        "EXTERNAL": 7,
+        "UNRESOLVED": 13
+      },
+      "resolution_rows": {
+        "EXTERNAL": 19,
+        "RESOLVED": 248,
+        "RUNTIME": 647,
+        "UNRESOLVED": 43
+      },
+      "resolution_sites": {
+        "EXTERNAL": 7,
+        "RESOLVED": 75,
+        "RUNTIME": 52,
+        "UNRESOLVED": 13
+      }
+    },
+    "exact_dynamic_value_total": 265,
+    "exact_dynamic_values_per_site": 1.8402777777777777
+  },
+  "examples": [
+    {
+      "name": "DxiGetAdr.c:133",
+      "file": "t-dxi/src/libdxi/DxiGetAdr.c",
+      "line": 133,
+      "group": "source_proven",
+      "legacy_values": [
+        "2510",
+        "2515"
+      ],
+      "exact_values": [
+        "2510"
+      ],
+      "dynamic_values": [],
+      "external_values": [],
+      "statuses": [
+        "EXACT"
+      ],
+      "resolution_statuses": [
+        "RESOLVED"
+      ],
+      "origins": [
+        "MACRO"
+      ],
+      "link_methods": [
+        "LOCAL_BACKWALK",
+        "VARTRACE"
+      ],
+      "fact_rows": 4
+    },
+    {
+      "name": "DxiGetAdr.c:185",
+      "file": "t-dxi/src/libdxi/DxiGetAdr.c",
+      "line": 185,
+      "group": "source_proven",
+      "legacy_values": [
+        "2510",
+        "2515"
+      ],
+      "exact_values": [
+        "2515"
+      ],
+      "dynamic_values": [],
+      "external_values": [],
+      "statuses": [
+        "EXACT"
+      ],
+      "resolution_statuses": [
+        "RESOLVED"
+      ],
+      "origins": [
+        "MACRO"
+      ],
+      "link_methods": [
+        "LOCAL_BACKWALK",
+        "VARTRACE"
+      ],
+      "fact_rows": 4
+    },
+    {
+      "name": "DxiSndHdr.c:265",
+      "file": "t-dxi/src/libdxi/DxiSndHdr.c",
+      "line": 265,
+      "group": "source_proven",
+      "legacy_values": [
+        "2502",
+        "2517",
+        "2523",
+        "2554"
+      ],
+      "exact_values": [],
+      "dynamic_values": [
+        "2502",
+        "2517",
+        "2523"
+      ],
+      "external_values": [],
+      "statuses": [
+        "DYNAMIC"
+      ],
+      "resolution_statuses": [
+        "RUNTIME"
+      ],
+      "origins": [
+        "MACRO"
+      ],
+      "link_methods": [
+        "LOCAL_BACKWALK"
+      ],
+      "fact_rows": 12
+    },
+    {
+      "name": "DxiSndHdr.c:687",
+      "file": "t-dxi/src/libdxi/DxiSndHdr.c",
+      "line": 687,
+      "group": "source_proven",
+      "legacy_values": [
+        "2502",
+        "2517",
+        "2523",
+        "2554"
+      ],
+      "exact_values": [
+        "2554"
+      ],
+      "dynamic_values": [],
+      "external_values": [],
+      "statuses": [
+        "EXACT"
+      ],
+      "resolution_statuses": [
+        "RESOLVED"
+      ],
+      "origins": [
+        "MACRO"
+      ],
+      "link_methods": [
+        "LOCAL_BACKWALK"
+      ],
+      "fact_rows": 4
+    },
+    {
+      "name": "dxiG_cirmng.c:805",
+      "file": "t-dxi/src/libdxiinside/dxiG_cirmng.c",
+      "line": 805,
+      "group": "source_proven",
+      "legacy_values": [
+        "2552",
+        "2554"
+      ],
+      "exact_values": [
+        "2554"
+      ],
+      "dynamic_values": [],
+      "external_values": [],
+      "statuses": [
+        "EXACT"
+      ],
+      "resolution_statuses": [
+        "RESOLVED"
+      ],
+      "origins": [
+        "MACRO"
+      ],
+      "link_methods": [
+        "LOCAL_BACKWALK"
+      ],
+      "fact_rows": 4
+    },
+    {
+      "name": "DxiSndHdr.c:291",
+      "file": "t-dxi/src/libdxi/DxiSndHdr.c",
+      "line": 291,
+      "group": "runtime",
+      "legacy_values": [],
+      "exact_values": [],
+      "dynamic_values": [
+        "702",
+        "703",
+        "724",
+        "725",
+        "728",
+        "729"
+      ],
+      "external_values": [],
+      "statuses": [
+        "DYNAMIC"
+      ],
+      "resolution_statuses": [
+        "RUNTIME"
+      ],
+      "origins": [
+        "CONST_TABLE"
+      ],
+      "link_methods": [
+        "LOCAL_BACKWALK"
+      ],
+      "fact_rows": 24
+    },
+    {
+      "name": "dxi_uptbn.c:74",
+      "file": "t-dxi/src/libdxiinside/dxi_uptbn.c",
+      "line": 74,
+      "group": "runtime",
+      "legacy_values": [],
+      "exact_values": [],
+      "dynamic_values": [
+        "2503",
+        "2513"
+      ],
+      "external_values": [
+        "t_flg"
+      ],
+      "statuses": [
+        "DYNAMIC",
+        "EXTERNAL"
+      ],
+      "resolution_statuses": [
+        "EXTERNAL",
+        "RUNTIME"
+      ],
+      "origins": [
+        "CONST_TABLE",
+        "EXTERNAL_ENTRY"
+      ],
+      "link_methods": [
+        "LOCAL_BACKWALK",
+        "TABLE_LOOKUP"
+      ],
+      "fact_rows": 5
+    },
+    {
+      "name": "dxi_uptbn.c:111",
+      "file": "t-dxi/src/libdxiinside/dxi_uptbn.c",
+      "line": 111,
+      "group": "runtime",
+      "legacy_values": [],
+      "exact_values": [],
+      "dynamic_values": [
+        "2520",
+        "2522"
+      ],
+      "external_values": [
+        "t_flg"
+      ],
+      "statuses": [
+        "DYNAMIC",
+        "EXTERNAL"
+      ],
+      "resolution_statuses": [
+        "EXTERNAL",
+        "RUNTIME"
+      ],
+      "origins": [
+        "CONST_TABLE",
+        "EXTERNAL_ENTRY"
+      ],
+      "link_methods": [
+        "LOCAL_BACKWALK",
+        "TABLE_LOOKUP"
+      ],
+      "fact_rows": 5
+    },
+    {
+      "name": "dxi_uptbn.c:148",
+      "file": "t-dxi/src/libdxiinside/dxi_uptbn.c",
+      "line": 148,
+      "group": "runtime",
+      "legacy_values": [],
+      "exact_values": [],
+      "dynamic_values": [
+        "2526",
+        "2528"
+      ],
+      "external_values": [
+        "t_flg"
+      ],
+      "statuses": [
+        "DYNAMIC",
+        "EXTERNAL"
+      ],
+      "resolution_statuses": [
+        "EXTERNAL",
+        "RUNTIME"
+      ],
+      "origins": [
+        "CONST_TABLE",
+        "EXTERNAL_ENTRY"
+      ],
+      "link_methods": [
+        "LOCAL_BACKWALK",
+        "TABLE_LOOKUP"
+      ],
+      "fact_rows": 5
+    },
+    {
+      "name": "dxi800d_reg.c:115",
+      "file": "t-dxi/src/dxi800d/dxi800d_reg.c",
+      "line": 115,
+      "group": "runtime",
+      "legacy_values": [],
+      "exact_values": [],
+      "dynamic_values": [
+        "2506",
+        "2507"
+      ],
+      "external_values": [],
+      "statuses": [
+        "DYNAMIC"
+      ],
+      "resolution_statuses": [
+        "RUNTIME"
+      ],
+      "origins": [
+        "CONST_TABLE"
+      ],
+      "link_methods": [
+        "TABLE_LOOKUP"
+      ],
+      "fact_rows": 2
+    },
+    {
+      "name": "dxi_dblcirreq.c:100",
+      "file": "t-dxi/src/libdxiinside/dxi_dblcirreq.c",
+      "line": 100,
+      "group": "runtime",
+      "legacy_values": [],
+      "exact_values": [],
+      "dynamic_values": [
+        "dxi500d",
+        "dxi501d",
+        "dxi502d"
+      ],
+      "external_values": [],
+      "statuses": [
+        "DYNAMIC"
+      ],
+      "resolution_statuses": [
+        "RUNTIME"
+      ],
+      "origins": [
+        "BOUNDED_SET"
+      ],
+      "link_methods": [
+        "LOCAL_BACKWALK",
+        "STRING_LITERAL"
+      ],
+      "fact_rows": 12
+    },
+    {
+      "name": "DxiItcReq2.c:711",
+      "file": "t-dxi/src/libdxi/DxiItcReq2.c",
+      "line": 711,
+      "group": "provenance_boundary",
+      "legacy_values": [],
+      "exact_values": [],
+      "dynamic_values": [],
+      "external_values": [
+        "filenum"
+      ],
+      "statuses": [
+        "EXTERNAL"
+      ],
+      "resolution_statuses": [
+        "EXTERNAL"
+      ],
+      "origins": [
+        "EXTERNAL_ENTRY"
+      ],
+      "link_methods": [
+        "LOCAL_BACKWALK"
+      ],
+      "fact_rows": 4
+    }
+  ],
+  "runtime_warnings": [
+    {
+      "name": "DxiSndHdr.c:567",
+      "file": "t-dxi/src/libdxi/DxiSndHdr.c",
+      "line": 567,
+      "legacy_values": [],
+      "exact_values": [],
+      "dynamic_values": [
+        "732",
+        "733",
+        "734",
+        "735",
+        "736"
+      ],
+      "external_values": [],
+      "statuses": [
+        "DYNAMIC"
+      ],
+      "resolution_statuses": [
+        "RUNTIME"
+      ],
+      "origins": [
+        "CONST_TABLE"
+      ],
+      "link_methods": [
+        "LOCAL_BACKWALK"
+      ],
+      "fact_rows": 20
+    },
+    {
+      "name": "DxiSndHdr.c:622",
+      "file": "t-dxi/src/libdxi/DxiSndHdr.c",
+      "line": 622,
+      "legacy_values": [],
+      "exact_values": [],
+      "dynamic_values": [
+        "732",
+        "733",
+        "734",
+        "735",
+        "736"
+      ],
+      "external_values": [],
+      "statuses": [
+        "DYNAMIC"
+      ],
+      "resolution_statuses": [
+        "RUNTIME"
+      ],
+      "origins": [
+        "CONST_TABLE"
+      ],
+      "link_methods": [
+        "LOCAL_BACKWALK"
+      ],
+      "fact_rows": 20
+    },
+    {
+      "name": "DxiItcReq2.c:575",
+      "file": "t-dxi/src/libdxi/DxiItcReq2.c",
+      "line": 575,
+      "legacy_values": [],
+      "exact_values": [],
+      "dynamic_values": [
+        "702",
+        "703",
+        "724",
+        "725",
+        "728",
+        "729"
+      ],
+      "external_values": [],
+      "statuses": [
+        "DYNAMIC"
+      ],
+      "resolution_statuses": [
+        "RUNTIME"
+      ],
+      "origins": [
+        "CONST_TABLE"
+      ],
+      "link_methods": [
+        "LOCAL_BACKWALK"
+      ],
+      "fact_rows": 24
+    }
+  ]
+}

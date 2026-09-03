@@ -26,17 +26,18 @@ class outputModelForReturn(BaseModel):
 
 
 class TransferEvidenceModel(BaseModel):
-    """An exact source span supporting one local value transfer."""
+    """The exact source line(s) the model cited for one local value transfer.
 
-    model_config = ConfigDict(extra="forbid")
+    The model is never asked for byte offsets: an LLM cannot count bytes
+    reliably, and a verbatim snippet is both easier to produce and easier to
+    verify -- the resolver locates the snippet in the file itself and derives
+    the span.  Old answers that still carry start_byte/end_byte are accepted
+    and the stale fields are ignored.
+    """
+
+    model_config = ConfigDict(extra="ignore")
     file: str
-    start_byte: int = Field(ge=0)
-    end_byte: int = Field(ge=0)
     snippet: str = ""
-
-    # NOTE: no model_validator. A degenerate or inverted span is repaired in
-    # ValueFlowResolver._validate_transfer_answer, not rejected here. Rejecting
-    # here discards the whole answer including correct bindings.
 
 
 class TransferBindingModel(BaseModel):

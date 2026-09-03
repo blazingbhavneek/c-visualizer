@@ -273,19 +273,24 @@ def _declarator_identifier(node) -> str | None:
     return None
 
 
-def extract_all_macros(filepath: str | Path) -> dict[str, str]:
+def extract_all_macros(
+    filepath: str | Path, source_code: bytes | None = None
+) -> dict[str, str]:
     """Extract object-like and function-like macros from a C/header file."""
     filepath = Path(filepath)
 
-    with open(filepath, "rb") as f:
-        source_code = f.read()
+    if source_code is None:
+        with open(filepath, "rb") as f:
+            source_code = f.read()
 
     parser = Parser(Language(tsc.language()))
     tree = parser.parse(source_code)
 
     results: dict[str, str] = {}
 
-    def walk_tree(node):
+    stack = [tree.root_node]
+    while stack:
+        node = stack.pop()
         if node.type in {"preproc_def", "preproc_function_def"}:
             name_node = node.child_by_field_name("name")
             value_node = node.child_by_field_name("value")
@@ -306,10 +311,7 @@ def extract_all_macros(filepath: str | Path) -> dict[str, str]:
                     .strip()
                 )
 
-        for child in node.children:
-            walk_tree(child)
-
-    walk_tree(tree.root_node)
+        stack.extend(reversed(node.children))
     return results
 
 
@@ -328,7 +330,9 @@ def extract_includes(filepath: str | Path) -> list[str]:
 
     include_paths: list[str] = []
 
-    def walk(node):
+    stack = [tree.root_node]
+    while stack:
+        node = stack.pop()
         if node.type == "preproc_include":
             path_node = node.child_by_field_name("path")
 
@@ -339,10 +343,7 @@ def extract_includes(filepath: str | Path) -> list[str]:
 
                 include_paths.append(raw_path.strip('<">'))
 
-        for child in node.children:
-            walk(child)
-
-    walk(tree.root_node)
+        stack.extend(reversed(node.children))
     return include_paths
 
 
@@ -368,14 +369,12 @@ class Preprocess:
         tree = self.parser.parse(code)
         comment_ranges: list[tuple[int, int]] = []
 
-        def collect_comments(node):
+        stack = [tree.root_node]
+        while stack:
+            node = stack.pop()
             if node.type == "comment":
                 comment_ranges.append((node.start_byte, node.end_byte))
-
-            for child in node.children:
-                collect_comments(child)
-
-        collect_comments(tree.root_node)
+            stack.extend(reversed(node.children))
 
         if not comment_ranges:
             return code
@@ -488,7 +487,7 @@ class Preprocess:
         content = path.read_bytes()
 
         if path.suffix == ".h":
-            cleaned = self.remove_comments(content)
+            cleaned = self._run_unifdef(self.remove_comments(content))
             tree = self.parser.parse(cleaned)
             has_error, error_count = self._tree_health(tree)
             return tree, cleaned, {
@@ -497,7 +496,7 @@ class Preprocess:
                 "final_has_error": has_error,
                 "initial_error_count": error_count,
                 "final_error_count": error_count,
-                "unifdef_args": [],
+                "unifdef_args": self.config.unifdef_args(),
             }
 
         if path.suffix == ".c":

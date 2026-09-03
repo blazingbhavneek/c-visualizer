@@ -8,7 +8,7 @@ import os
 import re
 import time
 from concurrent.futures import ThreadPoolExecutor
-from collections import defaultdict, deque
+from collections import OrderedDict, defaultdict, deque
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Iterable
@@ -31,6 +31,7 @@ from value_flow.transfers import (
     FormulaError,
     RouteArm,
     RouteGuide,
+    TableLookup,
     TransferRequest,
     evaluate_formula,
     make_transfer_cache_key,
@@ -45,17 +46,26 @@ _NUMBER = re.compile(
     r"^[+-]?(?:0[xX][0-9a-fA-F]+|0[bB][01]+|0[0-7]+|\d+(?:\.\d*)?(?:[eE][+-]?\d+)?)[uUlLfF]*$"
 )
 _IDENTIFIER = re.compile(r"^[A-Za-z_]\w*$")
+_DIRECT_CALL = re.compile(r"^\s*([A-Za-z_]\w*)\s*\(")
 # _IDENTIFIER is anchored with ^...$ and only usable with fullmatch(); this is
 # a separate scan pattern for finding identifiers inside a larger text.
 _IDENT_SCAN = re.compile(r"[A-Za-z_]\w*")
 _STRING_OR_CHAR = re.compile(
     r"^(?:u8|u|U|L)?(?:\"(?:\\.|[^\"])*\"|'(?:\\.|[^'])+')$", re.DOTALL
 )
+_RUNTIME_INPUT_CALLS = frozenset(
+    {"read", "recv", "recvfrom", "recvmsg", "mq_receive", "msgrcv", "fread"}
+)
 
 # Bump this whenever resolution semantics change.  Existing caches may contain
 # facts produced by the old proximity fallback or by an LLM being treated as
 # an exact source, so those facts must not be reused after this change.
-RESOLVER_VERSION = "valueflow-route-transfers-v2"
+RESOLVER_VERSION = "valueflow-bounded-table-index-v14"
+
+# A cross-function lookup has no reliable caller-local close ordering.  Keep
+# this above all source offsets and use it to distinguish that lookup from a
+# normal same-function reaching-definition query.
+_GLOBAL_HANDLE_SEARCH_BEFORE = 1 << 62
 
 
 @dataclass(slots=True)
@@ -76,6 +86,8 @@ class Expression:
     file_path: str
     # 1-based source line, used in CSV output and LLM context.
     line: int
+    # Source-backed branch conditions controlling this reaching definition.
+    guards: tuple[str, ...] = ()
 
 
 @dataclass(slots=True)
@@ -173,6 +185,18 @@ class CallerEdge:
     # Callback registration provenance: spelling, canonical target, registrar,
     # raw argument text, and byte range from the registration call.
     callback_meta: dict | None = None
+
+
+@dataclass(slots=True)
+class BackwardState:
+    """One unique value-flow state while walking from target toward callers."""
+
+    current_function_id: str
+    selected_site_id: str
+    arm: RouteArm
+    suffix_edges: tuple[CallerEdge, ...]
+    depth: int
+    branch_id: str
 
 
 @dataclass(slots=True)
@@ -321,6 +345,8 @@ class ValueFlowResolver:
         cache_path: Path | None = None,
         path_cap: int = 100,
         llm_concurrency: int = 1,
+        search_state_cap: int = 5000,
+        search_depth_cap: int = 256,
         progress: Callable[[Seed, list["ResolvedSeed"], float], None] | None = None,
     ) -> None:
         self.graph = graph
@@ -350,14 +376,15 @@ class ValueFlowResolver:
             if file_name and function_name
         ))
         self.function_configs = function_configs
-        # Named table/wrapper semantics belong only to the explicit legacy
-        # compatibility engine. Production valueflow always supplies the
-        # transfer callback (including the disabled/offline callback), so it
-        # must not load those rules as a semantic input.
         self.transfer_resolver = transfer_resolver or transfer_callback
+        # Preserve the original engine boundary: legacy resolution sees these
+        # rules only when no transfer resolver is active. The new route-initial
+        # table check receives its own copy without changing other fallbacks.
+        merged_value_rules = merge_value_rules(value_rules)
         self.value_rules = (
-            merge_value_rules(value_rules) if self.transfer_resolver is None else {}
+            merged_value_rules if self.transfer_resolver is None else {}
         )
+        self.route_value_rules = merged_value_rules
         self.builder_macros = macros or {}
         self.file_macros = file_macros or {}
         # The project map can contain several historical copies of a header.
@@ -366,6 +393,25 @@ class ValueFlowResolver:
         print("VALUEFLOW: indexing include graph")
         self.include_graph = self._build_include_graph()
         self.include_diagnostics = self._collect_include_diagnostics()
+        self._visible_files_cache: dict[str, tuple[str, ...]] = {}
+        self._builder_macros_by_path: dict[
+            str, dict[str, tuple[str, str]]
+        ] = defaultdict(dict)
+        self._builder_macros_without_path: dict[str, tuple[str, str]] = {}
+        for macro_name, value in self.builder_macros.items():
+            entry = (value[0], value[1])
+            if value[1]:
+                definition_path = str(Path(value[1]).resolve())
+                self._builder_macros_by_path[definition_path][macro_name] = entry
+            else:
+                self._builder_macros_without_path[macro_name] = entry
+        self._all_macros_cache: dict[
+            tuple[str | None, int, int], dict[str, tuple[str, str]]
+        ] = {}
+        self._resolved_macro_cache: dict[
+            tuple[str, str | None, int, int], tuple[str, str, int] | None
+        ] = {}
+        self._macro_lines_by_file: dict[str, dict[str, int]] = {}
         self._visible_enum_cache: dict[
             str, tuple[dict[str, tuple[str, str, int]], set[str]]
         ] = {}
@@ -379,6 +425,13 @@ class ValueFlowResolver:
         self.cache_path = cache_path
         self.path_cap = max(1, path_cap)
         self.llm_concurrency = max(1, llm_concurrency)
+        self.search_state_cap = self._positive_limit_from_env(
+            "TRACER_VF_SEARCH_STATE_CAP", search_state_cap
+        )
+        self.search_depth_cap = self._positive_limit_from_env(
+            "TRACER_VF_SEARCH_DEPTH_CAP", search_depth_cap
+        )
+        self.search_yield_interval = 64
         self.progress = progress
 
         # INDEXES: these are built once from the incoming call graph/AST.  They
@@ -398,6 +451,8 @@ class ValueFlowResolver:
         # with the callback-only set is ``reachable``.
         self.direct_reachable: set[str] = set()
         self.callback_only: set[str] = set()
+        self.reachability_predecessor: dict[str, CallerEdge | None] = {}
+        self.reachability_root: dict[str, str] = {}
         self.seeds: list[Seed] = []
 
         # RESOLUTION STATE: query token -> answer.  Caching a query saves work,
@@ -417,15 +472,27 @@ class ValueFlowResolver:
         self._operation_cache: dict[str, str] = {}
         self._call_number_cache: dict[tuple[str, tuple[str, ...]], str | None] = {}
         self.transfer_cache: dict[str, dict[str, Any]] = {}
+        self.transfer_in_flight: dict[str, asyncio.Future[Any]] = {}
         self.transfer_diagnostics: list[str] = []
         self.transfer_rejections: dict[str, int] = defaultdict(int)
         self.transfer_cache_hits = 0
         self.transfer_cache_misses = 0
         self.transfer_request_count = 0
+        self.fast_path_seed_count = 0
+        self.search_seed_count = 0
+        self.search_state_count = 0
+        self.search_deduplicated_state_count = 0
+        self.search_limit_seed_count = 0
+        self.search_max_frontier = 0
+        self.search_max_depth = 0
+        self.witness_path_count = 0
+        self._search_limited_seed_ids: set[str] = set()
+        self._scheduled_seed_modes: dict[str, bool] = {}
         self._function_slice_cache: dict[str, tuple[str, int]] = {}
         self._route_cache: dict[tuple[str, bool], list[Any]] = {}
         self._visible_names_cache: dict[str, set[str]] = {}
         self._constants_cache: dict[str, dict[str, str]] = {}
+        self._global_table_cache: dict[str, TableLookup] = {}
         # Part 5 flags: default off, so an unset environment reproduces
         # today's behaviour exactly. See implementation_plan.md Part 5.1.
         self.allow_opaque_formula = os.environ.get("TRACER_VF_GRAMMAR_EXTENDED") == "1"
@@ -474,6 +541,13 @@ class ValueFlowResolver:
         self._enumerate_seeds()
         print(f"VALUEFLOW: found {len(self.seeds)} target invocations")
         self._load_cache()
+
+    @staticmethod
+    def _positive_limit_from_env(name: str, default: int) -> int:
+        try:
+            return max(1, int(os.environ.get(name, str(default))))
+        except (TypeError, ValueError):
+            return max(1, int(default))
 
     # ------------------------------------------------------------------ index
     def _build_function_index(self) -> None:
@@ -872,16 +946,26 @@ class ValueFlowResolver:
             self.reachable = set()
             self.direct_reachable = set()
             self.callback_only = set()
+            self.reachability_predecessor = {}
+            self.reachability_root = {}
             return
+        entry_ids = sorted(dict.fromkeys(entry_ids))
         queue = deque(entry_ids)
         self.reachable.update(entry_ids)
+        self.reachability_predecessor = {entry_id: None for entry_id in entry_ids}
+        self.reachability_root = {entry_id: entry_id for entry_id in entry_ids}
         direct_queue = deque(entry_ids)
         self.direct_reachable.update(entry_ids)
         while queue:
             current = queue.popleft()
-            for edge in self.forward_edges.get(current, []):
+            for edge in sorted(
+                self.forward_edges.get(current, []),
+                key=lambda item: (item.site_id, item.callee_id),
+            ):
                 if edge.callee_id not in self.reachable:
                     self.reachable.add(edge.callee_id)
+                    self.reachability_predecessor[edge.callee_id] = edge
+                    self.reachability_root[edge.callee_id] = self.reachability_root[current]
                     queue.append(edge.callee_id)
         while direct_queue:
             current = direct_queue.popleft()
@@ -1250,7 +1334,29 @@ class ValueFlowResolver:
         if self._literal(value):
             return [self._source_fact(value, "CONST", expression, query)]
 
-        table_facts = self._resolve_table_expression(expression, site, query)
+        runtime_input = self._runtime_input_name(value)
+        if runtime_input is not None:
+            return [
+                Fact(
+                    value=value,
+                    origin_kind="RUNTIME_DATA",
+                    source_file=expression.file_path,
+                    source_line=expression.line,
+                    source_expr=raw,
+                    origin_query=query.token(),
+                    source_site_id=query.token(),
+                    metadata={
+                        "source_role": "GENESIS",
+                        "trace_complete": True,
+                        "termination_reason": "RUNTIME_INPUT",
+                        "runtime_input": runtime_input,
+                    },
+                )
+            ]
+
+        table_facts = self._resolve_table_expression(
+            expression, site, query, rules=self.route_value_rules
+        )
         if table_facts is not None:
             return table_facts
 
@@ -1258,17 +1364,21 @@ class ValueFlowResolver:
         if macro is not None:
             resolved, macro_file, macro_line = macro
             visible_enum_values, _ = self._visible_enum_index(expression.file_name)
+            is_enum = value in visible_enum_values
             return [
                 Fact(
                     value=resolved,
-                    origin_kind=(
-                        "CONST" if value in visible_enum_values else "MACRO"
-                    ),
+                    origin_kind="CONST" if is_enum else "MACRO",
                     source_file=macro_file or expression.file_path,
                     source_line=macro_line or expression.line,
                     source_expr=value,
                     origin_query=query.token(),
                     source_site_id=f"{macro_file}:{macro_line}:{value}",
+                    metadata={
+                        "source_role": "GENESIS",
+                        "trace_complete": True,
+                        "termination_reason": "ENUM" if is_enum else "MACRO",
+                    },
                 )
             ]
 
@@ -1293,15 +1403,34 @@ class ValueFlowResolver:
                 if definitions:
                     resolved: list[Fact] = []
                     for definition in definitions:
-                        resolved.extend(
-                            await self._resolve_expression(
-                                definition,
-                                site,
-                                query,
-                                stack,
-                                local_stack | {value},
-                            )
+                        definition_facts = await self._resolve_expression(
+                            definition,
+                            site,
+                            query,
+                            stack,
+                            local_stack | {value},
                         )
+                        for fact in definition_facts:
+                            if definition.guards:
+                                fact = replace(
+                                    fact,
+                                    metadata={
+                                        **(fact.metadata or {}),
+                                        "guards": list(definition.guards),
+                                    },
+                                )
+                            if fact.origin_kind == "CONST":
+                                metadata = dict(fact.metadata or {})
+                                metadata.setdefault("source_role", "GENESIS")
+                                metadata.setdefault("trace_complete", True)
+                                metadata.setdefault(
+                                    "termination_reason", "LOCAL_ASSIGNMENT"
+                                )
+                                fact = replace(
+                                    fact,
+                                    metadata=metadata,
+                                )
+                            resolved.append(fact)
                     if resolved:
                         return resolved
 
@@ -1338,12 +1467,12 @@ class ValueFlowResolver:
                     )
                 ]
 
-        # A call through a pointer is unfollowable; plain field/variable reads
-        # are ordinary external data.
-        kind = "UNKNOWN_INDIRECT" if "(*" in raw else "EXTERNAL_DATA"
+        # Unknown symbols and calls are analyzer failures, not proven runtime
+        # boundaries. Only explicit source/LLM boundary evidence is external.
+        kind = "UNKNOWN_INDIRECT" if "(*" in raw else "UNRESOLVED"
         return [
             Fact(
-                value=raw,
+                value="UNRESOLVED",
                 origin_kind=kind,
                 source_file=expression.file_path,
                 source_line=expression.line,
@@ -1356,33 +1485,69 @@ class ValueFlowResolver:
 
     # ---------------------------------------------------------- bounded values
     def _resolve_table_expression(
-        self, expression: Expression, site: IndexedSite, query: Query
+        self,
+        expression: Expression,
+        site: IndexedSite,
+        query: Query,
+        *,
+        rules: dict[str, dict[str, Any]] | None = None,
     ) -> list[Fact] | None:
         """Resolve a call proven to return a finite constant-table set.
 
         This handles both configured production wrappers and ordinary fixture
-        functions such as ``return table[index]``.  It intentionally refuses
-        mutable tables, computed values, and incomplete initializers.
+        functions such as ``return table[index]``. It accepts non-const static
+        tables only for configured wrappers and still refuses computed or
+        incomplete initializers.
         """
         node = expression.node
-        if node is None or node.type != "call_expression":
+        if node is None:
+            return None
+        if node.type == "subscript_expression":
+            lookup = self._local_indexed_table_lookup(
+                expression,
+                site,
+                int(getattr(query, "arg_index", 0) or 0),
+            )
+            if lookup is None:
+                return None
+            return self._indexed_table_facts(lookup, expression, site, query)
+        if node.type != "call_expression":
             return None
         function_node = node.child_by_field_name("function")
         if function_node is None or function_node.type != "identifier":
             return None
         name = node_text(function_node, site.source)
-        rule = self.value_rules.get(name)
+        rule = (self.value_rules if rules is None else rules).get(name)
         infos = self._function_infos_named(name)
         if not infos:
             return None
 
         selected: list[tuple[str, str, int, str, str, int, str]] | None = None
+        selected_info: FunctionInfo | None = None
         for info in infos:
             selected = self._table_values_for_function(info, rule or {})
             if selected:
+                selected_info = info
                 break
-        if not selected:
+        if not selected or selected_info is None:
             return None
+
+        # A literal wrapper index selects one initializer element exactly.
+        # A runtime index deliberately keeps the complete finite set.
+        index_expression = selected[0][6]
+        if index_expression in selected_info.parameters:
+            arguments = node.child_by_field_name("arguments")
+            parameter_index = selected_info.parameters.index(index_expression)
+            actuals = list(arguments.named_children) if arguments is not None else []
+            if parameter_index < len(actuals):
+                raw_index = strip_outer_parens(
+                    node_text(actuals[parameter_index], site.source).strip()
+                )
+                literal_index = self._parse_c_integer_literal(raw_index)
+                if literal_index is not None:
+                    if literal_index < 0 or literal_index >= len(selected):
+                        return None
+                    selected = [selected[literal_index]]
 
         set_id = hashlib.sha1(
             f"{site.site_id}:{name}:{selected[0][4]}".encode("utf-8", errors="replace")
@@ -1402,6 +1567,12 @@ class ValueFlowResolver:
                     "table_line": table_line,
                     "table_symbol": table_symbol,
                     "index_expression": index_expression,
+                    "source_role": "TABLE_VALUE",
+                    "trace_complete": True,
+                    "termination_reason": "TABLE_SET",
+                    "selector_source_file": expression.file_path,
+                    "selector_source_line": expression.line,
+                    "selector_source_expr": expression.text.strip(),
                     "bound": bound,
                     "set_id": set_id,
                     "wrapper": name,
@@ -1470,7 +1641,16 @@ class ValueFlowResolver:
         named = list(selected_match.named_children)
         table_symbol = node_text(named[0], info.source).strip()
         index_expression = node_text(named[1], info.source).strip()
-        values = self._constant_table_values(info.node.file_name, table_symbol)
+        values = self._constant_table_values(
+            info.node.file_name,
+            table_symbol,
+            member_index=(
+                int(rule["member_index"])
+                if "member_index" in rule
+                else None
+            ),
+            allow_static=bool(rule),
+        )
         if not values:
             return None
         return [
@@ -1487,9 +1667,14 @@ class ValueFlowResolver:
         ]
 
     def _constant_table_values(
-        self, file_name: str, symbol: str
+        self,
+        file_name: str,
+        symbol: str,
+        *,
+        member_index: int | None = None,
+        allow_static: bool = False,
     ) -> list[tuple[str, str, int, str]] | None:
-        """Read literal/macro/enum elements from one visible const array."""
+        """Read one scalar/member column from a source-backed table."""
         for visible_file in self._visible_files(file_name):
             tree, source = self.trees.get(visible_file, (None, b""))
             if tree is None:
@@ -1498,7 +1683,9 @@ class ValueFlowResolver:
                 if declaration.type != "declaration":
                     continue
                 declaration_text = node_text(declaration, source)
-                if not re.search(r"\b(?:static\s+)?const\b", declaration_text):
+                is_const = bool(re.search(r"\bconst\b", declaration_text))
+                is_static = bool(re.search(r"\bstatic\b", declaration_text))
+                if not is_const and not (allow_static and is_static):
                     continue
                 for init in declaration.named_children:
                     if init.type != "init_declarator":
@@ -1516,7 +1703,24 @@ class ValueFlowResolver:
                         elements.append(element)
                     values: list[tuple[str, str, int, str]] = []
                     for element in elements:
-                        raw = strip_outer_parens(node_text(element, source).strip())
+                        selected_element = element
+                        if member_index is not None:
+                            if element.type != "initializer_list":
+                                values = []
+                                break
+                            members = list(element.named_children)
+                            if member_index < 0 or member_index >= len(members):
+                                values = []
+                                break
+                            selected_element = members[member_index]
+                            if selected_element.type == "initializer_pair":
+                                selected_element = (
+                                    selected_element.child_by_field_name("value")
+                                    or selected_element
+                                )
+                        raw = strip_outer_parens(
+                            node_text(selected_element, source).strip()
+                        )
                         resolved = self._resolve_macro(raw, visible_file)
                         if resolved is not None:
                             value = resolved[0]
@@ -1529,7 +1733,7 @@ class ValueFlowResolver:
                             (
                                 value,
                                 self.project_structure.get(visible_file, visible_file),
-                                element.start_point.row + 1,
+                                selected_element.start_point.row + 1,
                                 raw,
                             )
                         )
@@ -1551,7 +1755,42 @@ class ValueFlowResolver:
             if not rule or str(rule.get("kind")) != "writes_table":
                 continue
             output_values = self._wrapper_output_values(candidate, name, rule)
-            if not output_values or not self._wrapper_success_guard(candidate, site):
+            if not self._wrapper_success_guard(candidate, site):
+                continue
+            if not output_values:
+                # The wrapper still proves a runtime write even when its table
+                # expression is too complex for the constant-table reader
+                # (for example, a two-dimensional subscript).  Do not fall
+                # back to the declaration initializer in that case.
+                output_args = {
+                    int(item) for item in (rule.get("output_args") or [])
+                }
+                for index, argument in enumerate(candidate.arguments, start=1):
+                    if index in output_args and normalise_handle(
+                        argument.text
+                    ) == normalise_handle(name):
+                        return [
+                            Fact(
+                                value=name,
+                                origin_kind="RUNTIME_DATA",
+                                source_file=candidate.file_path,
+                                source_line=candidate.line,
+                                source_expr=node_text(
+                                    candidate.ast_node, candidate.source
+                                ),
+                                origin_query=query.token(),
+                                source_site_id=candidate.site_id,
+                                metadata={
+                                    "wrapper": candidate.callee_name,
+                                    "output_variable": name,
+                                    "write_site": candidate.site_id,
+                                    "source_role": "GENESIS",
+                                    "trace_complete": True,
+                                    "termination_reason": "RUNTIME_PRODUCER",
+                                    "runtime_producer": candidate.callee_name,
+                                },
+                            )
+                        ]
                 continue
             set_id = hashlib.sha1(
                 f"{candidate.site_id}:{name}".encode("utf-8", errors="replace")
@@ -1691,6 +1930,9 @@ class ValueFlowResolver:
                     left_name = _extract_declarator_identifier(left, function.source)
                     if left_name == name:
                         raw = strip_outer_parens(node_text(right, function.source).strip())
+                        macro = self._resolve_macro(raw, site.file_name)
+                        if macro is not None:
+                            raw = macro[0]
                         if _STRING_OR_CHAR.fullmatch(raw) and raw.startswith(('"', 'u8"', 'u"', 'U"', 'L"')):
                             writes.append((node.start_byte, raw, node_text(node, function.source)))
             if node.type != "call_expression":
@@ -1709,6 +1951,9 @@ class ValueFlowResolver:
             if destination != name:
                 continue
             raw = strip_outer_parens(node_text(args[1], function.source).strip())
+            macro = self._resolve_macro(raw, site.file_name)
+            if macro is not None:
+                raw = macro[0]
             if not _STRING_OR_CHAR.fullmatch(raw) or not raw.startswith(('"', 'u8"', 'u"', 'U"', 'L"')):
                 continue
             if called_name == "strncpy" and len(args) >= 3:
@@ -1991,7 +2236,12 @@ class ValueFlowResolver:
                 }
             for caller_id in candidate_callers:
                 global_bindings.extend(
-                    self._binding_opens(caller_id, root, 1 << 62, dependencies)
+                    self._binding_opens(
+                        caller_id,
+                        root,
+                        _GLOBAL_HANDLE_SEARCH_BEFORE,
+                        dependencies,
+                    )
                 )
         if global_bindings:
             facts = []
@@ -2037,6 +2287,41 @@ class ValueFlowResolver:
         # values (the SVM records that motivated this fix were an example).
         return facts or [self._unresolved_fact(query, "HANDLE_AMBIGUOUS")]
 
+    def _close_exits_before(self, site: IndexedSite, before_byte: int) -> bool:
+        """Whether a close is confined to a branch that cannot reach the use."""
+        node = site.ast_node
+        parent = node.parent if node is not None else None
+        while parent is not None and parent.start_byte < before_byte:
+            if parent.type == "if_statement":
+                for branch_name in ("consequence", "alternative"):
+                    branch = parent.child_by_field_name(branch_name)
+                    if branch is None or not self._contains(branch, node):
+                        continue
+                    if branch.type == "else_clause" and branch.named_children:
+                        branch = branch.named_children[0]
+                    statements = (
+                        list(branch.named_children)
+                        if branch.type == "compound_statement"
+                        else [branch]
+                    )
+                    if any(
+                        statement.type == "return_statement"
+                        and statement.start_byte >= site.end_byte
+                        for statement in statements
+                    ):
+                        return True
+            if parent.type == "case_statement":
+                # A close in a switch error case cannot invalidate an open on
+                # the paths that continue after the switch.
+                if any(
+                    statement.type == "return_statement"
+                    and site.end_byte <= statement.start_byte < before_byte
+                    for statement in parent.named_children
+                ):
+                    return True
+            parent = parent.parent
+        return False
+
     def _binding_opens(
         self, caller_id: str, root: str, before_byte: int, dependencies: tuple[str, ...]
     ) -> list[IndexedSite]:
@@ -2070,6 +2355,14 @@ class ValueFlowResolver:
                 )
             )
         ]
+        if before_byte != _GLOBAL_HANDLE_SEARCH_BEFORE:
+            close_sites = [
+                site
+                for site in close_sites
+                if not self._close_exits_before(site, before_byte)
+            ]
+        else:
+            close_sites = []
         if close_sites:
             last_close = max(item.start_byte for item in close_sites)
             candidates = [item for item in candidates if item.start_byte > last_close]
@@ -2085,11 +2378,11 @@ class ValueFlowResolver:
         used, so the result proves a source-valid value for the enclosing
         function, never that the function executes.
         """
-        seen: set[int] = set()
+        seen: set[Any] = set()
         return self._locally_provable_checked(site, seen)
 
     def _locally_provable_checked(
-        self, site: IndexedSite, seen: set[int]
+        self, site: IndexedSite, seen: set[Any]
     ) -> bool:
         if id(site) in seen:
             return False
@@ -2101,6 +2394,10 @@ class ValueFlowResolver:
             if name in self.function_configs and name != site.callee_name
         )
         if dependencies:
+            # Consumer guards correlate owning-open alternatives. Keep this
+            # case in transfer search so contradictory arms are filtered.
+            if self._target_site_guards(site):
+                return False
             candidates = self._handle_candidates(site, dependencies)
             if len(candidates) != 1:
                 return False
@@ -2117,19 +2414,19 @@ class ValueFlowResolver:
             if not indices:
                 return False
             return all(
-                self._locally_provable_argument(opening, int(index), seen)
+                self._locally_provable_argument(opening, int(index), set(seen))
                 for index in indices
             )
         indices = config.get("indices") or []
         if not indices:
             return False
         return all(
-            self._locally_provable_argument(site, int(index), seen)
+            self._locally_provable_argument(site, int(index), set(seen))
             for index in indices
         )
 
     def _locally_provable_argument(
-        self, site: IndexedSite, index: int, seen: set[int]
+        self, site: IndexedSite, index: int, seen: set[Any]
     ) -> bool:
         argument = (
             site.target_argument(index)
@@ -2138,10 +2435,26 @@ class ValueFlowResolver:
         )
         if argument is None:
             return False
+        if self._runtime_input_name(argument.text) is not None:
+            return True
+        query = ArgQuery(site.site_id, index, target=site.is_configured_macro_target)
+        table_facts = self._resolve_table_expression(
+            argument, site, query, rules=self.route_value_rules
+        )
+        if table_facts is not None:
+            return bool(table_facts) and all(
+                fact.origin_kind in {"CONST_TABLE", "CONST", "MACRO"}
+                for fact in table_facts
+            )
+        value = strip_outer_parens(argument.text.strip())
+        if _IDENTIFIER.fullmatch(value):
+            string_facts = self._local_string_facts(site, value, query)
+            if string_facts is not None:
+                return bool(string_facts)
         return self._expression_locally_provable(site, argument.text, seen)
 
     def _expression_locally_provable(
-        self, site: IndexedSite, text: str, seen: set[int]
+        self, site: IndexedSite, text: str, seen: set[Any]
     ) -> bool:
         value = strip_outer_parens(text.strip())
         if not value:
@@ -2160,7 +2473,7 @@ class ValueFlowResolver:
         if not definitions:
             return False
         return all(
-            self._expression_locally_provable(site, definition.text, seen)
+            self._expression_locally_provable(site, definition.text, set(seen))
             for definition in definitions
         )
 
@@ -2343,38 +2656,47 @@ class ValueFlowResolver:
 
     # ------------------------------------------------------------ public run
     async def run(self) -> list[ResolvedSeed]:
-        """Resolve every seed through a bounded async producer/consumer pipeline.
-
-        A small pool of worker tasks pulls ``(index, seed)`` items off a
-        bounded queue and awaits the existing ``_resolve_seed()`` state
-        machine.  The workers only ever run on this coordinator's event loop,
-        so shared resolution state (``results``, ``in_flight``, provenance,
-        caches) is untouched by threads or processes.  While one worker is
-        yielded away inside a pending model request, the other workers keep
-        doing CPU-side tracing; ``_llm_gate`` still caps concurrent model
-        calls at ``llm_concurrency``.
-
-        Final records are flattened in original seed order, never completion
-        order, so output/cache/diagnostic ordering is unchanged.
-        """
+        """Resolve seeds with fast source-only work isolated from backwalks."""
         if not self.seeds:
             self.persist_cache()
             return []
 
-        limit = max(2, min(len(self.seeds), self.llm_concurrency * 2))
-        queue: asyncio.Queue[tuple[int, Seed] | None] = asyncio.Queue(maxsize=limit)
+        # Only do the cheap, obvious source check up front.  Full local
+        # backwalking stays in the normal resolver so a large project does not
+        # pay for a complete pre-scan before its first literal can finish.
+        classified = [self._seed_is_fast(seed) for seed in self.seeds]
+
+        fast_items = [
+            (index, seed)
+            for index, (seed, fast) in enumerate(zip(self.seeds, classified))
+            if fast
+        ]
+        slow_items = [
+            (index, seed)
+            for index, (seed, fast) in enumerate(zip(self.seeds, classified))
+            if not fast
+        ]
+        self._scheduled_seed_modes = {
+            seed.site.site_id: True
+            for seed, fast in zip(self.seeds, classified)
+            if fast
+        }
+
         rows_by_seed: dict[int, list[ResolvedSeed]] = {}
         first_error: BaseException | None = None
+        scheduler_tasks: list[asyncio.Task[Any]] = []
 
-        async def producer() -> None:
-            for index, seed in enumerate(self.seeds):
-                await queue.put((index, seed))
-            # One sentinel per worker so idle workers terminate after the
-            # last real seed has been consumed.
-            for _ in range(limit):
+        async def produce(
+            items: list[tuple[int, Seed]],
+            queue: asyncio.Queue[tuple[int, Seed] | None],
+            worker_count: int,
+        ) -> None:
+            for item in items:
+                await queue.put(item)
+            for _ in range(worker_count):
                 await queue.put(None)
 
-        async def worker() -> None:
+        async def worker(queue: asyncio.Queue[tuple[int, Seed] | None]) -> None:
             nonlocal first_error
             while True:
                 item = await queue.get()
@@ -2396,23 +2718,47 @@ class ValueFlowResolver:
                 if self.progress is not None:
                     self.progress(seed, rows, time.perf_counter() - started)
 
-        producer_task = asyncio.create_task(producer())
-        workers = [asyncio.create_task(worker()) for _ in range(limit)]
         try:
-            # Await the producer and workers together.  Waiting for the
-            # producer first can deadlock if every worker fails while the
-            # producer is still trying to enqueue work: there would be no
-            # consumers left to drain the bounded queue, so the exception
-            # cleanup below would never be reached.
-            await asyncio.gather(producer_task, *workers)
+            queue_specs = []
+            if fast_items:
+                queue_specs.append(
+                    (
+                        fast_items,
+                        min(10, len(fast_items)),
+                    )
+                )
+            if slow_items:
+                queue_specs.append(
+                    (
+                        slow_items,
+                        min(max(1, self.llm_concurrency), len(slow_items)),
+                    )
+                )
+            for items, worker_count in queue_specs:
+                queue: asyncio.Queue[tuple[int, Seed] | None] = asyncio.Queue(
+                    maxsize=max(1, worker_count * 2)
+                )
+                scheduler_tasks.append(
+                    asyncio.create_task(produce(items, queue, worker_count))
+                )
+                scheduler_tasks.extend(
+                    asyncio.create_task(worker(queue))
+                    for _ in range(worker_count)
+                )
+
+            # Await producers and workers together so a failing worker cannot
+            # strand a producer on a bounded queue.
+            await asyncio.gather(*scheduler_tasks)
         except BaseException:
             # A seed failure (or cancellation of run() itself) cancels the
             # remaining scheduler work instead of leaving it behind.
-            for task in [producer_task, *workers]:
+            for task in scheduler_tasks:
                 if not task.done():
                     task.cancel()
-            await asyncio.gather(producer_task, *workers, return_exceptions=True)
+            await asyncio.gather(*scheduler_tasks, return_exceptions=True)
             raise
+        finally:
+            self._scheduled_seed_modes.clear()
 
         records = [
             record
@@ -2423,8 +2769,48 @@ class ValueFlowResolver:
         return self._deduplicate_records(records)
 
     async def _resolve_seed(self, seed: Seed) -> list[ResolvedSeed]:
+        local = self._scheduled_seed_modes.get(seed.site.site_id)
+        if local is None:
+            local = self._seed_has_no_value(seed) or self._locally_provable(seed.site)
+        if local:
+            self.fast_path_seed_count += 1
+            return await self._resolve_seed_from_queries(seed)
         if self.transfer_resolver is not None:
+            self.search_seed_count += 1
             return await self._resolve_seed_with_transfers(seed)
+        return await self._resolve_seed_from_queries(seed)
+
+    @staticmethod
+    def _seed_has_no_value(seed: Seed) -> bool:
+        return not (seed.config.get("indices") or []) and not (
+            seed.config.get("dependent_functions") or []
+        )
+
+    def _seed_is_fast(self, seed: Seed) -> bool:
+        if self._seed_has_no_value(seed):
+            return True
+        config = self.function_configs.get(seed.target_function, {})
+        if config.get("dependent_functions"):
+            return False
+        for raw_index in config.get("indices") or ():
+            index = int(raw_index)
+            argument = (
+                seed.site.target_argument(index)
+                if seed.site.is_configured_macro_target
+                else seed.site.argument(index)
+            )
+            if argument is None:
+                return False
+            value = strip_outer_parens(argument.text.strip())
+            if self._literal(value):
+                continue
+            if self._resolve_macro(value, seed.site.file_name) is not None:
+                continue
+            return False
+        return True
+
+    async def _resolve_seed_from_queries(self, seed: Seed) -> list[ResolvedSeed]:
+        """Resolve one deterministic seed through existing memoized queries."""
 
         # One seed is one target call site. It can yield several rows when its
         # configured argument has several possible source values/paths.
@@ -2496,6 +2882,9 @@ class ValueFlowResolver:
     # ------------------------------------------------------ route transfers
     def routes_for_seed(self, seed: Seed) -> list[RouteGuide]:
         """Return deterministic root-valid routes for one exact target seed.
+
+        Deprecated execution path: normal value-flow resolution uses bounded
+        backward search. This remains temporarily for rollback/reference tests.
 
         The reverse caller index already contains the exact byte-based site for
         every ordinary edge and the synthetic site for callback edges.  Walking
@@ -2587,6 +2976,7 @@ class ValueFlowResolver:
         """Build one correlated bundle from exact source arguments."""
         bindings: list[Binding] = []
         sources: dict[int, dict[str, Any]] = {}
+        function = self.functions.get(site.caller_id)
         for raw_index in indices:
             index = int(raw_index)
             expression = (
@@ -2597,7 +2987,11 @@ class ValueFlowResolver:
             if expression is None:
                 bindings.append(Binding(index, "UNKNOWN", "missing argument"))
                 continue
-            bindings.append(Binding(index, "EXPRESSION", expression.text.strip()))
+            text = expression.text.strip()
+            normalized = strip_outer_parens(text)
+            if function is not None and normalized in function.parameters:
+                text = f"${function.parameters.index(normalized) + 1}"
+            bindings.append(Binding(index, "EXPRESSION", text))
             sources[index] = self._expression_source(expression)
         correlation = hashlib.sha256(
             f"{route.route_id}\0initial".encode("utf-8")
@@ -2608,6 +3002,756 @@ class ValueFlowResolver:
             bindings=bindings,
             source_by_arg=sources,
         )
+
+    def _initial_route_arms(
+        self,
+        *,
+        route: RouteGuide,
+        site: IndexedSite,
+        indices: Iterable[int],
+    ) -> list[RouteArm]:
+        """Expand source-proven table calls before asking for local transfer."""
+        materialized_indices = tuple(int(index) for index in indices)
+        arm = self.initial_route_arm(
+            route=route,
+            site=site,
+            indices=materialized_indices,
+        )
+        if len(materialized_indices) != 1:
+            return [arm]
+        index = materialized_indices[0]
+        expression = (
+            site.target_argument(index)
+            if site.is_configured_macro_target
+            else site.argument(index)
+        )
+        if expression is None:
+            return [arm]
+        lookup = self._local_indexed_table_lookup(expression, site, index)
+        if lookup is not None:
+            query = ArgQuery(
+                site.site_id,
+                index,
+                target=site.is_configured_macro_target,
+            )
+            table_facts = self._indexed_table_facts(
+                lookup, expression, site, query
+            )
+            if table_facts:
+                return [
+                    RouteArm(
+                        route_id=arm.route_id,
+                        correlation_id=(
+                            f"{arm.correlation_id}:table:{position}"
+                        ),
+                        bindings=[Binding(index, "EXACT", fact.value)],
+                        source_by_arg={
+                            index: {
+                                "file": fact.source_file,
+                                "line": fact.source_line,
+                                "expr": fact.source_expr,
+                                "source_site_id": fact.source_site_id,
+                                "origin_kind": fact.origin_kind,
+                                "link_method": fact.link_method,
+                                "metadata": dict(fact.metadata or {}),
+                            }
+                        },
+                    )
+                    for position, fact in enumerate(table_facts)
+                ]
+            selector = strip_outer_parens(lookup.selector)
+            selector_value = self._table_selector_value(selector, site.file_name)
+            function = self.functions.get(site.caller_id)
+            if selector_value is not None:
+                if 0 <= selector_value < len(lookup.values):
+                    return [
+                        RouteArm(
+                            route_id=arm.route_id,
+                            correlation_id=arm.correlation_id,
+                            bindings=[Binding(index, "EXPRESSION", selector)],
+                            table_lookups={index: lookup},
+                            source_by_arg=dict(arm.source_by_arg),
+                        )
+                    ]
+                return [
+                    RouteArm(
+                        route_id=arm.route_id,
+                        correlation_id=arm.correlation_id,
+                        bindings=[Binding(index, "UNKNOWN", "UNRESOLVED")],
+                        source_by_arg={
+                            index: {
+                                **arm.source_by_arg.get(index, {}),
+                                "expr": selector,
+                                "metadata": {
+                                    "source_role": "TABLE_VALUE",
+                                    "trace_complete": False,
+                                    "termination_reason": "TABLE_INDEX_OUT_OF_RANGE",
+                                },
+                            }
+                        },
+                    )
+                ]
+            if function is not None and selector in function.parameters:
+                selector = f"${function.parameters.index(selector) + 1}"
+                return [
+                    RouteArm(
+                        route_id=arm.route_id,
+                        correlation_id=arm.correlation_id,
+                        bindings=[Binding(index, "EXPRESSION", selector)],
+                        table_lookups={index: lookup},
+                        source_by_arg=dict(arm.source_by_arg),
+                    )
+                ]
+            # A mutable/local selector that cannot be proven is deliberately
+            # left unresolved instead of being handed to the model as a file
+            # number candidate.
+            return [
+                RouteArm(
+                    route_id=arm.route_id,
+                    correlation_id=arm.correlation_id,
+                    bindings=[Binding(index, "UNKNOWN", "UNRESOLVED")],
+                    source_by_arg={
+                        index: {
+                            **arm.source_by_arg.get(index, {}),
+                            "expr": lookup.selector,
+                            "metadata": {
+                                "source_role": "TABLE_VALUE",
+                                "trace_complete": False,
+                                "termination_reason": "UNSUPPORTED_SYNTAX",
+                            },
+                        }
+                    },
+                )
+            ]
+        facts = self._resolve_table_expression(
+            expression,
+            site,
+            ArgQuery(site.site_id, index, target=site.is_configured_macro_target),
+            rules=self.route_value_rules,
+        )
+        if not facts:
+            return [arm]
+        return [
+            RouteArm(
+                route_id=arm.route_id,
+                correlation_id=arm.correlation_id,
+                bindings=[Binding(index, "EXACT", fact.value)],
+                source_by_arg={
+                    index: {
+                        "file": fact.source_file,
+                        "line": fact.source_line,
+                        "expr": fact.source_expr,
+                        "source_site_id": fact.source_site_id,
+                        "origin_kind": fact.origin_kind,
+                        "link_method": fact.link_method,
+                        "metadata": dict(fact.metadata or {}),
+                    }
+                },
+            )
+            for fact in facts
+        ]
+
+    def _local_indexed_table_lookup(
+        self, expression: Expression, site: IndexedSite, target_arg: int
+    ) -> TableLookup | None:
+        """Recognize a uniquely initialized array with no observed writes."""
+        function = self.functions.get(site.caller_id)
+        if function is None:
+            return None
+        rule = self.route_value_rules.get(function.node.name) or {}
+        if rule.get("indexed_local_table") and int(
+            rule.get("target_argument") or target_arg
+        ) != target_arg:
+            return None
+        node = expression.node
+        if node is None or node.type != "subscript_expression":
+            return None
+        named = list(node.named_children)
+        if len(named) != 2 or named[0].type != "identifier":
+            return None
+        table_symbol = node_text(named[0], site.source).strip()
+        selector = node_text(named[1], site.source).strip()
+
+        def initialized_array(
+            declaration: Any, source: bytes
+        ) -> tuple[Any, list[Any]] | None:
+            for init in declaration.named_children:
+                if init.type != "init_declarator":
+                    continue
+                declarator = init.child_by_field_name("declarator")
+                if (
+                    declarator is None
+                    or declarator.type != "array_declarator"
+                    or _extract_declarator_identifier(declarator, source)
+                    != table_symbol
+                ):
+                    continue
+                value_node = init.child_by_field_name("value")
+                if value_node is None or value_node.type != "initializer_list":
+                    return None
+                elements = list(value_node.named_children)
+                size_node = declarator.child_by_field_name("size")
+                size = (
+                    self._parse_c_integer_literal(node_text(size_node, source))
+                    if size_node is not None
+                    else None
+                )
+                if (
+                    not elements
+                    or len(elements) > 32
+                    or (size is not None and size != len(elements))
+                    or any(
+                        item.type in {"initializer_pair", "initializer_list"}
+                        for item in elements
+                    )
+                ):
+                    return None
+                return declaration, elements
+            return None
+
+        declarations: list[tuple[Any, list[Any], str, bytes, bool]] = []
+        local_declaration_seen = False
+        for candidate in _walk(function.ast_node):
+            if candidate.type != "declaration" or candidate.start_byte >= node.start_byte:
+                continue
+            local_declaration_seen = local_declaration_seen or any(
+                _extract_declarator_identifier(
+                    child.child_by_field_name("declarator")
+                    if child.type == "init_declarator"
+                    else child,
+                    function.source,
+                )
+                == table_symbol
+                for child in candidate.named_children
+            )
+            found = initialized_array(candidate, function.source)
+            if found is not None:
+                declarations.append(
+                    (found[0], found[1], expression.file_name, function.source, False)
+                )
+        if local_declaration_seen and not declarations:
+            return None
+        if not declarations:
+            cached_global = self._global_table_cache.get(table_symbol)
+            if cached_global is not None:
+                return replace(cached_global, selector=selector)
+            for file_name, (tree, source) in self.trees.items():
+                if tree is None:
+                    continue
+                for candidate in tree.root_node.named_children:
+                    if candidate.type != "declaration":
+                        continue
+                    found = initialized_array(candidate, source)
+                    if found is not None:
+                        declarations.append(
+                            (found[0], found[1], file_name, source, True)
+                        )
+        if len(declarations) != 1:
+            return None
+        declaration, elements, declaration_file, declaration_source, global_scope = (
+            declarations[0]
+        )
+
+        # A later write or address escape invalidates the initializer proof.
+        scopes = (
+            [(file_name, tree.root_node, source) for file_name, (tree, source) in self.trees.items()]
+            if global_scope
+            else [(expression.file_name, function.ast_node, function.source)]
+        )
+        bare_symbol = re.compile(rf"\b{re.escape(table_symbol)}\b(?!\s*\[)")
+        for scope_file, root, source in scopes:
+            if root is None:
+                continue
+            for candidate in _walk(root):
+                if candidate.id == declaration.id and scope_file == declaration_file:
+                    continue
+                if (
+                    not global_scope
+                    and (
+                        candidate.start_byte <= declaration.end_byte
+                        or candidate.start_byte >= node.start_byte
+                        or candidate.start_byte <= node.start_byte < candidate.end_byte
+                    )
+                ):
+                    continue
+                if candidate.type in {"assignment_expression", "update_expression"}:
+                    left = candidate.child_by_field_name("left") or candidate
+                    if re.search(
+                        rf"\b{re.escape(table_symbol)}\b", node_text(left, source)
+                    ):
+                        return None
+                if candidate.type == "pointer_expression" and re.search(
+                    rf"\b{re.escape(table_symbol)}\b", node_text(candidate, source)
+                ):
+                    return None
+                if candidate.type == "call_expression":
+                    arguments = candidate.child_by_field_name("arguments")
+                    if arguments is not None and bare_symbol.search(
+                        node_text(arguments, source)
+                    ):
+                        return None
+
+        values: list[tuple[str, str, int, str]] = []
+        for element in elements:
+            raw = strip_outer_parens(node_text(element, declaration_source).strip())
+            resolved = self._resolve_macro(raw, declaration_file)
+            declaration_path = self.project_structure.get(
+                declaration_file, expression.file_path
+            )
+            if resolved is not None:
+                values.append(
+                    (
+                        resolved[0],
+                        resolved[1] or declaration_path,
+                        resolved[2] or element.start_point.row + 1,
+                        raw,
+                    )
+                )
+            elif self._literal(raw):
+                values.append(
+                    (raw, declaration_path, element.start_point.row + 1, raw)
+                )
+            else:
+                return None
+        lookup = TableLookup(
+            selector=selector,
+            values=tuple(values),
+            table_symbol=table_symbol,
+            declaration_file=self.project_structure.get(
+                declaration_file, expression.file_path
+            ),
+            declaration_line=declaration.start_point.row + 1,
+            global_scope=global_scope,
+        )
+        if global_scope:
+            self._global_table_cache[table_symbol] = lookup
+        return lookup
+
+    def _indexed_table_facts(
+        self,
+        lookup: TableLookup,
+        expression: Expression,
+        site: IndexedSite,
+        query: Query,
+    ) -> list[Fact] | None:
+        """Select table entries only from proven indices."""
+        selector = strip_outer_parens(lookup.selector.strip())
+        selector_expressions: list[Expression]
+        bounded_indices = self._bounded_table_indices(expression, site)
+        direct = self._constant_from_text(selector, site.file_name)
+        if bounded_indices is not None:
+            if any(
+                index < 0 or index >= len(lookup.values)
+                for index in bounded_indices
+            ):
+                return None
+            selector_expressions = [
+                Expression(
+                    text=str(index),
+                    node=expression.node,
+                    file_name=expression.file_name,
+                    file_path=expression.file_path,
+                    line=expression.line,
+                )
+                for index in bounded_indices
+            ]
+        elif direct is not None:
+            selector_expressions = [
+                Expression(
+                    text=direct[0],
+                    node=expression.node,
+                    file_name=expression.file_name,
+                    file_path=expression.file_path,
+                    line=expression.line,
+                )
+            ]
+        elif _IDENTIFIER.fullmatch(selector):
+            function = self.functions.get(site.caller_id)
+            unsupported_write = False
+            if function is not None and function.ast_node is not None:
+                for candidate in _walk(function.ast_node):
+                    if candidate.start_byte >= site.start_byte:
+                        continue
+                    if candidate.type == "update_expression" and re.fullmatch(
+                        rf"\s*(?:\+\+|--)?\s*{re.escape(selector)}\s*(?:\+\+|--)?\s*",
+                        node_text(candidate, function.source),
+                    ):
+                        unsupported_write = True
+                        break
+                    if candidate.type == "assignment_expression":
+                        left = candidate.child_by_field_name("left")
+                        right = candidate.child_by_field_name("right")
+                        if (
+                            left is not None
+                            and right is not None
+                            and node_text(left, function.source).strip() == selector
+                            and function.source[left.end_byte:right.start_byte].strip()
+                            != b"="
+                        ):
+                            unsupported_write = True
+                            break
+            selector_expressions = (
+                []
+                if unsupported_write and lookup.global_scope
+                else self._local_reaching_definitions(site, selector)
+            )
+            if unsupported_write and not lookup.global_scope:
+                return None
+        elif lookup.global_scope:
+            selector_expressions = []
+        else:
+            return None
+        if not selector_expressions and not lookup.global_scope:
+            return None
+
+        indices: list[int] = []
+        unresolved_selector = False
+        for candidate in selector_expressions:
+            resolved = self._constant_from_text(
+                candidate.text, candidate.file_name
+            )
+            if resolved is None:
+                unresolved_selector = True
+                break
+            index = self._parse_c_integer_literal(resolved[0])
+            if index is None:
+                unresolved_selector = True
+                break
+            if 0 <= index < len(lookup.values) and index not in indices:
+                indices.append(index)
+        if lookup.global_scope and (not selector_expressions or unresolved_selector):
+            return None
+        elif unresolved_selector:
+            return None
+        if not indices:
+            return None
+
+        set_id = hashlib.sha1(
+            f"{site.site_id}:{lookup.table_symbol}:{','.join(map(str, indices))}".encode(
+                "utf-8", errors="replace"
+            )
+        ).hexdigest()[:16]
+        return [
+            Fact(
+                value=lookup.values[index][0],
+                origin_kind="CONST_TABLE",
+                source_file=lookup.values[index][1],
+                source_line=lookup.values[index][2],
+                source_expr=lookup.values[index][3],
+                origin_query=query.token(),
+                source_site_id=(
+                    f"{lookup.values[index][1]}:{lookup.values[index][2]}:"
+                    f"{lookup.table_symbol}[{index}]"
+                ),
+                link_method="TABLE_LOOKUP",
+                metadata={
+                    "table_file": lookup.declaration_file,
+                    "table_line": lookup.declaration_line,
+                    "table_symbol": lookup.table_symbol,
+                    "index_expression": lookup.selector,
+                    "selector_source_file": expression.file_path,
+                    "selector_source_line": expression.line,
+                    "selector_source_expr": lookup.selector,
+                    "bound": len(lookup.values),
+                    "set_id": set_id,
+                    "source_role": "TABLE_VALUE",
+                    "trace_complete": True,
+                    "termination_reason": "TABLE_SET",
+                },
+            )
+            for index in indices
+        ]
+
+    def _bounded_table_indices(
+        self, expression: Expression, site: IndexedSite
+    ) -> tuple[int, ...] | None:
+        """Evaluate a small, source-proven integer domain for an array index."""
+        node = expression.node
+        if node is None or node.type != "subscript_expression":
+            return None
+        named = list(node.named_children)
+        if len(named) != 2:
+            return None
+        values = self._bounded_integer_values(named[1], site, frozenset())
+        if not values or len(values) > 32:
+            return None
+        return tuple(sorted(values))
+
+    def _bounded_integer_values(
+        self,
+        node: Any,
+        site: IndexedSite,
+        seen: frozenset[str],
+    ) -> set[int] | None:
+        """Evaluate one expression over source-proven identifier domains."""
+        text = strip_outer_parens(node_text(node, site.source).strip())
+        constant_resolver = self._constant_resolver(site.file_name)
+        domains: dict[str, set[int]] = {}
+        identifier_nodes: dict[str, Any] = {}
+        for candidate in _walk(node):
+            if candidate.type != "identifier":
+                continue
+            name = node_text(candidate, site.source).strip()
+            constant = constant_resolver(name)
+            if isinstance(constant, int) and not isinstance(constant, bool):
+                continue
+            identifier_nodes.setdefault(name, candidate)
+        for name, identifier_node in identifier_nodes.items():
+            values = self._bounded_identifier_values(
+                identifier_node, name, site, seen
+            )
+            if values is None:
+                return None
+            domains[name] = values
+
+        environments: list[dict[str, int]] = [{}]
+        for name in sorted(domains):
+            environments = [
+                {**environment, name: value}
+                for environment in environments
+                for value in sorted(domains[name])
+            ]
+            if len(environments) > 32:
+                return None
+
+        results: set[int] = set()
+        for environment in environments:
+            def resolve(name: str) -> Any | None:
+                if name in environment:
+                    return environment[name]
+                return constant_resolver(name)
+
+            try:
+                ok, value = evaluate_formula(text, resolve_constant=resolve)
+            except (FormulaError, ValueError, TypeError):
+                return None
+            if not ok or not isinstance(value, int) or isinstance(value, bool):
+                return None
+            results.add(value)
+        return results if 0 < len(results) <= 32 else None
+
+    def _bounded_identifier_values(
+        self,
+        node: Any,
+        name: str,
+        site: IndexedSite,
+        seen: frozenset[str],
+    ) -> set[int] | None:
+        """Find a finite domain for one local without guessing mutations."""
+        loop_values = self._bounded_for_index(node, name, site)
+        if loop_values is not None:
+            return loop_values
+        if name in seen:
+            return None
+        function = self.functions.get(site.caller_id)
+        if function is None or function.ast_node is None:
+            return None
+        for candidate in _walk(function.ast_node):
+            if candidate.start_byte >= site.start_byte:
+                continue
+            candidate_text = node_text(candidate, function.source)
+            if candidate.type == "update_expression" and re.search(
+                rf"\b{re.escape(name)}\b", candidate_text
+            ):
+                return None
+            if candidate.type == "assignment_expression":
+                left = candidate.child_by_field_name("left")
+                right = candidate.child_by_field_name("right")
+                if (
+                    left is not None
+                    and right is not None
+                    and node_text(left, function.source).strip() == name
+                    and function.source[left.end_byte:right.start_byte].strip()
+                    != b"="
+                ):
+                    return None
+            if candidate.type in {"pointer_expression", "unary_expression"} and re.fullmatch(
+                rf"\s*&\s*{re.escape(name)}\s*", candidate_text
+            ):
+                return None
+        definitions = self._local_reaching_definitions(site, name)
+        if not definitions:
+            return None
+        values: set[int] = set()
+        for definition in definitions:
+            if definition.node is None:
+                return None
+            definition_site = replace(site, start_byte=definition.node.start_byte)
+            resolved = self._bounded_integer_values(
+                definition.node, definition_site, seen | {name}
+            )
+            if resolved is None:
+                return None
+            values.update(resolved)
+            if len(values) > 32:
+                return None
+        return values or None
+
+    def _bounded_for_index(
+        self, node: Any, name: str, site: IndexedSite
+    ) -> set[int] | None:
+        """Prove the values of ``name`` inside a canonical bounded for-loop."""
+        current = node.parent
+        while current is not None:
+            if current.type != "for_statement":
+                current = current.parent
+                continue
+            body = current.child_by_field_name("body")
+            if body is None or not self._contains(body, node):
+                current = current.parent
+                continue
+            initializer = current.child_by_field_name("initializer")
+            condition = current.child_by_field_name("condition")
+            update = current.child_by_field_name("update")
+            if initializer is None or condition is None or update is None:
+                return None
+            init_match = re.fullmatch(
+                rf"\s*{re.escape(name)}\s*=\s*(.+?)\s*",
+                node_text(initializer, site.source),
+            )
+            condition_match = re.fullmatch(
+                rf"\s*{re.escape(name)}\s*(<|<=|>|>=)\s*(.+?)\s*",
+                node_text(condition, site.source),
+            )
+            update_text = re.sub(r"\s+", "", node_text(update, site.source))
+            if init_match is None or condition_match is None:
+                return None
+            start_value = self._constant_from_text(init_match.group(1), site.file_name)
+            bound_value = self._constant_from_text(condition_match.group(2), site.file_name)
+            start = (
+                self._parse_c_integer_literal(start_value[0])
+                if start_value is not None
+                else None
+            )
+            bound = (
+                self._parse_c_integer_literal(bound_value[0])
+                if bound_value is not None
+                else None
+            )
+            if start is None or bound is None:
+                return None
+            if update_text in {f"{name}++", f"++{name}"}:
+                step = 1
+            elif update_text in {f"{name}--", f"--{name}"}:
+                step = -1
+            else:
+                return None
+            operator = condition_match.group(1)
+            if (step > 0 and operator not in {"<", "<="}) or (
+                step < 0 and operator not in {">", ">="}
+            ):
+                return None
+            stop = bound + (1 if operator == "<=" else -1 if operator == ">=" else 0)
+            values = list(range(start, stop, step))
+            return set(values) if 0 < len(values) <= 32 else None
+        return None
+
+    def _table_selector_value(self, selector: str, file_name: str) -> int | None:
+        value = self._parse_c_integer_literal(strip_outer_parens(selector))
+        if value is not None:
+            return value
+        resolved = self._constant_from_text(selector, file_name)
+        if resolved is None:
+            return None
+        return self._parse_c_integer_literal(resolved[0])
+
+    def _local_table_selector_transfers(
+        self,
+        arm: RouteArm,
+        current_function: FunctionInfo,
+        selected_site: IndexedSite,
+    ) -> list[RouteArm] | None:
+        """Resolve a table selector from literal same-function definitions.
+
+        This is deliberately narrower than general local value-flow: it is
+        used only for a selector already tied to a source-backed table.  A
+        non-literal definition, missing branch, or ambiguous expression stays
+        on the normal transfer path.
+        """
+        pending = [binding for binding in arm.bindings if binding.kind == "EXPRESSION"]
+        if len(pending) != 1 or pending[0].target_arg not in arm.table_lookups:
+            return None
+        binding = pending[0]
+        selector = strip_outer_parens(binding.text.strip())
+        if not _IDENTIFIER.fullmatch(selector):
+            return None
+        definitions = self._local_reaching_definitions(selected_site, selector)
+        if not definitions:
+            return None
+
+        result: list[RouteArm] = []
+        for definition in definitions:
+            if self._table_selector_value(
+                definition.text, selected_site.file_name
+            ) is None:
+                return None
+            bindings = [
+                Binding(
+                    item.target_arg,
+                    "EXPRESSION",
+                    strip_outer_parens(definition.text.strip()),
+                )
+                if item is binding
+                else item
+                for item in arm.bindings
+            ]
+            sources = {
+                key: dict(value) for key, value in arm.source_by_arg.items()
+            }
+            sources[binding.target_arg] = {
+                **sources.get(binding.target_arg, {}),
+                "file": definition.file_path,
+                "line": definition.line,
+                "expr": definition.text.strip(),
+                "source_site_id": (
+                    f"{definition.file_name}:{definition.line}:"
+                    f"{definition.text.strip()}"
+                ),
+            }
+            result.append(
+                RouteArm(
+                    route_id=arm.route_id,
+                    correlation_id=arm.correlation_id,
+                    bindings=bindings,
+                    guards=[*arm.guards, *definition.guards],
+                    evidence=list(arm.evidence),
+                    transfer_chain=[
+                        *arm.transfer_chain,
+                        f"{current_function.function_id}:"
+                        f"{selected_site.site_id} "
+                        f"{selector}={definition.text.strip()}",
+                    ],
+                    table_lookups=dict(arm.table_lookups),
+                    source_by_arg=sources,
+                )
+            )
+        return result
+
+    def _forward_table_selector_parameter(
+        self,
+        arm: RouteArm,
+        current_function: FunctionInfo,
+        remaining_edges: list[CallerEdge],
+    ) -> RouteArm | None:
+        """Carry an indexed-table selector parameter to its direct caller."""
+        if not remaining_edges or remaining_edges[0].synthetic_callback:
+            return None
+        pending = [
+            binding for binding in arm.bindings if binding.kind == "EXPRESSION"
+        ]
+        if not pending:
+            return None
+        for binding in pending:
+            if binding.target_arg not in arm.table_lookups:
+                return None
+            match = re.fullmatch(r"\$(\d+)", binding.text.strip())
+            if (
+                match is None
+                or int(match.group(1)) < 1
+                or int(match.group(1)) > len(current_function.parameters)
+            ):
+                return None
+        return self._substitute_arm(arm, remaining_edges[0])
 
     def _expression_source(self, expression: Expression) -> dict[str, Any]:
         return {
@@ -2648,6 +3792,13 @@ class ValueFlowResolver:
             return macro[0], "CONST" if value in visible_enum_values else "MACRO"
         return None
 
+    @staticmethod
+    def _runtime_input_name(text: str) -> str | None:
+        match = _DIRECT_CALL.match(strip_outer_parens(text.strip()))
+        if match and match.group(1) in _RUNTIME_INPUT_CALLS:
+            return match.group(1)
+        return None
+
     def _constant_resolver(self, file_name: str) -> Callable[[str], Any | None]:
         def resolve(name: str) -> Any | None:
             direct = self._constant_from_text(name, file_name)
@@ -2663,8 +3814,82 @@ class ValueFlowResolver:
         """Settle only deterministic leaves; never interpret local C syntax."""
         bindings: list[Binding] = []
         for binding in arm.bindings:
+            lookup = arm.table_lookups.get(binding.target_arg)
+            if lookup is not None and binding.kind == "EXPRESSION":
+                selector = strip_outer_parens(binding.text.strip())
+                selector_value = self._table_selector_value(selector, site.file_name)
+                if selector_value is None:
+                    bindings.append(binding)
+                    continue
+                source = dict(arm.source_by_arg.get(binding.target_arg) or {})
+                if selector_value < 0 or selector_value >= len(lookup.values):
+                    bindings.append(Binding(binding.target_arg, "UNKNOWN", "UNRESOLVED"))
+                    source["expr"] = selector
+                    source["metadata"] = {
+                        **dict(source.get("metadata") or {}),
+                        "source_role": "TABLE_VALUE",
+                        "trace_complete": False,
+                        "termination_reason": "TABLE_INDEX_OUT_OF_RANGE",
+                    }
+                    arm.source_by_arg[binding.target_arg] = source
+                    continue
+                value, table_file, table_line, source_expr = lookup.values[selector_value]
+                bindings.append(Binding(binding.target_arg, "EXACT", value))
+                source.update(
+                    {
+                        "file": table_file,
+                        "line": table_line,
+                        "expr": source_expr,
+                        "source_site_id": f"{table_file}:{table_line}:{source_expr}",
+                        "origin_kind": "CONST_TABLE",
+                        "link_method": "TABLE_LOOKUP",
+                        "metadata": {
+                            **dict(source.get("metadata") or {}),
+                            "table_file": table_file,
+                            "table_line": table_line,
+                            "table_symbol": lookup.table_symbol,
+                            "index_expression": lookup.selector,
+                            "selector_source_expr": selector,
+                            "selector_source_file": source.get("file") or site.file_path,
+                            "selector_source_line": source.get("line") or site.line,
+                            "bound": len(lookup.values),
+                            "source_role": "TABLE_VALUE",
+                            "trace_complete": True,
+                            "termination_reason": "TABLE_SET",
+                            "set_id": hashlib.sha1(
+                                f"{site.site_id}:{lookup.table_symbol}".encode()
+                            ).hexdigest()[:16],
+                        },
+                    }
+                )
+                arm.source_by_arg[binding.target_arg] = source
+                continue
             if binding.kind != "EXPRESSION":
                 bindings.append(binding)
+                continue
+            runtime_input = self._runtime_input_name(binding.text)
+            if runtime_input is not None:
+                bindings.append(
+                    Binding(binding.target_arg, "EXTERNAL", binding.text.strip())
+                )
+                source = dict(arm.source_by_arg.get(binding.target_arg) or {})
+                source.update(
+                    {
+                        "file": source.get("file") or site.file_path,
+                        "line": source.get("line") or site.line,
+                        "expr": binding.text.strip(),
+                        "source_site_id": source.get("source_site_id") or site.site_id,
+                        "origin_kind": "RUNTIME_DATA",
+                        "metadata": {
+                            **dict(source.get("metadata") or {}),
+                            "source_role": "GENESIS",
+                            "trace_complete": True,
+                            "termination_reason": "RUNTIME_INPUT",
+                            "runtime_input": runtime_input,
+                        },
+                    }
+                )
+                arm.source_by_arg[binding.target_arg] = source
                 continue
             direct = self._constant_from_text(binding.text, site.file_name)
             if direct is not None:
@@ -2793,52 +4018,34 @@ class ValueFlowResolver:
         return best
 
     def _repair_span(self, evidence, source: bytes, fn_start: int, fn_end: int, *, same_file: bool) -> tuple[int, int] | None:
-        """Return a usable (start, end) byte span, or None.
+        """Locate the cited snippet in source and return its (start, end) bytes.
 
-        Models reliably get byte arithmetic wrong. The common failures are a
-        degenerate span (start == end), an inverted span, and offsets given
-        relative to the function body rather than the file. Each is repairable
-        from source, so none of them should cost a whole answer.
+        The model never reports byte offsets (LLMs cannot count bytes
+        reliably); the snippet IS the evidence and the resolver finds it.
+        Lookup tries, in order: the exact snippet, the snippet with trailing
+        whitespace stripped per line, and the first 24 characters with all
+        whitespace collapsed (models occasionally trim or break long lines).
+        A snippet that does not occur in the file is not evidence, so it
+        yields no span and the answer is rejected downstream.
         """
-        limit = len(source)
-        start = max(0, min(int(evidence.start_byte), limit))
-        end = max(0, min(int(evidence.end_byte), limit))
-
-        # 1. An exact snippet beats any offset the model computed.
         snippet = (evidence.snippet or "").strip()
-        if snippet:
-            raw = snippet.encode("latin-1", errors="replace")
+        if not snippet:
+            return None
+        candidates = [snippet]
+        stripped = "\n".join(line.rstrip() for line in snippet.splitlines()).strip()
+        if stripped != snippet:
+            candidates.append(stripped)
+        head = " ".join(snippet.split())[:24]
+        if len(head) >= 12 and head != snippet and head != stripped:
+            candidates.append(head)
+        for text in candidates:
+            raw = text.encode("latin-1", errors="replace")
             found = source.find(raw, fn_start, fn_end) if same_file and fn_end else -1
             if found < 0:
                 found = source.find(raw)
             if found >= 0:
                 return found, found + len(raw)
-
-        # 2. Offsets given relative to the function body.
-        if same_file and fn_end and end > start and end <= (fn_end - fn_start):
-            shifted_start, shifted_end = fn_start + start, fn_start + end
-            if shifted_end <= fn_end:
-                return shifted_start, shifted_end
-
-        # 3. A well-formed absolute span.
-        if end > start:
-            return start, end
-
-        # 4. Degenerate or inverted: widen to the line containing the anchor.
-        #    This is the reported start_byte == end_byte case.  Offsets of 0/0
-        #    carry no anchor at all -- the prompt tells the model to send that
-        #    when it is unsure -- so do not invent a span at the top of the
-        #    file, whose text belongs to some unrelated function and would then
-        #    count as evidence for the literal-coverage check.
-        if not start and not end:
-            return None
-        anchor = start if start else end
-        if not (0 <= anchor < limit):
-            return None
-        line_start = source.rfind(b"\n", 0, anchor) + 1
-        line_end = source.find(b"\n", anchor)
-        line_end = limit if line_end < 0 else line_end
-        return (line_start, line_end) if line_end > line_start else None
+        return None
 
     def _validate_transfer_answer(
         self,
@@ -3006,38 +4213,57 @@ class ValueFlowResolver:
             guards=tuple(arm.guards),
             macro_digest=macro_digest,
         )
+        call_text = (
+            node_text(selected_site.ast_node, selected_site.source)
+            if selected_site.ast_node is not None
+            else selected_site.callee_name
+        )
+        request = TransferRequest(
+            route=route,
+            function_id=current_function.function_id,
+            function_name=current_function.node.name,
+            function_file=current_function.node.file_name,
+            function_source=function_text,
+            function_start_byte=function_base,
+            parameters=tuple(current_function.parameters),
+            selected_site_id=selected_site.site_id,
+            selected_call_text=call_text,
+            selected_call_start_byte=(
+                selected_site.start_byte if selected_site.byte_range_known else -1
+            ),
+            selected_call_end_byte=(
+                selected_site.end_byte if selected_site.byte_range_known else -1
+            ),
+            bindings=request_bindings,
+            guards=tuple(arm.guards),
+            macro_context=macro_context,
+        )
         cached = self.transfer_cache.get(key)
-        request: TransferRequest | None = None
         if cached is not None:
             self.transfer_cache_hits += 1
             raw_answer = cached.get("answer")
         else:
-            self.transfer_cache_misses += 1
-            if self.transfer_resolver is None:
-                return None
-            call_text = node_text(selected_site.ast_node, selected_site.source) if selected_site.ast_node is not None else selected_site.callee_name
-            request = TransferRequest(
-                route=route,
-                function_id=current_function.function_id,
-                function_name=current_function.node.name,
-                function_file=current_function.node.file_name,
-                function_source=function_text,
-                function_start_byte=function_base,
-                parameters=tuple(current_function.parameters),
-                selected_site_id=selected_site.site_id,
-                selected_call_text=call_text,
-                selected_call_start_byte=(
-                    selected_site.start_byte if selected_site.byte_range_known else -1
-                ),
-                selected_call_end_byte=(
-                    selected_site.end_byte if selected_site.byte_range_known else -1
-                ),
-                bindings=request_bindings,
-                guards=tuple(arm.guards),
-                macro_context=macro_context,
-            )
-            self.transfer_request_count += 1
-            raw_answer = await self._await_llm(self.transfer_resolver, request)
+            future = self.transfer_in_flight.get(key)
+            if future is not None:
+                self.transfer_cache_hits += 1
+                raw_answer = await asyncio.shield(future)
+            else:
+                self.transfer_cache_misses += 1
+                if self.transfer_resolver is None:
+                    return None
+                future = asyncio.get_running_loop().create_future()
+                self.transfer_in_flight[key] = future
+                self.transfer_request_count += 1
+                try:
+                    raw_answer = await self._await_llm(self.transfer_resolver, request)
+                    if not future.done():
+                        future.set_result(raw_answer)
+                except BaseException as exc:
+                    if not future.done():
+                        future.set_exception(exc)
+                    raise
+                finally:
+                    self.transfer_in_flight.pop(key, None)
         if raw_answer is None:
             self.transfer_rejections["llm_returned_none"] += 1
             return None
@@ -3113,10 +4339,15 @@ class ValueFlowResolver:
                         for item in model_arm.bindings
                     ),
                 ],
+                table_lookups=dict(arm.table_lookups),
                 source_by_arg={key: dict(value) for key, value in arm.source_by_arg.items()},
             )
             for binding in model_arm.bindings:
-                if binding.kind == "EXPRESSION":
+                runtime_producer = bool(
+                    binding.kind == "UNKNOWN"
+                    and _DIRECT_CALL.match(binding.expression.strip())
+                )
+                if binding.kind == "EXPRESSION" or runtime_producer:
                     source = next(
                         (
                             span for span in child.evidence
@@ -3125,13 +4356,41 @@ class ValueFlowResolver:
                         ),
                         None,
                     )
+                    if source is None and runtime_producer:
+                        source = next(
+                            (
+                                span
+                                for span in validated_spans
+                                if span.file == current_function.node.file_name
+                            ),
+                            None,
+                        )
                     if source is not None:
+                        previous = dict(
+                            child.source_by_arg.get(binding.target_arg) or {}
+                        )
+                        metadata = dict(previous.get("metadata") or {})
+                        if runtime_producer:
+                            metadata.update(
+                                {
+                                    "source_role": "GENESIS",
+                                    "trace_complete": True,
+                                    "termination_reason": "RUNTIME_PRODUCER",
+                                    "runtime_producer": _DIRECT_CALL.match(
+                                        binding.expression.strip()
+                                    ).group(1),
+                                }
+                            )
                         child.source_by_arg[binding.target_arg] = {
                             "file": self.project_structure.get(source.file, source.file),
                             "line": self.trees[source.file][1][:source.start_byte].count(b"\n") + 1,
                             "expr": binding.expression,
                             "source_site_id": f"{source.file}:{source.start_byte}:{source.end_byte}",
-                            "origin_kind": "CONST",
+                            "origin_kind": (
+                                "RUNTIME_DATA" if runtime_producer else "CONST"
+                            ),
+                            "runtime_value": previous.get("expr", binding.expression),
+                            "metadata": metadata,
                         }
             output.append(child)
         return output
@@ -3151,6 +4410,85 @@ class ValueFlowResolver:
             remaining.append(guard)
         arm.guards = remaining
         return arm
+
+    def _target_site_guards(self, site: IndexedSite) -> list[str]:
+        """Return simple formal-parameter guards enclosing a target call.
+
+        Transfer arms are often produced at an owning open and later emitted
+        for a handle consumer.  The consumer's lexical branch is a separate
+        constraint, so retain only guards that can be expressed in the same
+        small placeholder formula language used by transfer arms.
+        """
+        function = self.functions.get(site.caller_id)
+        node = site.ast_node
+        if function is None or node is None:
+            return []
+        parameters = {
+            name: f"${index}"
+            for index, name in enumerate(function.parameters, start=1)
+        }
+        guards: list[str] = []
+        child = node
+        parent = node.parent
+        while parent is not None:
+            if parent.type == "if_statement":
+                consequence = parent.child_by_field_name("consequence")
+                alternative = parent.child_by_field_name("alternative")
+                if consequence is not None and self._contains(consequence, child):
+                    polarity = True
+                elif alternative is not None and self._contains(alternative, child):
+                    polarity = False
+                else:
+                    polarity = None
+                condition = parent.child_by_field_name("condition")
+                if polarity is not None and condition is not None:
+                    text = strip_outer_parens(node_text(condition, site.source))
+                    for name, placeholder in parameters.items():
+                        text = re.sub(rf"\b{re.escape(name)}\b", placeholder, text)
+                    match = re.fullmatch(r"(.+?)\s*(==|!=)\s*(.+)", text)
+                    if match and not any(
+                        operator in text for operator in ("&&", "||")
+                    ):
+                        left, operator, right = (
+                            part.strip() for part in match.groups()
+                        )
+                        if not polarity:
+                            operator = "==" if operator == "!=" else "!="
+                        guards.append(f"{left} {operator} {right}")
+                    elif text:
+                        guards.append(f"{text} {'!=' if polarity else '=='} 0")
+            child = parent
+            parent = parent.parent
+        return guards
+
+    @staticmethod
+    def _simple_guard_atom(guard: str) -> tuple[str, str, str] | None:
+        text = strip_outer_parens(guard)
+        match = re.fullmatch(r"(.+?)\s*(==|!=)\s*(.+)", text)
+        if not match or any(operator in text for operator in ("&&", "||")):
+            return None
+        left, operator, right = (" ".join(part.split()) for part in match.groups())
+        # Treat `0 != $4` and `$4 != 0` as the same atom.
+        if placeholder_indices(left) == () and placeholder_indices(right):
+            left, right = right, left
+        return left, operator, right
+
+    def _guards_contradict(
+        self, producer_guards: Iterable[str], target_guards: Iterable[str]
+    ) -> bool:
+        producer_atoms = {
+            atom for guard in producer_guards if (atom := self._simple_guard_atom(guard))
+        }
+        target_atoms = {
+            atom for guard in target_guards if (atom := self._simple_guard_atom(guard))
+        }
+        return any(
+            left == other_left
+            and right == other_right
+            and {operator, other_operator} == {"==", "!="}
+            for left, operator, right in producer_atoms
+            for other_left, other_operator, other_right in target_atoms
+        )
 
     def _substitute_arm(self, arm: RouteArm, edge: CallerEdge) -> RouteArm | None:
         site = self.sites.get(edge.site_id)
@@ -3184,18 +4522,39 @@ class ValueFlowResolver:
                 bindings.append(binding)
                 continue
             substituted = substitute_placeholders(binding.text, actuals)
+            caller = self.functions.get(edge.caller_id)
+            normalized = strip_outer_parens(substituted.strip())
+            if caller is not None and normalized in caller.parameters:
+                substituted = f"${caller.parameters.index(normalized) + 1}"
             bindings.append(Binding(binding.target_arg, binding.kind, substituted))
             if substituted != binding.text:
-                first = next((site.argument(index) for index in indexes if site.argument(index) is not None), None)
-                if first is not None:
-                    sources[binding.target_arg] = self._expression_source(first)
+                if binding.target_arg not in arm.table_lookups:
+                    first = next((site.argument(index) for index in indexes if site.argument(index) is not None), None)
+                    if first is not None:
+                        sources[binding.target_arg] = self._expression_source(first)
+        substituted_guards = [
+            substitute_placeholders(guard, actuals) for guard in arm.guards
+        ]
+        semantic = json.dumps(
+            {
+                "bindings": [
+                    (item.target_arg, item.kind, " ".join(item.text.split()))
+                    for item in bindings
+                ],
+                "guards": [" ".join(item.split()) for item in substituted_guards],
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        correlation = hashlib.sha256(semantic.encode("utf-8")).hexdigest()[:20]
         return RouteArm(
             route_id=arm.route_id,
-            correlation_id=arm.correlation_id,
+            correlation_id=f"corr:{correlation}",
             bindings=bindings,
-            guards=[substitute_placeholders(guard, actuals) for guard in arm.guards],
+            guards=substituted_guards,
             evidence=list(arm.evidence),
             transfer_chain=list(arm.transfer_chain),
+            table_lookups=dict(arm.table_lookups),
             source_by_arg=sources,
         )
 
@@ -3258,6 +4617,120 @@ class ValueFlowResolver:
             labels.append(node.label_with_line(line=target_site.line))
         return labels
 
+    def _witness_route(
+        self,
+        *,
+        seed: Seed,
+        current_function_id: str,
+        suffix_edges: tuple[CallerEdge, ...] = (),
+        target_site_id: str | None = None,
+    ) -> RouteGuide:
+        """Build one deterministic root prefix plus value-carrying suffix."""
+        prefix: list[CallerEdge] = []
+        current = current_function_id
+        while True:
+            edge = self.reachability_predecessor.get(current)
+            if edge is None:
+                break
+            prefix.append(edge)
+            current = edge.caller_id
+        prefix.reverse()
+        edges = tuple([*prefix, *suffix_edges])
+        root = self.reachability_root.get(current_function_id, current_function_id)
+        reachability = (
+            "LOCAL_BACKWALK"
+            if seed.local_backwalk and current_function_id not in self.reachable
+            else (
+                "CALLBACK"
+                if any(edge.synthetic_callback for edge in edges)
+                else "DIRECT_ROOT"
+            )
+        )
+        site_id = target_site_id or seed.site.site_id
+        digest = hashlib.sha256(
+            "\0".join([root, *(edge.site_id for edge in edges), site_id]).encode(
+                "utf-8", errors="replace"
+            )
+        ).hexdigest()[:20]
+        return RouteGuide(
+            route_id=f"route:{digest}",
+            root_function_id=root,
+            edges=edges,
+            target_site_id=site_id,
+            reachability=reachability,
+        )
+
+    @staticmethod
+    def _backward_state_key(state: BackwardState) -> tuple:
+        return (
+            state.current_function_id,
+            state.selected_site_id,
+            tuple(
+                (
+                    item.target_arg,
+                    item.kind,
+                    " ".join(item.text.split()),
+                )
+                for item in sorted(state.arm.bindings, key=lambda value: value.target_arg)
+            ),
+            tuple(sorted(" ".join(guard.split()) for guard in state.arm.guards)),
+        )
+
+    def _search_limit_arm(
+        self,
+        *,
+        seed: Seed,
+        site: IndexedSite,
+        route: RouteGuide,
+        indices: tuple[int, ...],
+        expanded: int,
+        max_frontier: int,
+        max_depth: int,
+    ) -> RouteArm:
+        """Build the explicit incomplete alternative required after truncation."""
+        fallback_index = (
+            int(seed.config.get("handle_index") or 1)
+            if site.site_id != seed.site.site_id
+            else None
+        )
+        return RouteArm(
+            route_id=route.route_id,
+            correlation_id=f"corr:search-limit:{seed.site.site_id}",
+            bindings=[
+                Binding(index, "UNKNOWN", "SEARCH_LIMIT_REACHED")
+                for index in indices
+            ],
+            source_by_arg={
+                index: {
+                    "file": seed.site.file_path,
+                    "line": seed.site.line,
+                    "expr": (
+                        seed.site.target_argument(fallback_index or index).text
+                        if seed.site.target_argument(fallback_index or index) is not None
+                        else seed.target_function
+                    ),
+                    "source_site_id": seed.site.site_id,
+                    "metadata": {
+                        "source_role": "TARGET_FALLBACK",
+                        "trace_complete": False,
+                        "termination_reason": "SEARCH_LIMIT_REACHED",
+                        "failure_reason": "SEARCH_LIMIT_REACHED",
+                        "search_truncated": True,
+                        "search_states_expanded": expanded,
+                        "search_max_frontier": max_frontier,
+                        "search_max_depth": max_depth,
+                    },
+                }
+                for index in indices
+            },
+        )
+
+    def _record_search_limit(self, seed: Seed, diagnostic: str) -> None:
+        if seed.site.site_id not in self._search_limited_seed_ids:
+            self._search_limited_seed_ids.add(seed.site.site_id)
+            self.search_limit_seed_count += 1
+        self.transfer_diagnostics.append(diagnostic)
+
     def _fact_from_transfer_binding(
         self,
         *,
@@ -3270,25 +4743,71 @@ class ValueFlowResolver:
         target_site: IndexedSite | None = None,
     ) -> Fact:
         source = arm.source_by_arg.get(binding.target_arg) or {}
+        unresolved_expr = ""
         if binding.kind == "EXACT":
-            value = binding.text
-            origin = str(source.get("origin_kind") or "CONST")
-        elif binding.kind == "EXTERNAL":
-            value = binding.text or "EXTERNAL"
-            origin = str(source.get("origin_kind") or ("EXTERNAL_ENTRY" if "$" in value else "EXTERNAL_DATA"))
-        else:
-            sentinel = binding.text in {
-                "RECURSIVE", "UNRESOLVED", "missing argument", "HANDLE_AMBIGUOUS",
-            }
-            if self.external_unknown and not sentinel and binding.text.strip():
-                # An expression we could not trace further is still an
-                # answer: the legacy engine reports it as EXTERNAL_DATA
-                # rather than discarding it (P17).
-                value = binding.text
-                origin = "UNKNOWN_INDIRECT" if "(*" in binding.text else "EXTERNAL_DATA"
+            candidate = binding.text.strip()
+            if self._literal(candidate):
+                value = candidate
+                origin = str(source.get("origin_kind") or "CONST")
             else:
+                # EXACT is a model-facing schema option, so validate it again
+                # at the fact boundary. A variable or call expression is
+                # provenance, not a resolved value.
                 value = "UNRESOLVED"
-                origin = "RECURSIVE" if binding.text == "RECURSIVE" else "UNRESOLVED"
+                origin = "UNRESOLVED"
+                unresolved_expr = candidate
+        elif binding.kind == "EXTERNAL":
+            candidate = binding.text.strip() or "EXTERNAL"
+            direct_call = _DIRECT_CALL.match(candidate)
+            project_local_call = bool(
+                direct_call
+                and any(
+                    info.ast_node is not None
+                    for info in self._function_infos_named(direct_call.group(1))
+                )
+            )
+            if project_local_call:
+                value = "UNRESOLVED"
+                origin = "UNRESOLVED"
+                unresolved_expr = candidate
+            else:
+                value = candidate
+                source_origin = str(source.get("origin_kind") or "")
+                origin = (
+                    source_origin
+                    if source_origin in {
+                        "EXTERNAL_ENTRY",
+                        "EXTERNAL_DATA",
+                        "RUNTIME_DATA",
+                    }
+                    else (
+                        "EXTERNAL_ENTRY" if "$" in value else "EXTERNAL_DATA"
+                    )
+                )
+        else:
+            runtime_producer = (
+                binding.kind == "UNKNOWN"
+                and str(source.get("origin_kind") or "") == "RUNTIME_DATA"
+            )
+            if runtime_producer:
+                value = str(source.get("runtime_value") or binding.text)
+                origin = "RUNTIME_DATA"
+            else:
+                sentinel = binding.text in {
+                    "RECURSIVE",
+                    "UNRESOLVED",
+                    "missing argument",
+                    "HANDLE_AMBIGUOUS",
+                    "SEARCH_LIMIT_REACHED",
+                }
+                if self.external_unknown and not sentinel and binding.text.strip():
+                    # Keep the terminal expression in source_expr/metadata, not in
+                    # the value column where it could be mistaken for an answer.
+                    value = "UNRESOLVED"
+                    origin = "UNKNOWN_INDIRECT" if "(*" in binding.text else "UNRESOLVED"
+                else:
+                    value = "UNRESOLVED"
+                    origin = "RECURSIVE" if binding.text == "RECURSIVE" else "UNRESOLVED"
         metadata = {
             "route_id": route.route_id,
             "correlation_id": arm.correlation_id,
@@ -3299,18 +4818,39 @@ class ValueFlowResolver:
             ],
             "transfer_chain": list(arm.transfer_chain),
             "reachability": route.reachability,
+            "path_mode": "WITNESS",
+            "semantic_alternative_id": arm.correlation_id,
         }
-        if binding.kind == "UNKNOWN" and binding.text not in {
-            "RECURSIVE", "UNRESOLVED", "missing argument", "HANDLE_AMBIGUOUS",
+        metadata.update(dict(source.get("metadata") or {}))
+        failure_reasons = {
+            "RECURSIVE": "RECURSIVE_STATE",
+            "HANDLE_AMBIGUOUS": "HANDLE_AMBIGUOUS",
+            "SEARCH_LIMIT_REACHED": "SEARCH_LIMIT_REACHED",
+            "SUBSTITUTION_FAILED": "UNSUPPORTED_SYNTAX",
+        }
+        if binding.kind == "UNKNOWN" and binding.text in failure_reasons:
+            metadata.setdefault("trace_complete", False)
+            metadata.setdefault("termination_reason", failure_reasons[binding.text])
+        if unresolved_expr:
+            metadata["unresolved_expr"] = unresolved_expr
+        elif origin != "RUNTIME_DATA" and binding.kind == "UNKNOWN" and binding.text not in {
+            "RECURSIVE",
+            "UNRESOLVED",
+            "missing argument",
+            "HANDLE_AMBIGUOUS",
+            "SEARCH_LIMIT_REACHED",
         }:
             metadata["unresolved_expr"] = binding.text
         for edge in route.edges:
             if edge.synthetic_callback and edge.callback_meta:
                 metadata.update(edge.callback_meta)
+        used_target_fallback = not source.get("file") or not source.get("line")
         source_file = str(source.get("file") or seed.site.file_path)
         source_line = int(source.get("line") or seed.site.line)
         source_expr = str(source.get("expr") or binding.text)
-        return Fact(
+        if used_target_fallback:
+            metadata.setdefault("source_role", "TARGET_FALLBACK")
+        return self._with_provenance_metadata(Fact(
             value=value,
             origin_kind=origin,
             source_file=source_file,
@@ -3319,9 +4859,13 @@ class ValueFlowResolver:
             origin_query=json.dumps(["TRANSFER", route.route_id, arm.correlation_id, binding.target_arg], separators=(",", ":")),
             source_site_id=str(source.get("source_site_id") or route.target_site_id),
             resolved_by="LLM" if arm.transfer_chain else "SYNTAX",
-            link_method=link_method or ("LLM_TRANSFER" if arm.transfer_chain else ""),
+            link_method=(
+                link_method
+                or str(source.get("link_method") or "")
+                or ("LLM_TRANSFER" if arm.transfer_chain else "")
+            ),
             metadata=metadata,
-        )
+        ), target_site or seed.site)
 
     def _resolved_transfer_seed(
         self,
@@ -3334,6 +4878,11 @@ class ValueFlowResolver:
         link_method: str = "",
     ) -> list[ResolvedSeed]:
         labels = self._route_labels(route, target_site or seed.site)
+        target_guards = self._target_site_guards(target_site) if target_site else []
+        if target_guards and self._guards_contradict(arm.guards, target_guards):
+            return []
+        if target_guards:
+            arm = replace(arm, guards=[*arm.guards, *target_guards])
         rows: list[ResolvedSeed] = []
         for index in indices:
             binding = next((item for item in arm.bindings if item.target_arg == index), None)
@@ -3353,7 +4902,12 @@ class ValueFlowResolver:
             rows.append(
                 ResolvedSeed(
                     seed=seed,
-                    arg_index=index,
+                    arg_index=(
+                        int(seed.config.get("handle_index") or index)
+                        if target_site is not None
+                        and target_site.site_id != route.target_site_id
+                        else index
+                    ),
                     fact=fact,
                     operation=operation,
                     call_number=None,
@@ -3381,7 +4935,11 @@ class ValueFlowResolver:
         current_function = self.functions.get(start_site.caller_id)
         if current_function is None:
             return []
-        arms = [self.initial_route_arm(route=route, site=start_site, indices=indices)]
+        arms = self._initial_route_arms(
+            route=route,
+            site=start_site,
+            indices=indices,
+        )
         remaining_edges = list(reversed(route.edges))
         selected_site = start_site
         active: set[tuple[str, str, tuple[tuple[int, str, str], ...]]] = set()
@@ -3441,6 +4999,12 @@ class ValueFlowResolver:
                         )
                     )
                     continue
+                forwarded = self._forward_table_selector_parameter(
+                    arm, current_function, remaining_edges
+                )
+                if forwarded is not None:
+                    next_arms.append(forwarded)
+                    continue
                 state_key = (
                     current_function.function_id,
                     selected_site.site_id,
@@ -3454,13 +5018,17 @@ class ValueFlowResolver:
                     ]
                     terminal.append(arm)
                     continue
-                active.add(state_key)
-                transferred = await self.request_local_transfer(
-                    route=route,
-                    current_function=current_function,
-                    selected_site=selected_site,
-                    arm=arm,
+                transferred = self._local_table_selector_transfers(
+                    arm, current_function, selected_site
                 )
+                if transferred is None:
+                    active.add(state_key)
+                    transferred = await self.request_local_transfer(
+                        route=route,
+                        current_function=current_function,
+                        selected_site=selected_site,
+                        arm=arm,
+                    )
                 if not transferred:
                     arm.bindings = [
                         Binding(item.target_arg, "UNKNOWN", "UNRESOLVED")
@@ -3702,6 +5270,504 @@ class ValueFlowResolver:
             ),
         )
 
+    async def _search_seed_backward(
+        self,
+        *,
+        seed: Seed,
+        start_site: IndexedSite,
+        indices: tuple[int, ...],
+        operation: str,
+        output_target_site: IndexedSite | None = None,
+        link_method: str = "",
+        initial_suffix: tuple[CallerEdge, ...] = (),
+        initial_branch_id: str = "local",
+        state_budget: list[int] | None = None,
+    ) -> list[ResolvedSeed]:
+        """Bounded fair BFS over unique caller/value states for one seed."""
+        initial_route = self._witness_route(
+            seed=seed,
+            current_function_id=start_site.caller_id,
+            suffix_edges=initial_suffix,
+            target_site_id=start_site.site_id,
+        )
+        frontier: dict[int, OrderedDict[str, deque[BackwardState]]] = {}
+        queued: set[tuple] = set()
+        seen: set[tuple] = set()
+        terminal: list[tuple[RouteArm, BackwardState]] = []
+        truncated = False
+        limit_type = ""
+        max_frontier = 0
+        max_depth = 0
+        state_cap = (
+            self.search_state_cap
+            if state_budget is None
+            else max(0, int(state_budget[0]))
+        )
+
+        def frontier_size() -> int:
+            return sum(len(queue) for groups in frontier.values() for queue in groups.values())
+
+        def add(state: BackwardState) -> None:
+            nonlocal truncated, limit_type, max_frontier
+            if state.depth > self.search_depth_cap:
+                truncated = True
+                limit_type = limit_type or "depth"
+                return
+            key = self._backward_state_key(state)
+            if key in seen or key in queued:
+                self.search_deduplicated_state_count += 1
+                return
+            if len(seen) + len(queued) >= state_cap:
+                truncated = True
+                limit_type = limit_type or "states"
+                return
+            groups = frontier.setdefault(state.depth, OrderedDict())
+            groups.setdefault(state.branch_id, deque()).append(state)
+            queued.add(key)
+            max_frontier = max(max_frontier, frontier_size())
+
+        def pop() -> BackwardState:
+            depth = min(frontier)
+            groups = frontier[depth]
+            branch, states = groups.popitem(last=False)
+            state = states.popleft()
+            if states:
+                groups[branch] = states
+            if not groups:
+                del frontier[depth]
+            queued.discard(self._backward_state_key(state))
+            return state
+
+        initial_arms = self._initial_route_arms(
+            route=initial_route, site=start_site, indices=indices
+        )
+        if (
+            len(indices) == 1
+            and len(initial_arms) == 1
+            and any(not self._terminal(item) for item in initial_arms[0].bindings)
+            and self._locally_provable_argument(start_site, indices[0], set())
+        ):
+            index = indices[0]
+            query = ArgQuery(start_site.site_id, index, target=True)
+            facts = [
+                fact
+                for fact in await self.resolve(query)
+                if fact.resolved_by == "SYNTAX"
+                and fact.origin_kind in {"CONST", "MACRO", "CONST_TABLE"}
+            ]
+            if facts:
+                base = initial_arms[0]
+                initial_arms = []
+                for fact in facts:
+                    correlation = hashlib.sha1(
+                        repr(fact.source_key).encode("utf-8", errors="replace")
+                    ).hexdigest()[:16]
+                    initial_arms.append(
+                        RouteArm(
+                            route_id=base.route_id,
+                            correlation_id=f"{base.correlation_id}:syntax:{correlation}",
+                            bindings=[Binding(index, "EXACT", fact.value)],
+                            guards=list(base.guards),
+                            evidence=list(base.evidence),
+                            transfer_chain=list(base.transfer_chain),
+                            source_by_arg={
+                                index: {
+                                    "file": fact.source_file,
+                                    "line": fact.source_line,
+                                    "expr": fact.source_expr,
+                                    "source_site_id": fact.source_site_id,
+                                    "origin_kind": fact.origin_kind,
+                                    "link_method": fact.link_method,
+                                    "metadata": dict(fact.metadata or {}),
+                                }
+                            },
+                        )
+                    )
+
+        for arm in initial_arms:
+            add(
+                BackwardState(
+                    current_function_id=start_site.caller_id,
+                    selected_site_id=start_site.site_id,
+                    arm=arm,
+                    suffix_edges=initial_suffix,
+                    depth=0,
+                    branch_id=initial_branch_id,
+                )
+            )
+
+        while frontier:
+            if len(seen) >= state_cap:
+                truncated = True
+                limit_type = limit_type or "states"
+                break
+            state = pop()
+            key = self._backward_state_key(state)
+            if key in seen:
+                self.search_deduplicated_state_count += 1
+                continue
+            seen.add(key)
+            max_depth = max(max_depth, state.depth)
+            current_function = self.functions.get(state.current_function_id)
+            selected_site = self.sites.get(state.selected_site_id)
+            if current_function is None or selected_site is None:
+                state.arm = self._mark_external_or_unknown(state.arm, external=False)
+                terminal.append((state.arm, state))
+                continue
+
+            arm = self._settle_transfer_arm(state.arm, selected_site)
+            arm = self._evaluate_arm_guards(arm, selected_site.file_name)
+            if arm is None:
+                continue
+            state.arm = arm
+            pending = [item for item in arm.bindings if not self._terminal(item)]
+            parameter_guards = any(
+                placeholder_indices(guard) for guard in arm.guards
+            )
+            if not pending and not parameter_guards:
+                terminal.append((arm, state))
+                continue
+
+            if pending and all(
+                strip_outer_parens(item.text.strip()) in current_function.parameters
+                for item in pending
+            ) and not self.reverse_callers.get(current_function.function_id):
+                arm = self._mark_external_or_unknown(
+                    arm,
+                    external=True,
+                    parameter_names=tuple(current_function.parameters),
+                )
+                terminal.append((arm, state))
+                continue
+
+            local_transfers = self._local_table_selector_transfers(
+                arm, current_function, selected_site
+            )
+            if local_transfers is None:
+                transferred = [arm]
+                if pending and not all(
+                    placeholder_indices(item.text) for item in pending
+                ):
+                    route = self._witness_route(
+                        seed=seed,
+                        current_function_id=state.current_function_id,
+                        suffix_edges=state.suffix_edges,
+                        target_site_id=start_site.site_id,
+                    )
+                    transferred = await self.request_local_transfer(
+                        route=route,
+                        current_function=current_function,
+                        selected_site=selected_site,
+                        arm=arm,
+                    ) or []
+                    if not transferred:
+                        arm.bindings = [
+                            Binding(item.target_arg, "UNKNOWN", "UNRESOLVED")
+                            if item.kind == "EXPRESSION"
+                            else item
+                            for item in arm.bindings
+                        ]
+                        terminal.append((arm, state))
+                        continue
+            else:
+                transferred = local_transfers
+
+            for child in transferred:
+                child = self._settle_transfer_arm(child, selected_site)
+                child = self._evaluate_arm_guards(child, selected_site.file_name)
+                if child is None:
+                    continue
+                needs_caller = any(
+                    not self._terminal(item) for item in child.bindings
+                ) or any(placeholder_indices(guard) for guard in child.guards)
+                if not needs_caller:
+                    terminal.append((child, replace(state, arm=child)))
+                    continue
+
+                caller_edges = [
+                    edge
+                    for edge in self.reverse_callers.get(
+                        current_function.function_id, []
+                    )
+                    if edge.caller_id in self.reachable
+                ]
+                caller_edges.sort(key=lambda item: (item.site_id, item.caller_id))
+                if not caller_edges:
+                    child = self._mark_external_or_unknown(
+                        child,
+                        external=True,
+                        parameter_names=tuple(current_function.parameters),
+                    )
+                    terminal.append((child, replace(state, arm=child)))
+                    continue
+
+                for edge in caller_edges:
+                    if edge.synthetic_callback:
+                        boundary = self._mark_external_or_unknown(
+                            replace(
+                                child,
+                                bindings=list(child.bindings),
+                                guards=list(child.guards),
+                                evidence=list(child.evidence),
+                                transfer_chain=list(child.transfer_chain),
+                                source_by_arg={
+                                    key: dict(value)
+                                    for key, value in child.source_by_arg.items()
+                                },
+                            ),
+                            external=True,
+                            parameter_names=tuple(current_function.parameters),
+                        )
+                        terminal.append((boundary, replace(state, arm=boundary)))
+                        continue
+                    substituted = self._substitute_arm(child, edge)
+                    if substituted is None:
+                        failed = replace(
+                            child,
+                            bindings=[
+                                Binding(item.target_arg, "UNKNOWN", "SUBSTITUTION_FAILED")
+                                if item.kind == "EXPRESSION"
+                                else item
+                                for item in child.bindings
+                            ],
+                        )
+                        terminal.append((failed, replace(state, arm=failed)))
+                        continue
+                    add(
+                        BackwardState(
+                            current_function_id=edge.caller_id,
+                            selected_site_id=edge.site_id,
+                            arm=substituted,
+                            suffix_edges=(edge, *state.suffix_edges),
+                            depth=state.depth + 1,
+                            branch_id=(
+                                state.branch_id
+                                if state.depth
+                                else edge.site_id
+                            ),
+                        )
+                    )
+
+            if len(seen) % self.search_yield_interval == 0:
+                await asyncio.sleep(0)
+
+        expanded = len(seen)
+        if state_budget is not None:
+            state_budget[0] = max(0, state_budget[0] - expanded)
+        self.search_state_count += expanded
+        self.search_max_frontier = max(self.search_max_frontier, max_frontier)
+        self.search_max_depth = max(self.search_max_depth, max_depth)
+        if truncated:
+            limit = (
+                self.search_depth_cap if limit_type == "depth" else state_cap
+            )
+            self._record_search_limit(
+                seed,
+                f"backward search limit reached for {seed.site.site_id}: "
+                f"{limit_type}={limit}, states={expanded}, "
+                f"max_frontier={max_frontier}, max_depth={max_depth}",
+            )
+            fallback_route = self._witness_route(
+                seed=seed,
+                current_function_id=start_site.caller_id,
+                suffix_edges=initial_suffix,
+                target_site_id=start_site.site_id,
+            )
+            limit_arm = self._search_limit_arm(
+                seed=seed,
+                site=start_site,
+                route=fallback_route,
+                indices=indices,
+                expanded=expanded,
+                max_frontier=max_frontier,
+                max_depth=max_depth,
+            )
+            terminal.append(
+                (
+                    limit_arm,
+                    BackwardState(
+                        start_site.caller_id,
+                        start_site.site_id,
+                        limit_arm,
+                        initial_suffix,
+                        0,
+                        initial_branch_id,
+                    ),
+                )
+            )
+
+        rows: list[ResolvedSeed] = []
+        for arm, state in terminal:
+            route = self._witness_route(
+                seed=seed,
+                current_function_id=state.current_function_id,
+                suffix_edges=state.suffix_edges,
+                target_site_id=start_site.site_id,
+            )
+            produced = self._resolved_transfer_seed(
+                seed,
+                route,
+                arm,
+                indices,
+                operation,
+                target_site=output_target_site,
+                link_method=link_method,
+            )
+            for row in produced:
+                metadata = {
+                    **(row.fact.metadata or {}),
+                    "search_states_expanded": expanded,
+                    "search_max_frontier": max_frontier,
+                    "search_max_depth": max_depth,
+                    "path_mode": "WITNESS",
+                    "semantic_alternative_id": arm.correlation_id,
+                }
+                row.fact = replace(row.fact, metadata=metadata)
+                self.witness_path_count += len(row.paths)
+            rows.extend(produced)
+        return rows
+
+    def _handle_openings_backward(
+        self, seed: Seed, dependencies: tuple[str, ...]
+    ) -> tuple[list[tuple[IndexedSite, tuple[CallerEdge, ...], str]], dict[str, int | bool]]:
+        """Find owning opens without comparing unrelated complete root routes."""
+        argument_index = int(seed.config.get("handle_index") or 1)
+        argument = (
+            seed.site.target_argument(argument_index)
+            if seed.site.is_configured_macro_target
+            else seed.site.argument(argument_index)
+        )
+        root = normalise_handle(argument.text) if argument is not None else ""
+        queue: deque[tuple[str, str, int, tuple[CallerEdge, ...], int, str]] = deque(
+            [(seed.site.caller_id, root, seed.site.start_byte, (), 0, "local")]
+        )
+        seen: set[tuple[str, str, int]] = set()
+        found: dict[str, tuple[IndexedSite, tuple[CallerEdge, ...], str]] = {}
+        truncated = False
+        external_boundary = False
+        max_frontier = len(queue)
+        max_depth = 0
+        while queue:
+            if len(seen) >= self.search_state_cap:
+                truncated = True
+                break
+            current_id, current_root, before, suffix, depth, branch_id = queue.popleft()
+            if depth > self.search_depth_cap:
+                truncated = True
+                break
+            key = (current_id, current_root, before)
+            if key in seen:
+                self.search_deduplicated_state_count += 1
+                continue
+            seen.add(key)
+            max_depth = max(max_depth, depth)
+            bindings = self._binding_opens(
+                current_id, current_root, before, dependencies
+            )
+            if len(bindings) == 1 or (len(bindings) > 1 and self.multi_open):
+                for opening in bindings:
+                    found.setdefault(
+                        opening.site_id, (opening, suffix, branch_id)
+                    )
+                continue
+            if len(bindings) > 1:
+                continue
+            function = self.functions.get(current_id)
+            if function is None or current_root not in function.parameters:
+                # A global or struct field may be opened in another reachable
+                # function.  Keep this bounded fallback in the backward search
+                # so helper functions that own global handles are not missed.
+                is_local = bool(
+                    function and self._is_local_variable(function, current_root)
+                )
+                static_scope = bool(
+                    function
+                    and current_root
+                    in self.file_static_vars.get(function.node.file_name, set())
+                )
+                if current_root and (
+                    "->" in current_root
+                    or "." in current_root
+                    or not is_local
+                    or static_scope
+                ):
+                    candidate_callers = self.reachable
+                    if static_scope and function is not None:
+                        candidate_callers = {
+                            caller_id
+                            for caller_id, info in self.functions.items()
+                            if info.node.file_name == function.node.file_name
+                        }
+                    global_bindings = [
+                        opening
+                        for caller_id in candidate_callers
+                        for opening in self._binding_opens(
+                            caller_id,
+                            current_root,
+                            _GLOBAL_HANDLE_SEARCH_BEFORE,
+                            dependencies,
+                        )
+                    ]
+                    global_bindings = list(
+                        {item.site_id: item for item in global_bindings}.values()
+                    )
+                    if len(global_bindings) == 1 or (
+                        len(global_bindings) > 1 and self.multi_open
+                    ):
+                        for opening in global_bindings:
+                            found.setdefault(
+                                opening.site_id, (opening, suffix, branch_id)
+                            )
+                        continue
+                    if len(global_bindings) > 1:
+                        continue
+                continue
+            parameter_index = function.parameters.index(current_root) + 1
+            for edge in sorted(
+                self.reverse_callers.get(current_id, []),
+                key=lambda item: (item.site_id, item.caller_id),
+            ):
+                if edge.synthetic_callback:
+                    external_boundary = True
+                    continue
+                if edge.caller_id not in self.reachable:
+                    continue
+                site = self.sites.get(edge.site_id)
+                actual = site.argument(parameter_index) if site is not None else None
+                next_root = normalise_handle(actual.text) if actual is not None else ""
+                if next_root:
+                    if len(seen) + len(queue) >= self.search_state_cap:
+                        truncated = True
+                        break
+                    queue.append(
+                        (
+                            edge.caller_id,
+                            next_root,
+                            site.start_byte,
+                            (edge, *suffix),
+                            depth + 1,
+                            branch_id if depth else edge.site_id,
+                        )
+                    )
+                    max_frontier = max(max_frontier, len(queue))
+        self.search_state_count += len(seen)
+        self.search_max_frontier = max(self.search_max_frontier, max_frontier)
+        self.search_max_depth = max(self.search_max_depth, max_depth)
+        if truncated:
+            self._record_search_limit(
+                seed,
+                f"handle backward search limit reached for {seed.site.site_id}: "
+                f"states={len(seen)}, max_frontier={max_frontier}, "
+                f"max_depth={max_depth}",
+            )
+        return [found[key] for key in sorted(found)], {
+            "truncated": truncated,
+            "external_boundary": external_boundary,
+            "expanded": len(seen),
+            "max_frontier": max_frontier,
+            "max_depth": max_depth,
+        }
+
     async def _resolve_seed_with_transfers(self, seed: Seed) -> list[ResolvedSeed]:
         operation = seed.config.get("type") or "NO DATA"
         if operation == "WRITEF/READF":
@@ -3713,99 +5779,160 @@ class ValueFlowResolver:
         )
         configured_indices = tuple(int(item) for item in seed.config.get("indices") or ())
         if not dependencies and not configured_indices:
-            rows: list[ResolvedSeed] = []
-            for route in self.routes_for_seed(seed):
-                labels = self._route_labels(route, seed.site)
-                metadata = {
-                    "route_id": route.route_id,
-                    "correlation_id": f"corr:{route.route_id[6:]}",
-                    "reachability": route.reachability,
-                }
-                fact = Fact(
-                    value="NO TARGET",
-                    origin_kind="CONST",
-                    source_file=seed.site.file_path,
-                    source_line=seed.site.line,
-                    source_expr=seed.target_function,
-                    origin_query=json.dumps(["TRANSFER", route.route_id, "NO_TARGET"]),
-                    source_site_id=seed.site.site_id,
-                    metadata=metadata,
-                )
-                rows.append(
-                    ResolvedSeed(
-                        seed=seed,
-                        arg_index=0,
-                        fact=fact,
-                        operation=operation,
-                        call_number=None,
-                        paths=[labels],
-                        path_count=1,
-                        legacy_labels=labels,
-                        legacy_paths=[labels],
-                        query_token=fact.origin_query,
-                    )
-                )
-            return rows
+            return await self._resolve_seed_from_queries(seed)
         effective: list[
-            tuple[IndexedSite, tuple[int, ...], str, IndexedSite | None, RouteGuide]
+            tuple[
+                IndexedSite,
+                tuple[int, ...],
+                str,
+                IndexedSite | None,
+                tuple[CallerEdge, ...],
+                str,
+            ]
         ] = []
+        handle_search_metrics: dict[str, int | bool] = {
+            "truncated": False,
+            "external_boundary": False,
+            "expanded": 0,
+            "max_frontier": 0,
+            "max_depth": 0,
+        }
         if dependencies:
-            for consumer_route in self.routes_for_seed(seed):
-                openings = (
-                    self._openings_for_route(seed, consumer_route, dependencies)
-                    if self.multi_open
-                    else (
-                        [self._opening_for_route(seed, consumer_route, dependencies)]
-                    )
-                )
-                for opening in openings:
-                    effective_route = (
-                        self._route_for_opening(consumer_route, opening)
-                        if opening is not None
-                        else None
-                    )
-                    if opening is not None and effective_route is not None:
-                        config = self.function_configs.get(opening.callee_name, {})
-                        indices = tuple(int(item) for item in config.get("indices") or ())
-                        if not indices:
-                            continue
-                        effective.append(
-                            (
-                                opening,
-                                indices,
-                                "VARTRACE",
-                                seed.site,
-                                effective_route,
-                            )
+            openings, handle_search_metrics = self._handle_openings_backward(
+                seed, dependencies
+            )
+            for opening, suffix, branch_id in openings:
+                config = self.function_configs.get(opening.callee_name, {})
+                indices = tuple(int(item) for item in config.get("indices") or ())
+                if indices:
+                    effective.append(
+                        (
+                            opening,
+                            indices,
+                            "VARTRACE",
+                            seed.site,
+                            suffix,
+                            branch_id,
                         )
+                    )
         else:
             effective = [
-                (seed.site, configured_indices, "", seed.site, route)
-                for route in self.routes_for_seed(seed)
+                (seed.site, configured_indices, "", seed.site, (), "local")
             ]
-        if not effective and dependencies:
-            routes = self.routes_for_seed(seed)
-            rows: list[ResolvedSeed] = []
-            for route in routes:
-                index = int(seed.config.get("handle_index") or 1)
-                arm = RouteArm(
-                    route_id=route.route_id,
-                    correlation_id=f"corr:{route.route_id[6:]}",
-                    bindings=[Binding(index, "UNKNOWN", "HANDLE_AMBIGUOUS")],
-                )
-                rows.extend(self._resolved_transfer_seed(seed, route, arm, (index,), operation, target_site=seed.site))
-            return rows
+        if (
+            not effective
+            and dependencies
+            and not handle_search_metrics["truncated"]
+            and not handle_search_metrics["external_boundary"]
+        ):
+            index = int(seed.config.get("handle_index") or 1)
+            route = self._witness_route(
+                seed=seed,
+                current_function_id=seed.site.caller_id,
+                target_site_id=seed.site.site_id,
+            )
+            arm = RouteArm(
+                route_id=route.route_id,
+                correlation_id=f"corr:handle:{seed.site.site_id}",
+                bindings=[Binding(index, "UNKNOWN", "HANDLE_AMBIGUOUS")],
+            )
+            return self._resolved_transfer_seed(
+                seed, route, arm, (index,), operation, target_site=seed.site
+            )
         rows = []
-        for opening, indices, link_method, output_site, route in effective:
+        state_budget = [
+            max(
+                0,
+                self.search_state_cap - int(handle_search_metrics["expanded"]),
+            )
+        ]
+        for opening, indices, link_method, output_site, suffix, branch_id in effective:
             rows.extend(
-                await self._walk_route_backward_transfers(
+                await self._search_seed_backward(
                     seed=seed,
-                    route=route,
                     start_site=opening,
                     indices=indices,
                     operation=operation,
                     output_target_site=output_site,
                     link_method=link_method,
+                    initial_suffix=suffix,
+                    initial_branch_id=branch_id,
+                    state_budget=state_budget,
+                )
+            )
+            if seed.site.site_id in self._search_limited_seed_ids:
+                break
+        if handle_search_metrics["external_boundary"]:
+            index = int(seed.config.get("handle_index") or 1)
+            argument = (
+                seed.site.target_argument(index)
+                if seed.site.is_configured_macro_target
+                else seed.site.argument(index)
+            )
+            route = self._witness_route(
+                seed=seed,
+                current_function_id=seed.site.caller_id,
+                target_site_id=seed.site.site_id,
+            )
+            arm = RouteArm(
+                route_id=route.route_id,
+                correlation_id=f"corr:handle-boundary:{seed.site.site_id}",
+                bindings=[
+                    Binding(
+                        index,
+                        "EXTERNAL",
+                        argument.text.strip() if argument is not None else "EXTERNAL",
+                    )
+                ],
+                source_by_arg={
+                    index: {
+                        "file": seed.site.file_path,
+                        "line": seed.site.line,
+                        "expr": argument.text.strip() if argument is not None else "EXTERNAL",
+                        "source_site_id": seed.site.site_id,
+                        "origin_kind": "EXTERNAL_ENTRY",
+                        "metadata": {
+                            "source_role": "BOUNDARY",
+                            "trace_complete": True,
+                            "termination_reason": "EXTERNAL_ENTRY",
+                        },
+                    }
+                },
+            )
+            rows.extend(
+                self._resolved_transfer_seed(
+                    seed,
+                    route,
+                    arm,
+                    (index,),
+                    operation,
+                    target_site=seed.site,
+                )
+            )
+        if handle_search_metrics["truncated"]:
+            index = int(seed.config.get("handle_index") or 1)
+            route = self._witness_route(
+                seed=seed,
+                current_function_id=seed.site.caller_id,
+                target_site_id=seed.site.site_id,
+            )
+            arm = self._search_limit_arm(
+                seed=seed,
+                site=seed.site,
+                route=route,
+                indices=(index,),
+                expanded=int(handle_search_metrics["expanded"]),
+                max_frontier=int(handle_search_metrics["max_frontier"]),
+                max_depth=int(handle_search_metrics["max_depth"]),
+            )
+            rows.extend(
+                self._resolved_transfer_seed(
+                    seed,
+                    route,
+                    arm,
+                    (index,),
+                    operation,
+                    target_site=seed.site,
                 )
             )
         for row in rows:
@@ -3821,6 +5948,20 @@ class ValueFlowResolver:
         call_number: str | None,
         query: Query,
     ) -> ResolvedSeed:
+        guards = self._target_site_guards(seed.site)
+        if guards:
+            fact = replace(
+                fact,
+                metadata={
+                    **(fact.metadata or {}),
+                    "guards": list(
+                        dict.fromkeys(
+                            [*(fact.metadata or {}).get("guards", []), *guards]
+                        )
+                    ),
+                },
+            )
+        fact = self._with_provenance_metadata(fact, seed.site)
         paths, path_count, truncated = self.paths_for_fact(fact, query)
         token = query.token()
         legacy_paths = self.legacy_paths_for_fact(fact, token)
@@ -3840,6 +5981,64 @@ class ValueFlowResolver:
             ),
             legacy_labels=legacy_paths[0] if legacy_paths else [],
             legacy_paths=legacy_paths,
+        )
+
+    def _with_provenance_metadata(
+        self, fact: Fact, target_site: IndexedSite
+    ) -> Fact:
+        """Fill semantic provenance fields without changing Fact's public shape."""
+        metadata = dict(fact.metadata or {})
+        origin = str(fact.origin_kind)
+        complete = origin in {
+            "CONST",
+            "MACRO",
+            "CONST_TABLE",
+            "BOUNDED_SET",
+            "RUNTIME_DATA",
+            "EXTERNAL_ENTRY",
+            "EXTERNAL_DATA",
+        }
+        termination = {
+            "CONST": "LITERAL",
+            "MACRO": "MACRO",
+            "CONST_TABLE": "TABLE_SET",
+            "BOUNDED_SET": "LOCAL_ASSIGNMENT",
+            "RUNTIME_DATA": "RUNTIME_INPUT",
+            "EXTERNAL_ENTRY": "EXTERNAL_ENTRY",
+            "EXTERNAL_DATA": "EXTERNAL_BOUNDARY",
+            "UNKNOWN_INDIRECT": "UNSUPPORTED_SYNTAX",
+            "RECURSIVE": "RECURSIVE_STATE",
+            "UNRESOLVED": "UNSUPPORTED_SYNTAX",
+        }.get(origin, "NO_TARGET" if fact.value == "NO TARGET" else "UNSUPPORTED_SYNTAX")
+        if fact.value == "NO TARGET":
+            complete = True
+            termination = "NO_TARGET"
+        metadata.setdefault("trace_complete", complete)
+        metadata.setdefault("termination_reason", termination)
+        if origin == "CONST_TABLE":
+            metadata.setdefault("source_role", "TABLE_VALUE")
+        elif origin in {"EXTERNAL_ENTRY", "EXTERNAL_DATA"}:
+            metadata.setdefault("source_role", "BOUNDARY")
+        elif complete:
+            metadata.setdefault("source_role", "GENESIS")
+        else:
+            metadata.setdefault(
+                "source_role",
+                "TARGET_FALLBACK"
+                if not fact.source_file or fact.source_line < 1
+                else "LAST_PROVEN",
+            )
+        source_file = fact.source_file or target_site.file_path
+        source_line = fact.source_line if fact.source_line > 0 else target_site.line
+        source_expr = fact.source_expr or target_site.callee_name
+        if source_file == target_site.file_path and source_line == target_site.line and not complete:
+            metadata["source_role"] = "TARGET_FALLBACK"
+        return replace(
+            fact,
+            source_file=source_file,
+            source_line=source_line,
+            source_expr=source_expr,
+            metadata=metadata,
         )
 
     # ------------------------------------------------------------- provenance
@@ -3902,41 +6101,51 @@ class ValueFlowResolver:
         # Starting at the query that found the source fact, walk forward through
         # recorded dependencies until reaching the original target query.
         origin = fact.origin_query
-        paths: list[list[str]] = []
         memo: dict[str, int] = {}
-
-        def count_paths(current: str, visiting: frozenset[str]) -> int:
-            if current == destination:
-                return 1
+        active: set[str] = set()
+        ignored_cycles: set[tuple[str, str]] = set()
+        count_stack: list[tuple[str, bool]] = [(origin, False)]
+        while count_stack:
+            current, expanded = count_stack.pop()
             if current in memo:
-                return memo[current]
-            if current in visiting:
-                return 0
-            total = sum(
-                count_paths(parent, visiting | {current})
-                for parent in self.provenance.get(current, set())
-            )
-            memo[current] = total
-            return total
+                continue
+            if current == destination:
+                memo[current] = 1
+                continue
+            parents = sorted(self.provenance.get(current, set()))
+            if expanded:
+                active.discard(current)
+                memo[current] = sum(
+                    memo.get(parent, 0)
+                    for parent in parents
+                    if (current, parent) not in ignored_cycles
+                )
+                continue
+            active.add(current)
+            count_stack.append((current, True))
+            for parent in reversed(parents):
+                if parent in active:
+                    ignored_cycles.add((current, parent))
+                elif parent not in memo:
+                    count_stack.append((parent, False))
 
-        count = count_paths(origin, frozenset())
-
-        def collect(current: str, path: list[str], seen: set[str]) -> None:
-            if len(paths) >= self.path_cap:
-                return
+        count = memo.get(origin, 0)
+        paths: list[list[str]] = []
+        collect_stack: list[tuple[str, list[str], frozenset[str]]] = [
+            (origin, [origin], frozenset({origin}))
+        ]
+        while collect_stack and len(paths) < self.path_cap:
+            current, path, seen = collect_stack.pop()
             if current == destination:
                 paths.append(path)
-                return
-            for parent in sorted(self.provenance.get(current, set())):
-                if parent in seen:
-                    continue
-                if count_paths(parent, frozenset()) == 0:
-                    continue
-                collect(parent, path + [parent], seen | {parent})
-                if len(paths) >= self.path_cap:
-                    break
-
-        collect(origin, [origin], {origin})
+                continue
+            parents = [
+                parent
+                for parent in sorted(self.provenance.get(current, set()))
+                if parent not in seen and memo.get(parent, 0) > 0
+            ]
+            for parent in reversed(parents):
+                collect_stack.append((parent, [*path, parent], seen | {parent}))
         if count == 0:
             count = 1
             paths = [[destination]]
@@ -3944,19 +6153,22 @@ class ValueFlowResolver:
 
     def provenance_tokens(self, fact: Fact, destination: str) -> list[str]:
         """Query tokens on one value-carrying chain, ordered source -> target."""
-
-        def find(current: str, seen: frozenset[str]) -> list[str] | None:
+        origin = fact.origin_query
+        queue = deque([origin])
+        predecessor: dict[str, str | None] = {origin: None}
+        while queue:
+            current = queue.popleft()
             if current == destination:
-                return [current]
+                path: list[str] = []
+                while current is not None:
+                    path.append(current)
+                    current = predecessor[current]
+                return list(reversed(path))
             for parent in sorted(self.provenance.get(current, set())):
-                if parent in seen:
-                    continue
-                suffix = find(parent, seen | {parent})
-                if suffix:
-                    return [current, *suffix]
-            return None
-
-        return find(fact.origin_query, frozenset({fact.origin_query})) or []
+                if parent not in predecessor:
+                    predecessor[parent] = current
+                    queue.append(parent)
+        return []
 
     def legacy_path_labels(self, fact: Fact, destination: str) -> list[str]:
         """Render one value chain using the call-graph label grammar.
@@ -4136,6 +6348,9 @@ class ValueFlowResolver:
 
     def _visible_files(self, file_name: str) -> tuple[str, ...]:
         """Return a file and its transitive includes in deterministic order."""
+        cached = self._visible_files_cache.get(file_name)
+        if cached is not None:
+            return cached
         queue = deque([file_name])
         visited: set[str] = set()
         ordered: list[str] = []
@@ -4146,7 +6361,9 @@ class ValueFlowResolver:
             visited.add(current)
             ordered.append(current)
             queue.extend(self.include_graph.get(current, ()))
-        return tuple(ordered)
+        result = tuple(ordered)
+        self._visible_files_cache[file_name] = result
+        return result
 
     def _build_enum_index(
         self,
@@ -4378,35 +6595,63 @@ class ValueFlowResolver:
 
     def _all_macros(self, file_name: str | None = None) -> dict[str, tuple[str, str]]:
         """Return macros visible from one active include chain."""
+        cache_key = (file_name, id(self.builder_macros), id(self.file_macros))
+        cached = self._all_macros_cache.get(cache_key)
+        if cached is not None:
+            return cached
         combined: dict[str, tuple[str, str]] = {}
-        visible = set(self._visible_files(file_name)) if file_name else set(self.trees)
-        visible_paths = {
-            str(Path(self.project_structure.get(name, name)).resolve())
-            for name in visible
-        }
-        for name, value in self.builder_macros.items():
-            definition_path = str(Path(value[1]).resolve()) if value[1] else ""
-            if not file_name or not definition_path or definition_path in visible_paths:
-                combined[name] = (value[0], value[1])
-        for visible_name in self._visible_files(file_name or self.main_file_name):
+        if file_name:
+            visible_files = self._visible_files(file_name)
+            combined.update(self._builder_macros_without_path)
+            for visible_name in visible_files:
+                visible_project_path = self._project_paths.get(visible_name)
+                if visible_project_path is None:
+                    visible_project_path = Path(
+                        self.project_structure.get(visible_name, visible_name)
+                    ).resolve()
+                visible_path = str(visible_project_path)
+                combined.update(
+                    self._builder_macros_by_path.get(visible_path, {})
+                )
+        else:
+            visible_files = self._visible_files(self.main_file_name)
+            combined.update(
+                {
+                    name: (value[0], value[1])
+                    for name, value in self.builder_macros.items()
+                }
+            )
+        for visible_name in visible_files:
             macros = self.file_macros.get(visible_name, {})
             path = self.project_structure.get(visible_name, "")
             for name, value in macros.items():
                 combined.setdefault(name, (value, path))
+        self._all_macros_cache[cache_key] = combined
         return combined
 
     def _resolve_macro(
         self, name: str, file_name: str | None = None
     ) -> tuple[str, str, int] | None:
+        cache_key = (
+            name,
+            file_name,
+            id(self.builder_macros),
+            id(self.file_macros),
+        )
+        if cache_key in self._resolved_macro_cache:
+            return self._resolved_macro_cache[cache_key]
         if not _IDENTIFIER.fullmatch(name):
+            self._resolved_macro_cache[cache_key] = None
             return None
         visible_enum_values, visible_enum_ambiguities = self._visible_enum_index(
             file_name or self.main_file_name
         )
         if name in visible_enum_ambiguities:
+            self._resolved_macro_cache[cache_key] = None
             return None
         enum_value = visible_enum_values.get(name)
         if enum_value is not None:
+            self._resolved_macro_cache[cache_key] = enum_value
             return enum_value
         macros = self._all_macros(file_name)
         current = name
@@ -4417,22 +6662,37 @@ class ValueFlowResolver:
             replacement, source_file = macros[current]
             replacement = strip_outer_parens(replacement.strip())
             if self._literal(replacement):
-                return replacement, source_file, self._macro_line(source_file, current)
+                result = (
+                    replacement,
+                    source_file,
+                    self._macro_line(source_file, current),
+                )
+                self._resolved_macro_cache[cache_key] = result
+                return result
             if not _IDENTIFIER.fullmatch(replacement):
+                self._resolved_macro_cache[cache_key] = None
                 return None
             current = replacement
+        self._resolved_macro_cache[cache_key] = None
         return None
 
     def _macro_line(self, file_path: str, macro_name: str) -> int:
-        try:
-            for line_number, line in enumerate(
-                Path(file_path).read_text(encoding="latin-1").splitlines(), start=1
-            ):
-                if re.match(rf"\s*#\s*define\s+{re.escape(macro_name)}\b", line):
-                    return line_number
-        except OSError:
-            pass
-        return -1
+        lines = self._macro_lines_by_file.get(file_path)
+        if lines is None:
+            lines = {}
+            try:
+                for line_number, line in enumerate(
+                    Path(file_path).read_text(encoding="latin-1").splitlines(), start=1
+                ):
+                    match = re.match(
+                        r"\s*#\s*define\s+([A-Za-z_]\w*)\b", line
+                    )
+                    if match:
+                        lines.setdefault(match.group(1), line_number)
+            except OSError:
+                pass
+            self._macro_lines_by_file[file_path] = lines
+        return lines.get(macro_name, -1)
 
     def _parameter_fast_path_safe(
         self, function: FunctionInfo, name: str, before_byte: int
@@ -4498,6 +6758,15 @@ class ValueFlowResolver:
             return []
         candidates.sort(key=lambda item: item[0])
         latest = candidates[-1]
+        controlling_switch = self._ancestor(latest[2], "switch_statement")
+        if controlling_switch is not None and controlling_switch.end_byte <= site.start_byte:
+            incoming = self._local_reaching_definitions(
+                replace(site, start_byte=controlling_switch.start_byte), name
+            )
+            reaching = self._collect_switch_values(
+                controlling_switch, candidates, incoming
+            )
+            return reaching if reaching else []
         controlling_if = self._ancestor(latest[2], "if_statement")
         if controlling_if is not None and controlling_if.end_byte <= site.start_byte:
             # An ``else if`` arm is itself an if_statement, so the latest
@@ -4526,9 +6795,86 @@ class ValueFlowResolver:
                     break
                 chain_root = parent
                 current = chain_root
-            reaching = self._collect_branch_values(chain_root, candidates)
+            incoming = self._local_reaching_definitions(
+                replace(site, start_byte=chain_root.start_byte), name
+            )
+            reaching = self._collect_branch_values(
+                chain_root, candidates, incoming=incoming or None
+            )
             return reaching if reaching else []
         return [latest[1]]
+
+    def _collect_switch_values(
+        self,
+        switch: Any,
+        candidates: list[tuple[int, Expression, Any]],
+        incoming: list[Expression],
+    ) -> list[Expression]:
+        """Conservatively merge definitions from switch arms reaching a use."""
+        body = switch.child_by_field_name("body")
+        cases = (
+            [child for child in body.named_children if child.type == "case_statement"]
+            if body is not None
+            else []
+        )
+        if not cases:
+            return []
+
+        values: list[Expression] = []
+        preserves_incoming = not any(
+            child.child_by_field_name("value") is None for child in cases
+        )
+        for case in cases:
+            condition = case.child_by_field_name("value")
+            guard = (
+                f"case {condition.text.decode('latin-1', errors='replace').strip()}"
+                if condition is not None and condition.text is not None
+                else "default"
+            )
+            direct = [
+                (offset, expression, node)
+                for offset, expression, node in candidates
+                if self._contains(case, node)
+                and self._ancestor(node, "switch_statement").id == switch.id
+            ]
+            if direct:
+                # Ordinary cases assign once. If a nested conditional assigns,
+                # retain every candidate plus the incoming value rather than
+                # manufacturing a false exact result.
+                nested_control = any(
+                    (owner := self._ancestor(node, "if_statement")) is not None
+                    and self._contains(case, owner)
+                    for _offset, _expression, node in direct
+                )
+                selected = direct if nested_control else [max(direct, key=lambda item: item[0])]
+                values.extend(
+                    replace(expression, guards=(*expression.guards, guard))
+                    for _offset, expression, _node in selected
+                )
+                if nested_control:
+                    preserves_incoming = True
+                continue
+            has_return = any(
+                statement.type == "return_statement"
+                for statement in case.named_children
+            )
+            has_break = any(
+                statement.type == "break_statement"
+                for statement in case.named_children
+            )
+            if has_break or not has_return:
+                preserves_incoming = True
+
+        if preserves_incoming:
+            values = [*incoming, *values]
+        unique: list[Expression] = []
+        seen: set[tuple[str, int, str]] = set()
+        for expression in values:
+            key = (expression.file_path, expression.line, expression.text.strip())
+            if key not in seen:
+                seen.add(key)
+                unique.append(expression)
+        return unique
 
     def _contains(self, ancestor: Any, node: Any) -> bool:
         """True when ``ancestor`` is ``node`` itself or encloses it.
@@ -4544,7 +6890,11 @@ class ValueFlowResolver:
         return False
 
     def _collect_branch_values(
-        self, arm: Any, candidates: list[tuple[int, Expression, Any]]
+        self,
+        arm: Any,
+        candidates: list[tuple[int, Expression, Any]],
+        guards: tuple[str, ...] = (),
+        incoming: list[Expression] | None = None,
     ) -> list[Expression] | None:
         """Values the variable can hold after one if-chain arm executes.
 
@@ -4563,15 +6913,39 @@ class ValueFlowResolver:
         if arm.type == "if_statement":
             consequence = arm.child_by_field_name("consequence")
             alternative = arm.child_by_field_name("alternative")
+            condition = arm.child_by_field_name("condition")
             if consequence is None:
                 return None
-            values = self._collect_branch_values(consequence, candidates)
+            # Every candidate expression carries its source bytes through the
+            # owning site; use the condition node's own text for guard evidence.
+            condition_text = (
+                condition.text.decode("latin-1", errors="replace").strip()
+                if condition is not None and condition.text is not None
+                else "condition"
+            )
+            values = self._collect_branch_values(
+                consequence,
+                candidates,
+                (*guards, condition_text),
+                incoming,
+            )
             if values is None:
                 return None
             if alternative is None:
-                # No else: the variable may keep an earlier value.
-                return None
-            alt_values = self._collect_branch_values(alternative, candidates)
+                # No else: the variable keeps its value from before the if.
+                if incoming is None:
+                    return None
+                alt_values = [
+                    replace(value, guards=(*guards, f"!({condition_text})"))
+                    for value in incoming
+                ]
+                return values + alt_values
+            alt_values = self._collect_branch_values(
+                alternative,
+                candidates,
+                (*guards, f"!({condition_text})"),
+                incoming,
+            )
             if alt_values is None:
                 return None
             return values + alt_values
@@ -4581,8 +6955,18 @@ class ValueFlowResolver:
             if offset >= arm.start_byte and node.end_byte <= arm.end_byte
         ]
         if not direct:
-            return None
-        return [max(direct, key=lambda item: item[0])[1]]
+            statements = (
+                list(arm.named_children)
+                if arm.type == "compound_statement"
+                else [arm]
+            )
+            if any(statement.type == "return_statement" for statement in statements):
+                return []
+            if incoming is None:
+                return None
+            return [replace(value, guards=guards) for value in incoming]
+        expression = max(direct, key=lambda item: item[0])[1]
+        return [replace(expression, guards=guards)]
 
     def _expression(self, node: Any, site: IndexedSite) -> Expression:
         return Expression(
@@ -4628,13 +7012,20 @@ class ValueFlowResolver:
     def _unresolved_fact(self, query: Query, expression: str) -> Fact:
         site = self.sites.get(getattr(query, "call_site_id", ""))
         return Fact(
-            value=expression,
+            value="UNRESOLVED",
             origin_kind="UNRESOLVED",
             source_file=site.file_path if site else "",
             source_line=site.line if site else -1,
             source_expr=expression,
             origin_query=query.token(),
             source_site_id=query.token(),
+            metadata={
+                "source_role": "TARGET_FALLBACK",
+                "trace_complete": False,
+                "termination_reason": expression
+                if expression.isupper()
+                else "UNSUPPORTED_SYNTAX",
+            },
         )
 
     def _deduplicate_facts(self, facts: list[Fact]) -> list[Fact]:
@@ -4653,26 +7044,39 @@ class ValueFlowResolver:
                 record.fact.source_key,
                 record.operation,
                 record.seed.launch_via,
-                (record.fact.metadata or {}).get("correlation_id") or "__legacy__",
+                (record.fact.metadata or {}).get("set_id")
+                or (record.fact.metadata or {}).get("semantic_alternative_id")
+                or "__legacy__",
             )
             existing = unique.get(key)
             if existing is None:
                 unique[key] = record
             else:
                 known = {tuple(path) for path in existing.paths}
-                existing.paths.extend(
+                new_paths = [
                     path for path in record.paths if tuple(path) not in known
-                )
+                ]
+                remaining = max(0, self.path_cap - len(existing.paths))
+                existing.paths.extend(new_paths[:remaining])
                 known_legacy = {tuple(path) for path in existing.legacy_paths}
-                existing.legacy_paths.extend(
+                new_legacy = [
                     path
                     for path in record.legacy_paths
                     if tuple(path) not in known_legacy
-                )
+                ]
+                existing.legacy_paths.extend(new_legacy[:remaining])
                 existing.path_count += record.path_count
                 existing.paths_truncated = (
                     existing.paths_truncated or record.paths_truncated
+                    or len(new_paths) > remaining
                 )
+                metadata = dict(existing.fact.metadata or {})
+                metadata["equivalent_route_count"] = int(
+                    metadata.get("equivalent_route_count", 1)
+                ) + int(
+                    (record.fact.metadata or {}).get("equivalent_route_count", 1)
+                )
+                existing.fact = replace(existing.fact, metadata=metadata)
         return list(unique.values())
 
     @staticmethod

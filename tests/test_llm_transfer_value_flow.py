@@ -15,6 +15,7 @@ from models import TransferAnswerModel
 from pydantic import ValidationError
 from value_flow.outputs import write_outputs
 from value_flow.resolver import ValueFlowResolver
+from value_flow.status import RUNTIME, UNRESOLVED, classify_records
 from value_flow.transfers import (
     FormulaError,
     evaluate_formula,
@@ -64,8 +65,8 @@ def build_resolver(
 
 
 def answer_for(request, bindings, *, guard="true", evidence_file="main.c"):
-    position = request.function_source.index(request.function_name + "(")
-    start = request.function_source.rfind("\n", 0, position) + 1
+    # Evidence is a verbatim snippet; the resolver locates it itself.
+    first_line = request.function_source.lstrip("\n").splitlines()[0].strip()
     return TransferAnswerModel(
         arms=[
             {
@@ -74,8 +75,7 @@ def answer_for(request, bindings, *, guard="true", evidence_file="main.c"):
                 "evidence": [
                     {
                         "file": evidence_file,
-                        "start_byte": start,
-                        "end_byte": len(request.function_source),
+                        "snippet": first_line,
                     }
                 ],
             }
@@ -137,6 +137,83 @@ class TransferUtilityTests(unittest.TestCase):
 
 
 class RouteTransferTests(unittest.TestCase):
+    def test_source_backed_output_producer_is_runtime_and_shared_in_flight(self):
+        source = (
+            "typedef int Handle;\n"
+            "void fill_file_no(int *out);\n"
+            "void open_h(Handle *handle, int file_no);\n"
+            "void write_h(Handle *handle);\n"
+            "int main(void) {\n"
+            "  int file_no; Handle handle;\n"
+            "  fill_file_no(&file_no);\n"
+            "  open_h(&handle, file_no);\n"
+            "  write_h(&handle);\n"
+            "  return 0;\n"
+            "}\n"
+        )
+        calls = []
+
+        async def transfer(_request):
+            calls.append(1)
+            await asyncio.sleep(0.01)
+            return {
+                "arms": [
+                    {
+                        "bindings": [
+                            {
+                                "target_arg": 2,
+                                "kind": "UNKNOWN",
+                                "expression": "fill_file_no(&file_no)",
+                            }
+                        ],
+                        "guard": "true",
+                        "evidence": [
+                            {
+                                "file": "main.c",
+                                "snippet": "fill_file_no(&file_no);",
+                            }
+                        ],
+                    }
+                ]
+            }
+
+        configs = {
+            "open_h": {
+                "type": "OPENF",
+                "indices": [2],
+                "handle_index": 1,
+                "dependent_functions": [],
+            },
+            "write_h": {
+                "type": "WRITEF",
+                "indices": [],
+                "handle_index": 1,
+                "dependent_functions": ["open_h"],
+            },
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            resolver = build_resolver(
+                Path(directory), source, configs, transfer
+            )
+            records = asyncio.run(resolver.run())
+
+        self.assertEqual(calls, [1])
+        self.assertEqual(resolver.transfer_request_count, 1)
+        self.assertEqual(resolver.transfer_cache_hits, 1)
+        self.assertEqual(len(records), 2)
+        statuses = classify_records(records)
+        self.assertEqual(
+            {statuses[id(record)].status for record in records}, {RUNTIME}
+        )
+        for record in records:
+            self.assertEqual(record.fact.value, "file_no")
+            self.assertEqual(record.fact.origin_kind, "RUNTIME_DATA")
+            self.assertEqual(record.fact.source_line, 7)
+            self.assertEqual(record.fact.source_expr, "fill_file_no(&file_no)")
+            self.assertEqual(
+                record.fact.metadata["termination_reason"], "RUNTIME_PRODUCER"
+            )
+
     def test_direct_literal_and_macro_do_not_request_a_transfer(self):
         source = (
             "#define FILE_NO 4013\n"
@@ -163,6 +240,42 @@ class RouteTransferTests(unittest.TestCase):
 
         self.assertEqual({record.fact.value for record in records}, {"17", "4013"})
         self.assertEqual(calls, [])
+        self.assertEqual(resolver.fast_path_seed_count, 2)
+
+    def test_queue_wrapper_parameter_uses_backward_search_without_route_enumeration(self):
+        source = (
+            "void Dac_EnqSem(void *cpu, int qno);\n"
+            "void dispatch(int qno) { Dac_EnqSem(0, qno); }\n"
+            "int main(void) { dispatch(77); return 0; }\n"
+        )
+
+        async def transfer_must_not_run(_request):
+            raise AssertionError("a bare formal parameter needs no model transfer")
+
+        with tempfile.TemporaryDirectory() as directory:
+            resolver = build_resolver(
+                Path(directory),
+                source,
+                {
+                    "Dac_EnqSem": {
+                        "type": "QUEUEF",
+                        "launch": "FORK",
+                        "indices": [2],
+                        "get_upper": True,
+                        "dependent_functions": [],
+                        "semantic_wrapper": True,
+                        "canonical_target": "mpf_mfs_addque",
+                    }
+                },
+                transfer_must_not_run,
+            )
+            resolver.routes_for_seed = lambda _seed: (_ for _ in ()).throw(
+                AssertionError("bounded search must not enumerate routes")
+            )
+            records = asyncio.run(resolver.run())
+
+        self.assertEqual([record.fact.value for record in records], ["77"])
+        self.assertEqual(resolver.search_seed_count, 1)
 
     def test_composes_nested_arithmetic_and_stops_at_constant_caller(self):
         source = (
@@ -186,6 +299,9 @@ class RouteTransferTests(unittest.TestCase):
                 source,
                 {"X": {"type": "READF", "indices": [1], "dependent_functions": []}},
                 transfer,
+            )
+            resolver.routes_for_seed = lambda _seed: (_ for _ in ()).throw(
+                AssertionError("normal resolution must not enumerate routes")
             )
             records = asyncio.run(resolver.run())
 
@@ -222,7 +338,115 @@ class RouteTransferTests(unittest.TestCase):
         self.assertEqual(len(records), 10)
         self.assertEqual({record.fact.value for record in records}, {str(i) for i in range(1, 11)})
         self.assertEqual(len(calls), 1)
-        self.assertEqual(resolver.transfer_cache_hits, 9)
+        self.assertEqual(resolver.transfer_cache_hits, 0)
+        self.assertGreaterEqual(resolver.search_state_count, 11)
+
+    def test_search_state_cap_is_visible_and_blocks_resolution(self):
+        source = (
+            "void X(int value);\n"
+            "void Y(int p) { X(p + 1); }\n"
+            "int main(void) { Y(4); return 0; }\n"
+        )
+
+        async def transfer(request):
+            return answer_for(
+                request,
+                [{"target_arg": 1, "kind": "EXPRESSION", "expression": "$1 + 1"}],
+            )
+
+        with tempfile.TemporaryDirectory() as directory:
+            resolver = build_resolver(
+                Path(directory),
+                source,
+                {"X": {"type": "READF", "indices": [1], "dependent_functions": []}},
+                transfer,
+            )
+            resolver.search_state_cap = 1
+            resolver.routes_for_seed = lambda _seed: (_ for _ in ()).throw(
+                AssertionError("bounded search must not enumerate routes")
+            )
+            records = asyncio.run(resolver.run())
+
+        self.assertEqual(resolver.search_limit_seed_count, 1)
+        self.assertEqual(classify_records(records)[id(records[0])].status, UNRESOLVED)
+        self.assertTrue(records[0].fact.metadata["search_truncated"])
+        self.assertEqual(
+            records[0].fact.metadata["termination_reason"],
+            "SEARCH_LIMIT_REACHED",
+        )
+
+    def test_search_depth_cap_is_visible_and_blocks_resolution(self):
+        source = (
+            "void X(int value);\n"
+            "void Y(int p) { X(p); }\n"
+            "void Z(int q) { Y(q); }\n"
+            "int main(void) { Z(4); return 0; }\n"
+        )
+
+        async def transfer(request):
+            return answer_for(
+                request,
+                [{"target_arg": 1, "kind": "EXPRESSION", "expression": "$1"}],
+            )
+
+        with tempfile.TemporaryDirectory() as directory:
+            resolver = build_resolver(
+                Path(directory),
+                source,
+                {"X": {"type": "READF", "indices": [1], "dependent_functions": []}},
+                transfer,
+            )
+            resolver.search_depth_cap = 1
+            records = asyncio.run(resolver.run())
+
+        self.assertEqual(resolver.search_limit_seed_count, 1)
+        self.assertEqual(classify_records(records)[id(records[0])].status, UNRESOLVED)
+        self.assertEqual(
+            records[0].fact.metadata["termination_reason"],
+            "SEARCH_LIMIT_REACHED",
+        )
+
+    def test_diamond_routes_collapse_to_one_semantic_state(self):
+        source = (
+            "void X(int value);\n"
+            "void leaf(int p) { X(p); }\n"
+            "void left(int p) { leaf(p); }\n"
+            "void right(int p) { leaf(p); }\n"
+            "void join(int p) { left(p); right(p); }\n"
+            "int main(void) { join(4); return 0; }\n"
+        )
+
+        async def transfer(request):
+            return answer_for(
+                request,
+                [{"target_arg": 1, "kind": "EXPRESSION", "expression": "$1"}],
+            )
+
+        observations = []
+        for _ in range(3):
+            with tempfile.TemporaryDirectory() as directory:
+                resolver = build_resolver(
+                    Path(directory),
+                    source,
+                    {"X": {"type": "READF", "indices": [1], "dependent_functions": []}},
+                    transfer,
+                )
+                resolver.routes_for_seed = lambda _seed: (_ for _ in ()).throw(
+                    AssertionError("bounded search must not enumerate routes")
+                )
+                records = asyncio.run(resolver.run())
+                observations.append(
+                    (
+                        [record.fact.value for record in records],
+                        resolver.search_state_count,
+                        resolver.search_deduplicated_state_count,
+                    )
+                )
+
+        self.assertEqual(observations[0], observations[1])
+        self.assertEqual(observations[1], observations[2])
+        self.assertEqual(observations[0][0], ["4"])
+        self.assertGreater(observations[0][2], 0)
 
     def test_transfer_cache_survives_a_new_resolver(self):
         source = (
@@ -306,7 +530,7 @@ class RouteTransferTests(unittest.TestCase):
         self.assertNotIn("1_20", {row["target_number->ans"] for row in legacy})
         self.assertNotIn("2_10", {row["target_number->ans"] for row in legacy})
 
-    def test_proven_caller_selects_one_guarded_arm(self):
+    def test_complete_local_branch_set_uses_fast_path_without_transfer(self):
         source = (
             "void X(int value);\n"
             "void Y(int mode) { int value; if (mode) value = 100; "
@@ -314,9 +538,12 @@ class RouteTransferTests(unittest.TestCase):
             "int main(void) { Y(1); return 0; }\n"
         )
 
+        calls = []
+
         async def transfer(request):
-            start = request.function_source.index("void " + request.function_name)
-            evidence = [{"file": "main.c", "start_byte": start, "end_byte": len(source)}]
+            calls.append(request)
+            # The evidence must cover the values the formulas cite (100, 200).
+            evidence = [{"file": "main.c", "snippet": "if (mode) value = 100; else value = 200; X(value);"}]
             return {
                 "arms": [
                     {
@@ -341,8 +568,88 @@ class RouteTransferTests(unittest.TestCase):
             )
             records = asyncio.run(resolver.run())
 
-        self.assertEqual([record.fact.value for record in records], ["100"])
-        self.assertEqual(records[0].fact.metadata["guards"], [])
+        self.assertEqual({record.fact.value for record in records}, {"100", "200"})
+        self.assertEqual(calls, [])
+        self.assertEqual(resolver.fast_path_seed_count, 1)
+        self.assertTrue(all(record.fact.metadata["guards"] for record in records))
+        statuses = classify_records(records)
+        self.assertEqual({statuses[id(record)].status for record in records}, {"RUNTIME"})
+        self.assertEqual(
+            len({statuses[id(record)].value_set_id for record in records}),
+            1,
+        )
+
+    def test_consumer_branch_filters_owning_open_arms(self):
+        source = (
+            "typedef int Handle;\n"
+            "void open_h(Handle *, int);\n"
+            "void read_h(Handle *);\n"
+            "void worker(int mode) {\n"
+            "  Handle h; int fno;\n"
+            "  if (mode) fno = 100; else fno = 200;\n"
+            "  open_h(&h, fno);\n"
+            "  if (mode) read_h(&h); else read_h(&h);\n"
+            "}\n"
+            "int main(void) { return 0; }\n"
+        )
+
+        async def transfer(_request):
+            evidence = [
+                {
+                    "file": "main.c",
+                    "snippet": "if (mode) fno = 100; else fno = 200;",
+                }
+            ]
+            return {
+                "arms": [
+                    {
+                        "bindings": [
+                            {"target_arg": 2, "kind": "EXPRESSION", "expression": "100"}
+                        ],
+                        "guard": "$1 != 0",
+                        "evidence": evidence,
+                    },
+                    {
+                        "bindings": [
+                            {"target_arg": 2, "kind": "EXPRESSION", "expression": "200"}
+                        ],
+                        "guard": "$1 == 0",
+                        "evidence": evidence,
+                    },
+                ]
+            }
+
+        with tempfile.TemporaryDirectory() as directory:
+            resolver = build_resolver(
+                Path(directory),
+                source,
+                {
+                    "open_h": {
+                        "type": "OPENF",
+                        "indices": [2],
+                        "handle_index": 1,
+                    },
+                    "read_h": {
+                        "type": "READF",
+                        "indices": [],
+                        "handle_index": 1,
+                        "dependent_functions": ["open_h"],
+                    },
+                },
+                transfer,
+            )
+            records = asyncio.run(resolver.run())
+
+        consumer_values = {}
+        for record in records:
+            if record.seed.target_function == "read_h":
+                consumer_values.setdefault(record.seed.site.site_id, set()).add(
+                    record.fact.value
+                )
+        self.assertEqual(
+            sorted(consumer_values.values(), key=lambda values: min(values)),
+            [{"100"}, {"200"}],
+        )
 
     def test_handle_consumer_uses_the_exact_owning_open(self):
         source = (
@@ -431,8 +738,7 @@ class RouteTransferTests(unittest.TestCase):
                         "evidence": [
                             {
                                 "file": "does-not-exist.c",
-                                "start_byte": 0,
-                                "end_byte": 10,
+                                "snippet": "X(value);",
                             }
                         ],
                     }
@@ -462,7 +768,7 @@ class RouteTransferTests(unittest.TestCase):
                             {"target_arg": 1, "kind": "EXTERNAL", "expression": "999"}
                         ],
                         "guard": "true",
-                        "evidence": [{"file": "main.c", "start_byte": 0, "end_byte": len(source)}],
+                        "evidence": [{"file": "main.c", "snippet": "X(pick());"}],
                     }
                 ]
             }
@@ -478,7 +784,7 @@ class RouteTransferTests(unittest.TestCase):
 
         self.assertEqual(records[0].fact.value, "UNRESOLVED")
 
-    def test_out_of_range_evidence_becomes_unresolved(self):
+    def test_unfindable_evidence_becomes_unresolved(self):
         source = "void X(int value); int main(void) { X(pick()); return 0; }\n"
 
         async def transfer(_request):
@@ -492,8 +798,7 @@ class RouteTransferTests(unittest.TestCase):
                         "evidence": [
                             {
                                 "file": "main.c",
-                                "start_byte": 0,
-                                "end_byte": len(source) + 1,
+                                "snippet": "a line that does not exist in the file",
                             }
                         ],
                     }
@@ -535,7 +840,7 @@ class RouteTransferTests(unittest.TestCase):
             )
             records = asyncio.run(resolver.run())
 
-        self.assertEqual(calls, ["Y"])
+        self.assertEqual(calls, [])
         self.assertEqual(records[0].fact.value, "argc")
         self.assertEqual(records[0].fact.origin_kind, "EXTERNAL_ENTRY")
 

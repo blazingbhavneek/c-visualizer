@@ -191,8 +191,78 @@ class ValueFlowSchedulerTests(unittest.TestCase):
 
             self.assertEqual(sorted(completed), [llm_line, syntax_line])
             self.assertEqual(
-                {record.fact.value for record in records}, {"9", "a"}
+                {record.fact.value for record in records}, {"9", "UNRESOLVED"}
             )
+
+    def test_fast_seed_bypasses_slow_seed_prefix(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            hold = asyncio.Event()
+            active = 0
+            completed: list[int] = []
+
+            async def one_hop(site, index, expression):
+                nonlocal active
+                active += 1
+                try:
+                    await hold.wait()
+                finally:
+                    active -= 1
+                return None
+
+            def progress(seed, rows, seconds):
+                completed.append(seed.site.line)
+
+            slow_calls = "\n".join(
+                f"  target(value_{index});" for index in range(25)
+            )
+            source = (
+                "void target(int value);\n"
+                "int main(void) {\n"
+                "  int "
+                + ", ".join(f"value_{index}" for index in range(25))
+                + ";\n"
+                + slow_calls
+                + "\n  target(9);\n"
+                "  return 0;\n"
+                "}\n"
+            )
+            resolver = self.build_resolver(
+                Path(temp_dir),
+                {"main.c": source},
+                {
+                    "target": {
+                        "type": "READF",
+                        "indices": [1],
+                        "dependent_functions": [],
+                    }
+                },
+                one_hop=one_hop,
+                llm_concurrency=2,
+            )
+            resolver.progress = progress
+            literal_line = next(
+                seed.site.line
+                for seed in resolver.seeds
+                if seed.site.argument(1).text == "9"
+            )
+
+            async def scenario():
+                run_task = asyncio.create_task(resolver.run())
+                try:
+                    while not active:
+                        await asyncio.sleep(0)
+                    while literal_line not in completed:
+                        await asyncio.sleep(0)
+                    self.assertEqual(completed, [literal_line])
+                    hold.set()
+                    return await run_task
+                finally:
+                    hold.set()
+
+            records = asyncio.run(scenario())
+
+            self.assertIn(literal_line, completed)
+            self.assertEqual(len(records), 26)
 
     def test_shared_query_still_resolves_once_for_multiple_seeds(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -293,7 +363,7 @@ class ValueFlowSchedulerTests(unittest.TestCase):
                 self.assertEqual(len(records), 2)
                 self.assertEqual(
                     {record.fact.origin_kind for record in records},
-                    {"EXTERNAL_DATA"},
+                    {"UNRESOLVED"},
                 )
 
     def test_unexpected_worker_failures_propagate_without_deadlock(self):

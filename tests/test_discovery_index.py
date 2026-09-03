@@ -23,12 +23,16 @@ from pathlib import Path
 
 from call_graph.call_graph import CallGraphBuilder
 from discovery_index import (
+    STATUS_ALIAS_INTERNAL,
     STATUS_DYNAMIC,
     STATUS_EXACT,
     STATUS_EXTERNAL,
     STATUS_NO_TARGET,
     STATUS_UNREACHABLE,
     STATUS_UNRESOLVED,
+    TARGET_SITE_COLUMNS,
+    NormalizedDiscoveryFact,
+    _mark_internal_wrapper_aliases,
     build_discovery_payloads,
     build_target_site_inventory,
     legacy_answers_to_facts,
@@ -60,7 +64,7 @@ DEFS_H = """\
 #   main getrec               -> 1234 (handle link, first open)
 #   wrapper open              -> 1234 (parameter from main), READ
 #   main addque JDS_QUEUE_FNO -> 5678, ADDQUE
-#   dynamic_queue addque field -> DYNAMIC hint (g_qdef.QNo)
+#   dynamic_queue addque field -> UNRESOLVED (global read has no producer)
 #   cb_queue addque param     -> EXTERNAL (framework input)
 #   orphan_queue addque       -> UNREACHABLE (never called)
 #   fork "dyn002" literal     -> dyn002
@@ -324,6 +328,130 @@ class DiscoveryAdapterTests(unittest.TestCase):
         self.assertEqual(macro_site.arg_expression, "4321")
         self.assertEqual(macro_site.aux_lock, "MPF_MFS_WRITELOCK")
 
+    def test_full_spec_inventory_ignores_empty_preliminary_subset(self):
+        source = (
+            "void Dac_EnqSem(void *cpu, int qno);\n"
+            "int main(void) { Dac_EnqSem(0, 77); return 0; }\n"
+        )
+        path = _write(self.root, "main.c", source)
+        project = {"main.c": path}
+        trees = Preprocess().preprocess(project_structure=project)
+
+        sites = build_target_site_inventory(
+            trees=trees,
+            functions_identified={},
+            spec=SPEC,
+            project_structure={"main.c": str(path)},
+            source_root=self.root,
+            process_root=self.root,
+        )
+
+        self.assertEqual(len(sites), 1)
+        self.assertEqual(sites[0].target_function, "Dac_EnqSem")
+        self.assertEqual(sites[0].arg_index, 2)
+        self.assertEqual(sites[0].arg_expression, "77")
+
+        payloads = build_discovery_payloads(
+            process_name="process",
+            source_root=self.root,
+            process_root=self.root,
+            target_sites=sites,
+            facts=[],
+            resolver="valueflow",
+        )
+        inventory = _csv_rows(payloads["target_sites.csv"])
+        self.assertEqual(list(inventory[0]), TARGET_SITE_COLUMNS)
+        metadata = json.loads(payloads["index_metadata.json"])
+        self.assertEqual(metadata["counts"]["inventory_sites_without_facts"], 1)
+        self.assertTrue(metadata["diagnostics"])
+
+    def test_covered_wrapper_internal_call_is_evidence_only(self):
+        def fact(target, line, status, enclosing):
+            return NormalizedDiscoveryFact(
+                resolver="valueflow",
+                target_function=target,
+                target_site_file="main.c",
+                target_site_line=line,
+                arg_index=2,
+                target_expression="77",
+                resource="mfs_queue",
+                value="77",
+                operation="ADDQUE",
+                source_file="main.c",
+                source_line=line,
+                source_expr="77",
+                origin_kind="CONST",
+                resolved_by="SYNTAX",
+                link_method="",
+                path_count=1,
+                status=status,
+                metadata={"enclosing_function": enclosing},
+                resolution_status="RESOLVED" if status == STATUS_EXACT else "UNRESOLVED",
+            )
+
+        wrapper = fact("Dac_EnqSem", 20, STATUS_EXACT, "main")
+        inner = fact("mpf_mfs_addque", 5, STATUS_EXACT, "Dac_EnqSem")
+        marked = _mark_internal_wrapper_aliases(
+            [wrapper, inner], SPEC["targets"]
+        )
+
+        self.assertEqual([item.status for item in marked], [STATUS_EXACT, STATUS_ALIAS_INTERNAL])
+        self.assertTrue(marked[1].metadata["alias_internal"])
+        payloads = build_discovery_payloads(
+            process_name="process",
+            source_root=self.root,
+            process_root=self.root,
+            target_sites=[],
+            facts=marked,
+            resolver="valueflow",
+        )
+        self.assertEqual(len(_csv_rows(payloads["discovery_facts.csv"])), 2)
+        self.assertEqual(len(json.loads(payloads["mfs_queue_access.json"])["77"]), 1)
+
+        incomplete = fact("Dac_EnqSem", 20, STATUS_UNRESOLVED, "main")
+        unmarked = _mark_internal_wrapper_aliases(
+            [incomplete, inner], SPEC["targets"]
+        )
+        self.assertEqual(unmarked[1].status, STATUS_EXACT)
+
+    def test_wrapper_and_inner_call_keep_two_sites_but_one_exact_access(self):
+        env = run_valueflow_pipeline(
+            self.root,
+            {
+                "main.c": (
+                    "void mpf_mfs_addque(void *cpu, int qno, void *data);\n"
+                    "void Dac_EnqSem(void *cpu, int qno) {\n"
+                    "  mpf_mfs_addque(cpu, qno, 0);\n"
+                    "}\n"
+                    "int main(void) { Dac_EnqSem(0, 77); return 0; }\n"
+                )
+            },
+        )
+
+        rows = _csv_rows(env["payloads"]["discovery_facts.csv"])
+        self.assertEqual(
+            {row["target_function"] for row in rows},
+            {"Dac_EnqSem", "mpf_mfs_addque"},
+        )
+        metadata = {
+            row["target_function"]: json.loads(row["metadata"])
+            for row in rows
+        }
+        self.assertEqual(metadata["Dac_EnqSem"]["site_role"], "WRAPPER_CALL")
+        self.assertEqual(
+            metadata["Dac_EnqSem"]["canonical_target"],
+            "mpf_mfs_addque",
+        )
+        self.assertEqual(metadata["Dac_EnqSem"]["canonical_operation"], "ADDQUE")
+        inner = next(row for row in rows if row["target_function"] == "mpf_mfs_addque")
+        self.assertEqual(inner["status"], STATUS_ALIAS_INTERNAL)
+        self.assertEqual(
+            metadata["mpf_mfs_addque"]["site_role"],
+            "WRAPPER_IMPLEMENTATION",
+        )
+        access = json.loads(env["payloads"]["mfs_queue_access.json"])
+        self.assertEqual(len(access["77"]), 1)
+
     def test_exact_json_shapes_match_build_index(self):
         env = self.chukyu_env()
         payloads = env["payloads"]
@@ -347,18 +475,19 @@ class DiscoveryAdapterTests(unittest.TestCase):
 
         file_access = json.loads(payloads["mfs_file_access.json"])
         self.assertTrue(all(key.isdigit() for key in file_access))
-        # one record per (site, value): branches keep both values
+        # Branch opens are exact at their own sites. The later handle read is
+        # a complete two-value runtime set and therefore evidence-only.
         fno_1234 = file_access["1234"]
         self.assertEqual(len(fno_1234), 3)
         self.assertEqual(
             {(r["lock"], r["fno_raw"]) for r in fno_1234},
             {("READ", "JDS_FILE_FNO"), ("GETREC", "JDS_FILE_FNO")},
         )
-        self.assertEqual(len(file_access["1111"]), 2)
-        self.assertEqual(len(file_access["2222"]), 2)
+        self.assertEqual(len(file_access["1111"]), 1)
+        self.assertEqual(len(file_access["2222"]), 1)
         self.assertEqual(
             {(r["lock"], r["fno_raw"]) for r in file_access["1111"]},
-            {("READ", "1111"), ("GETREC", "1111")},
+            {("READ", "1111")},
         )
         self.assertEqual(file_access["4321"][0]["lock"], "WRITE")
         self.assertEqual(file_access["9999"][0]["lock"], "WRITE")
@@ -382,19 +511,7 @@ class DiscoveryAdapterTests(unittest.TestCase):
             ]
         })
 
-        dynamic = json.loads(payloads["mfs_dynamic_addque.json"])
-        self.assertEqual(
-            dynamic,
-            {
-                main_rel: [
-                    {
-                        "line": _line_of(MAIN_C, "g_qdef.QNo"),
-                        "expr": "g_qdef.QNo",
-                        "lock": "ADDQUE",
-                    }
-                ]
-            },
-        )
+        self.assertEqual(json.loads(payloads["mfs_dynamic_addque.json"]), {})
 
     def test_evidence_keeps_every_status_and_excludes_unresolved_from_json(self):
         env = self.chukyu_env(callbacks={"register_q": {"func_argument": [1]}})
@@ -405,6 +522,9 @@ class DiscoveryAdapterTests(unittest.TestCase):
         self.assertIn(STATUS_EXTERNAL, statuses)
         self.assertIn(STATUS_UNREACHABLE, statuses)
         self.assertIn(STATUS_NO_TARGET, statuses)
+        self.assertTrue(all("resolution_status" in row for row in rows))
+        self.assertTrue(all("source_expr" in row for row in rows))
+        self.assertTrue(all("value_set_id" in row for row in rows))
 
         # every inventory site appears in the evidence exactly per (value)
         site_keys = {
@@ -607,8 +727,7 @@ class DiscoveryAdapterTests(unittest.TestCase):
         self.assertEqual(fork_edges[0]["target"], "proc:dyn002")
         self.assertEqual(fork_edges[0]["source"], "proc:procv")
         dynamic_edges = [e for e in graph["edges"] if e["confidence"] == "DYNAMIC_HINT"]
-        self.assertEqual(len(dynamic_edges), 1)
-        self.assertEqual(dynamic_edges[0]["target"], "queue:DYNAMIC")
+        self.assertEqual(dynamic_edges, [])
         # one edge per call site line; the out-of-scope library fork has none
         self.assertEqual(len(fork_edges), 2)
         self.assertEqual(

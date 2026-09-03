@@ -12,6 +12,14 @@ from pathlib import Path
 
 from output_paths import process_results_dir
 from value_flow.resolver import ResolvedSeed, ValueFlowResolver
+from value_flow.status import (
+    EXTERNAL,
+    NO_TARGET,
+    RESOLVED,
+    RUNTIME,
+    UNRESOLVED,
+    classify_records,
+)
 
 FACT_COLUMNS = [
     "fact_id",
@@ -34,6 +42,8 @@ FACT_COLUMNS = [
     "metadata",
     "path_count",
     "resolved_by",
+    "resolution_status",
+    "value_set_id",
 ]
 
 PATH_COLUMNS = ["fact_id", "path_index", "path", "path_length"]
@@ -42,6 +52,7 @@ LEGACY_COLUMNS = [
     "process_name",
     "function_name",
     "target_number->ans",
+    "target_number->status",
     "call_number",
     "target_number->path_str",
     "launch_via",
@@ -52,6 +63,11 @@ LEGACY_COLUMNS = [
     "function_name_src->line_number",
     "target_name_src->path",
     "target_name_src->line_number",
+    "resolution_status",
+    "value_source->path",
+    "value_source->line_number",
+    "value_source->expression",
+    "resolution_reason",
 ]
 
 
@@ -96,6 +112,17 @@ def _target_component(value: str) -> str:
     return text
 
 
+def _legacy_target_value(status: str, values: list[str]) -> str:
+    """Keep unresolved expressions out of the compatibility answer field."""
+    if status == UNRESOLVED:
+        return UNRESOLVED
+    return (
+        "_".join(_target_component(value) for value in values)
+        if len(values) > 1
+        else values[0]
+    )
+
+
 def _output_launch_via(record: ResolvedSeed) -> str:
     """Keep launch metadata separate from local-backwalk provenance."""
     return "NO DATA" if record.seed.local_backwalk else record.seed.launch_via
@@ -125,6 +152,7 @@ def _legacy_rows(
     # pmf_setsem(process, index) needs both configured arguments combined into
     # one target name (for example, svm300d_0), while alternative source paths
     # must stay as separate rows.
+    resolution_info = classify_records(records)
     grouped: dict[tuple, list[ResolvedSeed]] = {}
     for record in records:
         key = (
@@ -139,7 +167,9 @@ def _legacy_rows(
             # key prevents values from two unrelated route arms from forming
             # a Cartesian product.  Records created by older callers have no
             # identity and intentionally retain the compatibility fallback.
-            (record.fact.metadata or {}).get("correlation_id") or "__legacy__",
+            (record.fact.metadata or {}).get("semantic_alternative_id")
+            or (record.fact.metadata or {}).get("correlation_id")
+            or "__legacy__",
         )
         grouped.setdefault(key, []).append(record)
 
@@ -155,7 +185,10 @@ def _legacy_rows(
                 )
 
         ordered_indices = sorted(choices_by_index)
-        correlation_id = (group[0].fact.metadata or {}).get("correlation_id")
+        correlation_id = (
+            (group[0].fact.metadata or {}).get("semantic_alternative_id")
+            or (group[0].fact.metadata or {}).get("correlation_id")
+        )
         if correlation_id:
             expected = {
                 int(index) for index in (group[0].seed.config.get("indices") or [])
@@ -170,11 +203,21 @@ def _legacy_rows(
         for combination in product(*(choices_by_index[index] for index in ordered_indices)):
             representative = combination[0][0]
             values = [item.fact.value for item, _ in combination]
-            target_value = (
-                "_".join(_target_component(value) for value in values)
-                if len(ordered_indices) > 1
-                else values[0]
+            statuses = {
+                resolution_info[id(item)].status for item, _ in combination
+            }
+            status = next(
+                candidate
+                for candidate in (
+                    UNRESOLVED,
+                    EXTERNAL,
+                    RUNTIME,
+                    RESOLVED,
+                    NO_TARGET,
+                )
+                if candidate in statuses
             )
+            target_value = _legacy_target_value(status, values)
             display_paths = ["->".join(labels) for _, labels in combination]
             path = " | ".join(dict.fromkeys(display_paths))
             site = representative.seed.site
@@ -193,6 +236,16 @@ def _legacy_rows(
                     "function_name_src->line_number": representative.seed.function_source_line,
                     "target_name_src->path": site.file_path,
                     "target_name_src->line_number": site.line,
+                    "target_number->status": status,
+                    "resolution_status": status,
+                    "value_source->path": representative.fact.source_file,
+                    "value_source->line_number": representative.fact.source_line,
+                    "value_source->expression": representative.fact.source_expr,
+                    "resolution_reason": str(
+                        (representative.fact.metadata or {}).get(
+                            "termination_reason", ""
+                        )
+                    ),
                 }
             )
     return rows
@@ -286,7 +339,7 @@ def write_outputs(
     """Write the fact, provenance-path, and legacy compatibility CSVs once."""
     # Output has three levels. Do not confuse them while debugging:
     #   facts.csv  = one resolved source value for one target argument
-    #   paths.csv  = every source-to-target route for that fact
+    #   paths.csv  = retained source-to-target proof/witness paths for that fact
     #   <process>.csv = values combined per target invocation for old consumers
     process_dir = process_results_dir(process_name)
     fact_path = process_dir / "facts.csv"
@@ -299,6 +352,7 @@ def write_outputs(
     fact_rows: list[dict] = []
     path_rows: list[dict] = []
     truncations: list[str] = []
+    resolution_info = classify_records(records)
     for record in records:
         fact_id = resolver.fact_id(record, process_name)
         site = record.seed.site
@@ -325,6 +379,8 @@ def write_outputs(
                 "metadata": json.dumps(fact.metadata or {}, ensure_ascii=False, sort_keys=True),
                 "path_count": record.path_count,
                 "resolved_by": fact.resolved_by,
+                "resolution_status": resolution_info[id(record)].status,
+                "value_set_id": resolution_info[id(record)].value_set_id,
             }
         )
         for path_index, path in enumerate(record.paths, start=1):
@@ -395,6 +451,19 @@ def write_outputs(
                 "",
                 f"Origins: "
                 + ", ".join(f"{key} {value}" for key, value in origins.most_common()),
+                "",
+                "## Value-flow performance",
+                "",
+                "| measure | value |",
+                "| --- | --- |",
+                f"| fast-path seeds | {stats.get('fast_path_seed_count', 0)} |",
+                f"| backward-search seeds | {stats.get('search_seed_count', 0)} |",
+                f"| unique search states | {stats.get('search_state_count', 0)} |",
+                f"| deduplicated states | {stats.get('search_deduplicated_state_count', 0)} |",
+                f"| search-limit seeds | {stats.get('search_limit_seed_count', 0)} |",
+                f"| maximum frontier | {stats.get('search_max_frontier', 0)} |",
+                f"| maximum search depth | {stats.get('search_max_depth', 0)} |",
+                f"| witness paths | {stats.get('witness_path_count', 0)} |",
                 "",
                 "### Slowest resolutions",
                 "",

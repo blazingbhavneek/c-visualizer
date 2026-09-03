@@ -373,7 +373,7 @@ write an immutable group manifest under `visualizer/groups/<group>/runs/...`
     library functions, for LLM context / summaries)
 - with `--targets`: `target_spec.py` `load_target_spec` (rejects duplicate
   keys, computes a sha256 `digest`) then `validate_target_spec` checks it
-  against the 33-target build-index contract (`EXPECTED_TARGETS`,
+  against the 39-target build-index/wrapper contract (`EXPECTED_TARGETS`,
   `OPEN_POSITIONS`, etc.). A typo there is fatal so the target set can't
   silently shrink.
 

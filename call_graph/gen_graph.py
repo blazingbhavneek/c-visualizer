@@ -356,7 +356,12 @@ def visualize_large_graph(
     # ================================================================
     results_path = graph_output_dir(destination_name)
     results_path.mkdir(parents=True, exist_ok=True)
-    net.show(str(results_path / "graph.html"), notebook=False)
+    # net.show(str(results_path / "graph.html"), notebook=False)
+    # ``show`` launches the configured browser (often VS Code in a remote
+    # shell); write the same graph without opening an IPC connection.
+    net.write_html(
+        str(results_path / "graph.html"), notebook=False, open_browser=False
+    )
     # return net
 
 

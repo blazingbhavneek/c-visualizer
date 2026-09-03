@@ -42,6 +42,7 @@ class RouteArm:
     guards: list[str] = field(default_factory=list)
     evidence: list[EvidenceSpan] = field(default_factory=list)
     transfer_chain: list[str] = field(default_factory=list)
+    table_lookups: dict[int, "TableLookup"] = field(default_factory=dict)
     # Resolver-only source witnesses.  They are intentionally not copied into
     # Fact's public shape until output materialisation.
     source_by_arg: dict[int, dict[str, Any]] = field(default_factory=dict)
@@ -61,6 +62,18 @@ class EffectiveValueSite:
     site_id: str
     value_indices: tuple[int, ...]
     link_method: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class TableLookup:
+    """Resolver-only state for a source-backed indexed array."""
+
+    selector: str
+    values: tuple[tuple[str, str, int, str], ...]
+    table_symbol: str
+    declaration_file: str
+    declaration_line: int
+    global_scope: bool = False
 
 
 @dataclass(frozen=True, slots=True)

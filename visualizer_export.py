@@ -187,9 +187,24 @@ def build_complete_file_functions(
     starting another parser for thousands of headers.
     """
     complete = {name: dict(definitions) for name, definitions in file_functions.items()}
-    for file_name, (tree, source_bytes) in trees.items():
-        if file_name not in complete:
-            complete[file_name] = _tree_function_definitions(tree, source_bytes)
+    missing = [
+        (file_name, tree, source_bytes)
+        for file_name, (tree, source_bytes) in trees.items()
+        if file_name not in complete
+    ]
+    if missing:
+        with ThreadPoolExecutor(
+            max_workers=min(8, len(missing)),
+            thread_name_prefix="visualizer-functions",
+        ) as executor:
+            extracted = executor.map(
+                lambda item: (
+                    item[0],
+                    _tree_function_definitions(item[1], item[2]),
+                ),
+                missing,
+            )
+            complete.update(extracted)
     return complete
 
 

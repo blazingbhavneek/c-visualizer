@@ -4,6 +4,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 from call_graph.call_graph import CallGraphBuilder
 from helpers.Preprocess.preprocess import Preprocess
@@ -116,6 +117,42 @@ class ValueFlowTests(unittest.TestCase):
             self.assertEqual(len({seed.site.site_id for seed in resolver.seeds}), 3)
             parameter_token = ParamQuery("[main.c]wrapper", 1).token()
             self.assertIn(parameter_token, resolver.results)
+
+    def test_macro_resolution_is_memoized_per_source_file(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            resolver = self.build_resolver(
+                Path(temp_dir),
+                {
+                    "defs.h": "#define FILE_NO 42\n",
+                    "main.c": (
+                        '#include "defs.h"\n'
+                        "void target(int value);\n"
+                        "int main(void) { target(FILE_NO); return 0; }\n"
+                    ),
+                },
+                {
+                    "target": {
+                        "type": "READF",
+                        "indices": [1],
+                        "dependent_functions": [],
+                    }
+                },
+            )
+            calls = 0
+            original = resolver._all_macros
+
+            def counted(file_name=None):
+                nonlocal calls
+                calls += 1
+                return original(file_name)
+
+            resolver._all_macros = counted
+            first = resolver._resolve_macro("FILE_NO", "main.c")
+            second = resolver._resolve_macro("FILE_NO", "main.c")
+
+            self.assertEqual(first, second)
+            self.assertEqual(first[0], "42")
+            self.assertEqual(calls, 1)
 
     def test_enum_constants_are_resolved_without_llm(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -293,7 +330,8 @@ class ValueFlowTests(unittest.TestCase):
 
             self.assertEqual(len(read_records), 1)
             self.assertEqual(read_records[0].fact.origin_kind, "UNRESOLVED")
-            self.assertEqual(read_records[0].fact.value, "HANDLE_AMBIGUOUS")
+            self.assertEqual(read_records[0].fact.value, "UNRESOLVED")
+            self.assertEqual(read_records[0].fact.source_expr, "HANDLE_AMBIGUOUS")
             self.assertNotEqual(read_records[0].fact.link_method, "LEGACY_PROXIMITY")
 
     def test_llm_value_is_a_candidate_not_an_exact_fact(self):
@@ -701,7 +739,10 @@ class ValueFlowTests(unittest.TestCase):
                 legacy = list(csv.DictReader(handle))
             self.assertEqual(len(facts), 1)
             self.assertEqual(paths[0]["fact_id"], facts[0]["fact_id"])
+            self.assertEqual(facts[0]["resolution_status"], "RESOLVED")
+            self.assertEqual(facts[0]["value_set_id"], "")
             self.assertEqual(legacy[0]["target_number->ans"], "9")
+            self.assertEqual(legacy[0]["target_number->status"], "RESOLVED")
             self.assertEqual(legacy[0]["target_name_src->line_number"], "1")
 
     def test_provenance_counts_all_value_paths_when_rows_are_capped(self):
@@ -732,6 +773,53 @@ class ValueFlowTests(unittest.TestCase):
             self.assertEqual(records[0].path_count, 2)
             self.assertEqual(len(records[0].paths), 1)
             self.assertTrue(records[0].paths_truncated)
+
+    def test_deep_provenance_chain_is_stack_safe(self):
+        resolver = object.__new__(ValueFlowResolver)
+        resolver.path_cap = 1
+        resolver.provenance = {
+            f"q{index}": {f"q{index + 1}"} for index in range(1500)
+        }
+        resolver.query_labels = {}
+        fact = SimpleNamespace(origin_query="q0")
+
+        paths, count, truncated = resolver._provenance_token_paths(fact, "q1500")
+
+        self.assertEqual(count, 1)
+        self.assertFalse(truncated)
+        self.assertEqual(len(paths[0]), 1501)
+        self.assertEqual(len(resolver.provenance_tokens(fact, "q1500")), 1501)
+
+    def test_dense_provenance_graph_is_counted_without_enumerating_every_path(self):
+        iterations = {"count": 0}
+
+        class CountedParents(set):
+            def __iter__(self):
+                iterations["count"] += 1
+                if iterations["count"] > 500:
+                    raise AssertionError("provenance paths were enumerated")
+                return super().__iter__()
+
+        resolver = object.__new__(ValueFlowResolver)
+        resolver.path_cap = 1
+        layers = 40
+        provenance = {"q0": CountedParents({"a0", "b0"})}
+        for index in range(layers - 1):
+            parents = CountedParents({f"a{index + 1}", f"b{index + 1}"})
+            provenance[f"a{index}"] = parents
+            provenance[f"b{index}"] = CountedParents(parents)
+        provenance[f"a{layers - 1}"] = CountedParents({"end"})
+        provenance[f"b{layers - 1}"] = CountedParents({"end"})
+        resolver.provenance = provenance
+        resolver.query_labels = {}
+        fact = SimpleNamespace(origin_query="q0")
+
+        paths, count, truncated = resolver._provenance_token_paths(fact, "end")
+
+        self.assertEqual(count, 2**layers)
+        self.assertTrue(truncated)
+        self.assertEqual(len(paths), 1)
+        self.assertEqual(resolver.provenance_tokens(fact, "end")[-1], "end")
 
     def test_legacy_output_emits_each_materialized_value_path_separately(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -932,12 +1020,15 @@ class ValueFlowTests(unittest.TestCase):
         self.assertEqual({record.fact.value for record in syntactic}, {"0x1007"})
 
         llm_required = [
-            record for record in access if record.fact.value == "vf_pick_file()"
+            record
+            for record in access
+            if record.fact.source_expr == "vf_pick_file()"
         ]
         self.assertTrue(llm_required, "opaque-call case should survive as LLM work")
         self.assertEqual(
-            {record.fact.origin_kind for record in llm_required}, {"EXTERNAL_DATA"}
+            {record.fact.origin_kind for record in llm_required}, {"UNRESOLVED"}
         )
+        self.assertEqual({record.fact.value for record in llm_required}, {"UNRESOLVED"})
         self.assertEqual({record.operation for record in llm_required}, {"WRITEF"})
 
         # Syntax first: the pointer-write site must never reach the LLM, while

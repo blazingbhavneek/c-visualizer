@@ -19,6 +19,36 @@ from pathlib import Path
 from pprint import pprint
 from typing import Literal
 
+
+def _load_dotenv() -> None:
+    """Load KEY=VALUE pairs from ./.env into os.environ (no override).
+
+    Minimal stdlib-only loader: the project has no python-dotenv dependency.
+    Existing environment variables always win, so an explicit shell export
+    like TRACER_VF_NO_FORK=0 still beats the .env file.  Comments (#), blank
+    lines, an optional leading "export ", and single/double quotes are
+    handled.  The file is optional; a missing .env is not an error.
+    """
+    env_file = Path(__file__).resolve().parent / ".env"
+    if not env_file.is_file():
+        return
+    for line in env_file.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        if line.startswith("export "):
+            line = line[len("export "):]
+        key, _, value = line.partition("=")
+        key = key.strip()
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+            value = value[1:-1]
+        if key and key not in os.environ:
+            os.environ[key] = value
+
+
+_load_dotenv()
+
 import clang.cindex
 import ollama
 import pandas as pd
@@ -35,6 +65,7 @@ from rich.console import Console
 from rich.markup import escape
 from rich.syntax import Syntax
 from rich.tree import Tree
+from tqdm import tqdm
 from tree_sitter import Language, Parser
 from tree_sitter_custom import language
 
@@ -157,21 +188,25 @@ RESET = "\033[0m"
 
 
 ## lists function calls only in given code, checks recursively
-def extract_function_calls(code: bytes) -> list[str]:
+def extract_function_calls(code: bytes, tree=None) -> list[str]:
     """
     RETURNS A LIST OF FUNCTION CALLED IN THIS CODE.
     """
-    # import from tree_sitter_customustompp as tsc
-    import tree_sitter_custom as tsc
-    from tree_sitter import Language, Parser
+    if tree is None:
+        # Compatibility path for callers that only have source bytes.  The
+        # main trace path passes the already-parsed Tree-sitter tree below.
+        import tree_sitter_custom as tsc
+        from tree_sitter import Language, Parser
 
-    lang = Language(tsc.language())
-    parser = Parser(lang)
-    tree = parser.parse(code)
+        lang = Language(tsc.language())
+        parser = Parser(lang)
+        tree = parser.parse(code)
 
     calls: list[str] = []
 
-    def traverse(node):
+    stack = [tree.root_node]
+    while stack:
+        node = stack.pop()
         if node.type == "call_expression":
             func_node = node.child_by_field_name("function")
             if func_node:
@@ -179,11 +214,7 @@ def extract_function_calls(code: bytes) -> list[str]:
                     "latin-1", errors="replace"
                 )
                 calls.append(name)
-
-        for child in node.children:
-            traverse(child)
-
-    traverse(tree.root_node)
+        stack.extend(reversed(node.children))
     return calls
 
 # Scans project source files to identify calls to configured functions from STATE["FUNCTION_TYPES"].
@@ -217,15 +248,32 @@ def identify_funs_to_trace(
 
     functions_to_trace = {}
 
+    source_files = [
+        (file_name, trees[file_name][0], trees[file_name][1])
+        for file_name in project_structure
+        if not file_name.endswith(".h") and file_name in trees
+    ]
+
+    def scan_file(item):
+        file_name, tree, source = item
+        return file_name, extract_function_calls(source, tree)
+
+    # These scans are independent because each worker only reads one
+    # pre-parsed tree.  map() preserves source-file order for deterministic
+    # output while keeping the pool deliberately small.
+    calls_by_file = {}
+    if source_files:
+        with ThreadPoolExecutor(
+            max_workers=min(8, len(source_files)),
+            thread_name_prefix="target-call-scan",
+        ) as executor:
+            calls_by_file.update(executor.map(scan_file, source_files))
+
     if not functions_to_detect:
         print("Data 'FUNCTION_TYPES' Not in state.")
 
-    for file_name in project_structure:
-        if file_name.endswith(".h"):
-            continue
-
-        bytes_content = trees[file_name][1]
-        functions_called = extract_function_calls(bytes_content)
+    for file_name, _tree, _source in source_files:
+        functions_called = calls_by_file[file_name]
 
         for function_name in functions_to_detect:
             if function_name in functions_called:
@@ -670,23 +718,58 @@ def llm_calls_transfer(
     ) or "(none)"
     guard_text = "\n".join(request.guards) or "true"
     system_prompt = """
-You are a conservative C value-transfer analyst. Analyze only the selected
-function and selected outgoing call on the already validated route supplied by
-the user. Do not select another call site and do not follow callers; the
-coordinator performs caller substitution.
+You are a C value-transfer analyst. One question per request: at the
+SELECTED OUTGOING CALL, where does each requested argument value come from?
 
-For every requested target argument return one binding in every live correlated
-branch arm. An EXPRESSION is a formula over the current function's formal
-parameters, using $1, $2, and so on. It may use integer or character literals,
-strings, visible macro/enum names, parentheses, and the ordinary integer,
-comparison, and logical operators. Do not use local variable names in a
-completed EXPRESSION: resolve them or return EXTERNAL/UNKNOWN. Return every
-live branch alternative and put all requested arguments in the same arm.
+Procedure, in order; STOP at the first step that applies:
+1. Read the argument expression in the call.
+2. It is a literal, a macro/enum name, or a formal parameter:
+   kind "EXPRESSION", expression = it (formal parameters written $1..$N).
+3. It is a local variable: find its last assignment before the call and
+   repeat step 2 on that value. At most 2 hops; then use step 4.
+4. It comes from another function's return value, or step 3 did not finish:
+   kind "UNKNOWN" with the unchanged source expression in `expression`.
+   A named function call is not EXTERNAL merely because this local question
+   cannot follow it; it may have a project-local definition.
+5. It enters this source from a formal entry parameter or external/global
+   data: kind "EXTERNAL" with that terminal source expression in
+   `expression` (never a bare number). Do not analyze other functions. Do
+   not follow the call. Do not guess.
 
-Every arm needs exact byte evidence from the supplied project source. Never
-calculate a final number as a guess. EXTERNAL means visible external/global/
-volatile input; UNKNOWN means the source is unsafe or cannot be determined.
-Return only the TransferAnswer JSON schema.
+A fast EXTERNAL or UNKNOWN is a GOOD answer. Never invent a number.
+Never restate the source code in the answer. Keep the whole JSON under
+1000 characters, at most 2 evidence items, one source line per snippet.
+
+Output: exactly the TransferAnswer JSON schema.
+- arms: one arm in the normal case. More arms only when a branch makes the
+  value differ; then set guard to that C condition.
+- bindings: one entry per requested target argument (1-based number).
+- expression, kind "EXPRESSION": formula over $1..$N, integer/char literals,
+  macro/enum names, parentheses, and + - * / % << >> & | ^ ~ ! && ||
+  < > <= >= == != . No local variable names.
+- expression, kind "EXTERNAL": the source expression text, e.g.
+  "Tbl[nIdx].Schfno". Never a literal number.
+- expression, kind "UNKNOWN": the unchanged expression that could not be
+  followed locally, especially a named function call.
+- evidence: 1-2 items. snippet = the exact source line(s) used, copied
+  verbatim from CURRENT FUNCTION SOURCE. Nothing else to fill in.
+
+Examples (abridged):
+Case A:
+  FORMAL PARAMETERS: $1=pFcb $2=iFno $3=iSub
+  CALL: mpf_mfs_readrec( &fcb, iSub + 1, &data );
+  REQUESTED: target argument 2
+  ANSWER:
+  {"arms": [{"bindings": [{"target_arg": 2, "kind": "EXPRESSION",
+  "expression": "$3 + 1"}], "guard": "true", "evidence":
+  [{"file": "x.c", "snippet": "mpf_mfs_readrec( &fcb, iSub + 1, &data );"}]}]}
+Case B:
+  CALL: mpf_mfs_open_H( &fcb, DynREGetSchfno(nFnoidx), 0, 0, LOCK );
+  REQUESTED: target argument 2
+  ANSWER:
+  {"arms": [{"bindings": [{"target_arg": 2, "kind": "UNKNOWN",
+  "expression": "DynREGetSchfno(nFnoidx)"}], "guard": "true", "evidence":
+  [{"file": "x.c", "snippet": "mpf_mfs_open_H( &fcb, DynREGetSchfno(nFnoidx), 0, 0, LOCK );"}]}]}
 """
     user_prompt = """
 ROUTE:
@@ -708,12 +791,8 @@ REQUESTED CORRELATED BINDINGS:
 PENDING GUARDS:
 {guards}
 
-Use $N only for an existing formal parameter N. For each evidence item set
-"snippet" to the exact source text you are citing, copied verbatim from
-CURRENT FUNCTION SOURCE (one line is enough), and set "file" to its file.
-Byte offsets are optional; if you are unsure, set start_byte and end_byte to 0
-and rely on the snippet. The coordinator will substitute selected caller
-arguments simultaneously and evaluate safe formulas.
+Answer ONLY the requested bindings for the selected call, following the
+procedure in the system prompt.
 MACRO EXPANSION CONTEXT: {macro_context}
 """
     client = OllamaClient(
@@ -811,10 +890,10 @@ def write_unique_path_report(
         pd.DataFrame(invocation_rows).to_excel(
             writer, sheet_name="unique_target_invocations", index=False
         )
-    print(
-        f"Unique-path report written to {path_report} "
-        f"({len(all_paths_rows)} paths; {len(invocation_rows)} target invocations)"
-    )
+    # print(
+    #     f"Unique-path report written to {path_report} "
+    #     f"({len(all_paths_rows)} paths; {len(invocation_rows)} target invocations)"
+    # )
     return path_report
 
 
@@ -1680,21 +1759,11 @@ async def make_value_flow_calls(
     # but also include "mpf_open" config so value-flow can resolve the handle/resource relationship.
     configured = state.get("FUNCTION_TYPES") or {}
 
-    # Build the small resolver configuration for THIS project.
-    # Start with only functions actually detected in this project.
-    # This avoids resolving every configured API from the JSON/state.
+    # Value-flow inventory and seed creation use the complete normalized
+    # registry. The resolver creates work only for call sites that exist.
     valueflow_configs = {
-        name: dict(configured.get(name, config))
-        for name, config in functions_identified.items()
+        name: dict(config) for name, config in configured.items()
     }
-
-    # A read/close API can depend on an open/create/register API.  Keep those
-    # dependency configs even when the open API was not itself a direct target.
-    # Add those dependency configs too, even if they were not direct seeds.
-    for config in functions_identified.values():
-        for dependency in config.get("dependent_functions") or []:
-            if dependency in configured:
-                valueflow_configs.setdefault(dependency, dict(configured[dependency]))
 
     # Aggregated LLM token/query stats for this whole resolver run.
     token_totals = {"Input_tokens": 0, "Output_tokens": 0, "Total_tokens": 0}
@@ -1871,7 +1940,7 @@ async def make_value_flow_calls(
             "output"
         )
 
-    resolved_count = [0]
+    seed_progress = None
 
     def report_seed(seed, rows, seconds: float) -> None:
         """
@@ -1879,17 +1948,17 @@ async def make_value_flow_calls(
 
         Called once per resolved target invocation/seed.
         """
-        resolved_count[0] += 1
+        if seed_progress is not None:
+            seed_progress.update(1)
 
-        values = ", ".join(
-            f"{row.fact.value} ({row.fact.origin_kind})" for row in rows
-        )
-
-        print(
-            f"[{resolved_count[0]}/{len(resolver.seeds)}] {seconds:6.2f}s "
-            f"{seed.target_function} {seed.site.file_name}:{seed.site.line}"
-            f" -> {values or 'no target'}"
-        )
+        # values = ", ".join(
+        #     f"{row.fact.value} ({row.fact.origin_kind})" for row in rows
+        # )
+        # print(
+        #     f"[{resolved_count[0]}/{len(resolver.seeds)}] {seconds:6.2f}s "
+        #     f"{seed.target_function} {seed.site.file_name}:{seed.site.line}"
+        #     f" -> {values or 'no target'}"
+        # )
 
     # Check whether the optional LLM endpoint is available.  If it is down,
     # the same route-guided engine remains active with direct source constants
@@ -1927,7 +1996,7 @@ async def make_value_flow_calls(
             transfer_model_id=os.environ.get("TRACER_LLM_MODEL", TRACER_DEFAULT_MODEL),
             # The opaque-grammar flag changes which formulas validate, so an
             # answer cached with it on must never be served with it off.
-            transfer_prompt_version="valueflow-transfer-v2"
+            transfer_prompt_version="valueflow-transfer-v4"
             + ("-opaque" if os.environ.get("TRACER_VF_GRAMMAR_EXTENDED") == "1" else ""),
             return_use_resolver=resolve_return_use if llm_ready else None,
             cache_path=cache_path,
@@ -1945,7 +2014,14 @@ async def make_value_flow_calls(
 
         # Main resolver execution.
         # Produces fact records: target call + resolved value + paths/evidence.
-        records = await resolver.run()
+        with tqdm(
+            total=len(resolver.seeds),
+            desc="Resolving seeds",
+            unit="seed",
+            mininterval=0.2,
+            dynamic_ncols=True,
+        ) as seed_progress:
+            records = await resolver.run()
 
         # Root/reachability state for the discovery index: which functions a
         # recognized root reaches directly, which only through callbacks, and
@@ -1984,12 +2060,20 @@ async def make_value_flow_calls(
         "transfer_rejections": dict(resolver.transfer_rejections),
         "transfer_prompt_version": resolver.transfer_prompt_version,
         "transfer_model_id": resolver.transfer_model_id,
+        "fast_path_seed_count": resolver.fast_path_seed_count,
+        "search_seed_count": resolver.search_seed_count,
+        "search_state_count": resolver.search_state_count,
+        "search_deduplicated_state_count": resolver.search_deduplicated_state_count,
+        "search_limit_seed_count": resolver.search_limit_seed_count,
+        "search_max_frontier": resolver.search_max_frontier,
+        "search_max_depth": resolver.search_max_depth,
+        "witness_path_count": resolver.witness_path_count,
         "Tokens": token_totals,
         "queries": query_stats,
     }
 
     # Write machine-readable resolver outputs.  facts.csv keeps individual
-    # values; paths.csv keeps every source-to-target provenance chain; the
+    # values; paths.csv keeps retained source-to-target proof/witness paths; the
     # top-level process CSV is the compatibility feed used by the visualizer.
     # Usually includes fact rows and path rows under the process result folder.
     output_paths = write_outputs(
@@ -2356,7 +2440,7 @@ def trace_variable(
 
     for files in PROJECT_STRUCTURE.keys():
         # Collect per-file macros and includes for later analysis.
-        macros[files] = extract_all_macros(PROJECT_STRUCTURE[files])
+        macros[files] = extract_all_macros(PROJECT_STRUCTURE[files], trees[files][1])
         file_includes[files] = extract_includes(PROJECT_STRUCTURE[files])
 
         # Headers do not contain project entry-point functions.
@@ -2618,7 +2702,7 @@ def trace_variable(
             # A discovery-index failure must not hide the resolver result.
             print(f"Failed to write discovery index: {index_exc}")
 
-    if functions_identified == {}:
+    if functions_identified == {} and resolver != "valueflow":
         print(
             f"{BOLD}{RED}NO FUNCTIONS IDENTIFIED IN THE PROJECT {process_name}.{RESET}"
         )
@@ -3062,7 +3146,7 @@ if __name__ == "__main__":
                 source_root=command_args.source_root,
             )
 
-            console.print(summary)
+            # console.print(summary)
 
             graph_path = STATE.get("VISUALIZER_GRAPH_PATH")
             if graph_path and Path(graph_path).is_file():

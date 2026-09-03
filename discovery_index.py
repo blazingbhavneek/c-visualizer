@@ -39,6 +39,7 @@ import json
 import os
 import re
 import tempfile
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from io import StringIO
@@ -54,6 +55,7 @@ from target_spec import (
     resource_for,
 )
 from value_flow.handles import strip_outer_parens
+from value_flow.status import classify_records, from_discovery_status
 
 DISCOVERY_SCHEMA_VERSION = 3
 
@@ -94,6 +96,24 @@ EVIDENCE_COLUMNS = [
     "owner_process",
     "owner_kind",
     "metadata",
+    # Additive semantic fields. Existing ``status`` remains the exact-index
+    # promotion gate for compatibility with downstream index consumers.
+    "resolution_status",
+    "source_expr",
+    "value_set_id",
+]
+
+TARGET_SITE_COLUMNS = [
+    "target_function",
+    "target_site_file",
+    "target_site_line",
+    "arg_index",
+    "target_expression",
+    "operation",
+    "aux_lock",
+    "macro_name",
+    "unmapped_args",
+    "in_process",
 ]
 
 # Discovery fact statuses.  EXACT rows may feed the exact JSON indexes; every
@@ -105,6 +125,7 @@ STATUS_DYNAMIC = "DYNAMIC"
 STATUS_NO_TARGET = "NO_TARGET"
 STATUS_UNREACHABLE = "UNREACHABLE"
 STATUS_CYCLE = "CYCLE"
+STATUS_ALIAS_INTERNAL = "ALIAS_INTERNAL"
 
 # Reachability dimension, kept separate from value-resolution ``status``.
 # Promotion to the exact JSON indexes requires status EXACT, in_process, and a
@@ -379,28 +400,41 @@ def build_target_site_inventory(
     configured targets, including calls reached through renaming macros.  No
     value resolution, reachability, or LLM work happens here.
     """
-    targets = (spec or {}).get("targets") or {}
+    targets = (spec or {}).get("targets") or functions_identified
     discovery_targets: dict[str, dict[str, Any]] = {}
-    for name, config in functions_identified.items():
-        entry = targets.get(name) or config
-        if discovery_args_for(entry):
-            discovery_targets[name] = entry
+    for name, config in targets.items():
+        if discovery_args_for(config):
+            discovery_targets[name] = config
 
     prefix = process_relative_prefix(source_root, process_root)
     macros = macros or {}
     sites: list[TargetSite] = []
 
-    for file_name in sorted(trees):
-        if file_name.endswith(".h"):
-            continue
-        tree, source = trees[file_name]
+    source_files = [
+        (file_name, tree, source)
+        for file_name, (tree, source) in sorted(trees.items())
+        if not file_name.endswith(".h")
+    ]
+
+    def scan_file(item):
+        file_name, tree, source = item
+        return file_name, list(_iter_call_expressions(tree.root_node, source))
+
+    scanned_files = []
+    if source_files:
+        with ThreadPoolExecutor(
+            max_workers=min(8, len(source_files)),
+            thread_name_prefix="discovery-call-scan",
+        ) as executor:
+            scanned_files = list(executor.map(scan_file, source_files))
+
+    for file_name, call_expressions in scanned_files:
+        source = trees[file_name][1]
         file_path = str(project_structure.get(file_name, ""))
         rel_path = rel_to_source_root(file_path or file_name, source_root)
         in_process = is_in_process(rel_path, prefix)
 
-        for func_name, arguments_node, line, _start_byte in _iter_call_expressions(
-            tree.root_node, source
-        ):
+        for func_name, arguments_node, line, _start_byte in call_expressions:
             target_name: str | None = None
             macro_name: str | None = None
             entry = discovery_targets.get(func_name)
@@ -528,10 +562,16 @@ class NormalizedDiscoveryFact:
     # never treated as proven dead code.
     reachability: str = REACH_UNKNOWN
     metadata: dict[str, Any] = field(default_factory=dict)
+    resolution_status: str = ""
+    value_set_id: str = ""
 
 
 def _classify_valueflow_fact(
-    record: Any, resource: str, operation: str, target_expression: str
+    record: Any,
+    resource: str,
+    operation: str,
+    target_expression: str,
+    semantic_status: str,
 ) -> tuple[str, str]:
     """(status, value) for one value-flow record fact."""
     fact = record.fact
@@ -545,13 +585,22 @@ def _classify_valueflow_fact(
             return STATUS_NO_TARGET, ""
         return STATUS_UNRESOLVED, ""
 
-    if origin in {"CONST", "MACRO"}:
-        # A source-grounded constant behind an unresolved route guard is
-        # evidence, not one exact runtime value.  The resolver keeps the guard
-        # in metadata so the discovery index can remain conservative without
-        # changing the CSV schema.
-        if (fact.metadata or {}).get("guards"):
-            return STATUS_UNRESOLVED, value
+    if origin == "LLM_CANDIDATE":
+        return STATUS_UNRESOLVED, value
+
+    if semantic_status == "UNRESOLVED":
+        return STATUS_UNRESOLVED, value
+    if semantic_status == "EXTERNAL":
+        return STATUS_EXTERNAL, value
+    if semantic_status == "RUNTIME":
+        return STATUS_DYNAMIC, value
+
+    if semantic_status == "RESOLVED" and origin in {
+        "CONST",
+        "MACRO",
+        "CONST_TABLE",
+        "BOUNDED_SET",
+    }:
         if resource in {"mfs_file", "mfs_queue"}:
             if to_decimal(value) is not None and operation:
                 return STATUS_EXACT, value
@@ -560,30 +609,6 @@ def _classify_valueflow_fact(
             if package_name(value) is not None:
                 return STATUS_EXACT, value
             return STATUS_UNRESOLVED, value
-
-    # An LLM may suggest a useful candidate, but it has not proved the value
-    # through the parsed source tree.  Keep it visible in evidence while
-    # preventing it from entering the exact index.
-    if origin == "LLM_CANDIDATE":
-        return STATUS_UNRESOLVED, value
-
-    # Bounded source-backed sets are valid evidence but not one exact runtime
-    # path.  Keep status conservative so exact indexes cannot flatten them.
-    if origin in {"CONST_TABLE", "BOUNDED_SET"}:
-        return STATUS_UNRESOLVED, value
-
-    if origin in {"EXTERNAL_DATA", "EXTERNAL_ENTRY"}:
-        if resource == "mfs_queue" and is_dynamic_queue_expression(target_expression):
-            return STATUS_DYNAMIC, value
-        return STATUS_EXTERNAL, value
-
-    if origin == "UNKNOWN_INDIRECT":
-        if resource == "mfs_queue" and is_dynamic_queue_expression(target_expression):
-            return STATUS_DYNAMIC, value
-        return STATUS_UNRESOLVED, value
-
-    if origin == "RECURSIVE":
-        return STATUS_CYCLE, value
 
     return STATUS_UNRESOLVED, value
 
@@ -681,9 +706,9 @@ def _unreachable_facts(
                 resource=resource_for(targets.get(site.target_function) or {}),
                 value="",
                 operation=site.operation,
-                source_file="",
-                source_line=0,
-                source_expr="",
+                source_file=site.site_file,
+                source_line=site.site_line,
+                source_expr=site.arg_expression,
                 origin_kind="",
                 resolved_by="",
                 link_method="",
@@ -694,6 +719,12 @@ def _unreachable_facts(
                     resolver_state,
                     in_process=site.in_process,
                 ),
+                metadata={
+                    "source_role": "TARGET_FALLBACK",
+                    "trace_complete": False,
+                    "termination_reason": "UNREACHABLE_TARGET",
+                },
+                resolution_status="UNRESOLVED",
             )
         )
     return rows
@@ -762,6 +793,7 @@ def valueflow_records_to_facts(
     site_index = _make_site_index(sites)
     facts: list[NormalizedDiscoveryFact] = []
     covered: set[tuple] = set()
+    resolution_info = classify_records(records)
 
     for record in records:
         site_ref = record.seed.site
@@ -778,8 +810,13 @@ def valueflow_records_to_facts(
             operation = LOCK_MAP.get(lock_text, "")
 
         fact = record.fact
+        semantic = resolution_info[id(record)]
         status, value = _classify_valueflow_fact(
-            record, resource, operation, site.arg_expression if site else ""
+            record,
+            resource,
+            operation,
+            site.arg_expression if site else "",
+            semantic.status,
         )
         in_process = site.in_process if site is not None else True
         caller_id = getattr(getattr(record, "seed", None), "site", None)
@@ -793,6 +830,15 @@ def valueflow_records_to_facts(
             # Same-function backwalk proves a source-valid value, not root
             # reachability; keep it a separate, explicitly labeled row.
             row_reachability = REACH_LOCAL_BACKWALK
+        metadata = dict(getattr(fact, "metadata", {}) or {})
+        caller_name = str(getattr(site_ref, "caller_id", "") or "")
+        if "]" in caller_name:
+            caller_name = caller_name.rsplit("]", 1)[-1]
+        metadata["enclosing_function"] = caller_name
+        if entry.get("semantic_wrapper"):
+            metadata["site_role"] = "WRAPPER_CALL"
+            metadata["canonical_target"] = entry.get("canonical_target", "")
+            metadata["canonical_operation"] = operation
         facts.append(
             NormalizedDiscoveryFact(
                 resolver="valueflow",
@@ -814,12 +860,49 @@ def valueflow_records_to_facts(
                 status=status,
                 in_process=in_process,
                 reachability=row_reachability,
-                metadata=dict(getattr(fact, "metadata", {}) or {}),
+                metadata=metadata,
+                resolution_status=semantic.status,
+                value_set_id=semantic.value_set_id,
             )
         )
 
     facts.extend(_unreachable_facts(sites, covered, "valueflow", targets, resolver_state))
-    return _dedupe_facts(facts)
+    facts = _dedupe_facts(facts)
+    return _mark_internal_wrapper_aliases(facts, targets)
+
+
+def _mark_internal_wrapper_aliases(
+    facts: list[NormalizedDiscoveryFact], targets: dict[str, Any]
+) -> list[NormalizedDiscoveryFact]:
+    """Keep wrapper implementation sites as evidence without double promotion."""
+    wrappers = {
+        name: str(entry.get("canonical_target") or "")
+        for name, entry in targets.items()
+        if entry.get("semantic_wrapper") and entry.get("canonical_target")
+    }
+    covered = {
+        (name, canonical, fact.operation, fact.value)
+        for fact in facts
+        for name, canonical in wrappers.items()
+        if fact.target_function == name
+        and fact.status == STATUS_EXACT
+        and fact.resolution_status == "RESOLVED"
+    }
+    output: list[NormalizedDiscoveryFact] = []
+    for fact in facts:
+        enclosing = str((fact.metadata or {}).get("enclosing_function") or "")
+        canonical = wrappers.get(enclosing)
+        if not canonical or fact.target_function != canonical:
+            output.append(fact)
+            continue
+        metadata = {**(fact.metadata or {}), "site_role": "WRAPPER_IMPLEMENTATION"}
+        key = (enclosing, canonical, fact.operation, fact.value)
+        if key in covered and fact.status == STATUS_EXACT:
+            metadata["alias_internal"] = True
+            output.append(replace(fact, status=STATUS_ALIAS_INTERNAL, metadata=metadata))
+        else:
+            output.append(replace(fact, metadata=metadata))
+    return output
 
 
 def legacy_answers_to_facts(
@@ -996,6 +1079,30 @@ def build_discovery_payloads(
     ]
     dynamic = [f for f in facts if f.status == STATUS_DYNAMIC and f.in_process]
 
+    target_site_rows = [
+        {
+            "target_function": site.target_function,
+            "target_site_file": site.site_file,
+            "target_site_line": site.site_line,
+            "arg_index": site.arg_index,
+            "target_expression": site.arg_expression,
+            "operation": site.operation,
+            "aux_lock": site.aux_lock,
+            "macro_name": site.macro_name or "",
+            "unmapped_args": site.unmapped_args,
+            "in_process": site.in_process,
+        }
+        for site in sorted(
+            target_sites,
+            key=lambda item: (
+                item.site_file,
+                item.site_line,
+                item.arg_index,
+                item.target_function,
+            ),
+        )
+    ]
+
     # --- forkproc ----------------------------------------------------------
     forkproc_callers: dict[str, set[str]] = {}
     forkproc_targets: dict[str, set[tuple[int, str]]] = {}
@@ -1089,6 +1196,13 @@ def build_discovery_payloads(
             "owner_process": "",
             "owner_kind": "",
             "metadata": json.dumps(f.metadata or {}, ensure_ascii=False, sort_keys=True),
+            "resolution_status": (
+                f.resolution_status or from_discovery_status(f.status)
+            ),
+            "source_expr": f.source_expr,
+            "value_set_id": (
+                f.value_set_id or str((f.metadata or {}).get("set_id") or "")
+            ),
         }
         for f in facts
     ]
@@ -1105,12 +1219,40 @@ def build_discovery_payloads(
 
     # --- metadata ---------------------------------------------------------------
     status_counts: dict[str, int] = {}
+    resolution_status_counts: dict[str, int] = {}
     reachability_counts: dict[str, int] = {}
     for fact in facts:
         status_counts[fact.status] = status_counts.get(fact.status, 0) + 1
+        resolution_status = (
+            fact.resolution_status or from_discovery_status(fact.status)
+        )
+        resolution_status_counts[resolution_status] = (
+            resolution_status_counts.get(resolution_status, 0) + 1
+        )
         reachability_counts[fact.reachability] = (
             reachability_counts.get(fact.reachability, 0) + 1
         )
+    inventory_keys = {
+        (site.target_function, site.site_file, site.site_line, site.arg_index)
+        for site in target_sites
+    }
+    fact_keys = {
+        (
+            fact.target_function,
+            fact.target_site_file,
+            fact.target_site_line,
+            fact.arg_index,
+        )
+        for fact in facts
+    }
+    inventory_sites_without_facts = len(inventory_keys - fact_keys)
+    facts_without_inventory_site = len(fact_keys - inventory_keys)
+    diagnostics: list[str] = []
+    if target_sites and not facts:
+        diagnostics.append(
+            "Configured target sites were found, but resolver produced zero facts."
+        )
+
     metadata = {
         "schema_version": DISCOVERY_SCHEMA_VERSION,
         "pipeline": "c-visualizer",
@@ -1131,7 +1273,10 @@ def build_discovery_payloads(
             "target_sites": len(target_sites),
             "target_sites_in_process": sum(1 for s in target_sites if s.in_process),
             "facts": len(facts),
+            "inventory_sites_without_facts": inventory_sites_without_facts,
+            "facts_without_inventory_site": facts_without_inventory_site,
             "evidence_statuses": dict(sorted(status_counts.items())),
+            "resolution_statuses": dict(sorted(resolution_status_counts.items())),
             "reachability": dict(sorted(reachability_counts.items())),
             "forkproc_callers": len(forkproc_callers_json),
             "mfs_file_access_entries": sum(len(v) for v in mfs_file_access.values()),
@@ -1144,10 +1289,12 @@ def build_discovery_payloads(
             "Records for call sites outside the process root are evidence-only "
             "(out-of-scope); they never enter the exact JSON indexes.",
         ],
+        "diagnostics": diagnostics,
     }
 
     return {
         "index_metadata.json": json.dumps(metadata, ensure_ascii=False, indent=2) + "\n",
+        "target_sites.csv": _csv_text(TARGET_SITE_COLUMNS, target_site_rows),
         "discovery_facts.csv": _csv_text(EVIDENCE_COLUMNS, evidence_rows),
         "forkproc_callers.json": _compact_json(forkproc_callers_json),
         "forkproc_targets_by_caller.json": _compact_json(forkproc_targets_json),

@@ -103,7 +103,7 @@ class ProcessGroupTests(unittest.TestCase):
                 state = load_project_state(json_dir, targets_path=spec)
                 self.assertEqual(state.get("FUNCTION_POINTER_ARGS"), {})
                 self.assertEqual(state.get("FUNCTION_MAP"), {})
-                self.assertEqual(len(state.get("FUNCTION_TYPES")), 33)
+                self.assertEqual(len(state.get("FUNCTION_TYPES")), 39)
             finally:
                 State().reset()
 
@@ -254,7 +254,7 @@ class TargetOverrideTests(unittest.TestCase):
                     json_dir, targets_path=self.CANONICAL_SPEC
                 )
                 spec = state.get("TARGET_SPEC")
-                self.assertEqual(len(spec["targets"]), 33)
+                self.assertEqual(len(spec["targets"]), 39)
                 self.assertEqual(state.get("FUNCTION_TYPES"), spec["targets"])
                 self.assertEqual(state.get("FUNCTION_POINTER_ARGS"), {})
                 self.assertEqual(state.get("FUNCTION_MAP"), {})

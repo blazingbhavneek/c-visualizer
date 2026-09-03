@@ -1,1787 +1,1364 @@
-# Value-Flow Transfer Resolver — Problem Inventory and Repair Plan
+# C-Visualizer: minimal-diff reliability, accuracy, and performance plan
 
-Scope: `value_flow/resolver.py`, `value_flow/transfers.py`, `models.py`,
-`project_aware.py`, `client/llm.py`.
+## 0. Purpose
 
-Symptoms being addressed:
+This plan improves the existing C-Visualizer value-flow pipeline without changing its basic design.
 
-1. High UNRESOLVED rate on real projects (resolved answers are accurate).
-2. Very long prompts / high prefill time per LLM hop.
-3. Wasted LLM calls — answers that are computed and then discarded.
+The required outcome is:
 
-Ground rule for every change below: **minimal, additive, reversible.** No
-refactors, no renames, no schema field removals. Every new model field has a
-default so old cache entries still validate. Every behavioural change is
-either (a) strictly more permissive on a path that currently discards data, or
-(b) gated so the old path remains reachable.
+1. Keep the values that C-Visualizer already resolves correctly.
+2. Stop correct constants and macros from being labelled unresolved only because the call is inside an `if` statement.
+3. List every configured target call found by the AST, even when the call is not reachable from the selected process root.
+4. Fix the silent-zero case where a successful run reports no target sites even though configured target calls exist.
+5. Stop Python recursion failures in the preprocessing and inventory stages.
+6. Avoid enumerating every complete root-to-target call path before resolving a target value.
+7. Resolve cheap, deterministic values before doing any inter-function search or LLM work.
+8. Search backward from the target value with bounded, fair breadth-first search when local resolution is not enough.
+9. Never turn an incomplete or truncated search into a false exact result.
+10. Distinguish a successfully traced runtime value from a value the analyzer failed to trace.
+11. Put a useful source file, source line, and source expression on every output row.
+12. Keep the implementation diff as small and local as possible.
 
-Nothing here has been executed. Line numbers are from the working tree at the
-time of writing and should be confirmed before editing.
+This is an implementation plan only. It does not authorize reading the old regex implementation or proprietary source trees.
 
 ---
 
-## Part 1 — Problem inventory
-
-Each item is marked **Confirmed** (read directly in the code) or **Likely**
-(strongly implied but not executed).
-
-### A. Prompt / context problems
-
-**P1 — `function_source` is the entire file, not the function. (Confirmed)**
-
-`FunctionInfo.source` is assigned the whole file's bytes:
-
-- `value_flow/resolver.py:471` — `source = self.trees.get(function_node.file_name, (None, b""))[1]`
-- `value_flow/resolver.py:503` — `source=source,`
-
-It must be the whole file, because `_local_reaching_definitions` and
-`node_text()` index it with absolute Tree-sitter byte offsets.
-
-But it is then handed straight to the model:
-
-- `value_flow/resolver.py:2809` — `function_source=current_function.source.decode("latin-1", errors="replace")`
-- rendered in `project_aware.py` under the label `CURRENT FUNCTION SOURCE:`
-
-Consequences:
-
-- Every transfer hop ships an entire C translation unit. This is the direct
-  cause of the prefill-time problem.
-- `num_ctx` is 110000 (`client/llm.py:74`). Large files silently truncate, and
-  what gets cut is the tail — which may include the schema instructions.
-- The model is told it is looking at one function and given a whole file.
-- It also poisons the cache key (see P2).
-
-**P2 — Cache key digests the whole file. (Confirmed)**
-
-`value_flow/resolver.py:2810` passes `function_source=current_function.source`
-into `make_transfer_cache_key`. Editing *any* function in a file invalidates
-every cached transfer for *every* function in that file.
-
-**P3 — Whole-file decode and SHA run before the cache lookup. (Confirmed)**
-
-In `request_local_transfer` the order is: build `macro_context` → sha256 →
-`make_transfer_cache_key` (whole-file sha256) → build `TransferRequest`
-(whole-file `.decode("latin-1")`) → *then* check `self.transfer_cache`
-(`value_flow/resolver.py:2790-2827`). Every cache hit still pays a full
-whole-file decode plus two whole-file digests. With high route fan-out this is
-likely the dominant CPU cost of a "mostly cached" run.
-
-**P4 — Macro/enum values are not supplied to the model. (Confirmed)**
-
-The transfer prompt allows macro and enum identifiers in a formula
-(`_transfer_visible_names`, `value_flow/resolver.py:2552`) but never tells the
-model what those names expand to. The repo already has this capability —
-`parser/parser_files.py:177 all_macros_in_file()` plus the
-`//NAME=value` filtered-macro block emitted at the end of `parse_for_path` —
-but it is only wired into the *legacy* one-hop prompt via `context_for`
-(`project_aware.py:1732`), not into the transfer prompt.
-
-Note: `parseFiles` reads from **disk** and runs `_format_code()`, so its output
-does not share byte offsets with `resolver.trees`. It cannot be dropped into
-the transfer prompt as-is without breaking evidence spans. The plan below
-reuses the *idea* (trimmed body + `//NAME=value` block) using data the resolver
-already holds.
-
-### B. Evidence / answer-validation problems
-
-**P5 — A single degenerate byte span discards the entire answer. (Confirmed — this is the reported `start_byte == end_byte` failure)**
-
-`models.py:33-40`:
-
-```python
-start_byte: int = Field(ge=0)
-end_byte: int = Field(gt=0)
-
-@model_validator(mode="after")
-def validate_range(self):
-    if self.end_byte <= self.start_byte:
-        raise ValueError("end_byte must be greater than start_byte")
-```
-
-That raise propagates out of `TransferAnswerModel.model_validate` in
-`_validate_transfer_answer` (`value_flow/resolver.py:2688-2694`), which returns
-`None`, which makes `request_local_transfer` return `None`, which marks every
-pending binding `UNKNOWN / "UNRESOLVED"` (`value_flow/resolver.py:3219-3226`).
-
-So: the model does the work, gets the *bindings* right, emits one span with
-`start == end`, and the whole hop is thrown away. This is the single most
-wasteful failure mode in the pipeline — it is pure discarded compute.
-
-**P6 — One bad span discards a whole arm. (Confirmed)**
-
-`value_flow/resolver.py:2708-2714`: an unresolvable file or an out-of-range
-`end_byte` sets `valid_spans = False` and `break`s, dropping the arm even when
-other spans were fine.
-
-**P7 — `_resolve_project_file` fails on ambiguous basenames. (Confirmed)**
-
-`value_flow/resolver.py:2663-2675`. Resolution order is exact key → resolved
-absolute path → basename match, and the basename match requires
-`len(matches) == 1`. Any project with several `common.h` / `main.c` / `def.h`
-copies fails here, and P6 then drops the arm.
-
-**P8 — Arms must cover the pending set exactly. (Confirmed)**
-
-`value_flow/resolver.py:2700`: `set(indices) != pending_set` → `continue`. If
-the model resolves two of three requested arguments, the two correct bindings
-are discarded along with the third.
-
-**P9 — An inexpressible guard destroys valid bindings. (Confirmed)**
-
-`value_flow/resolver.py:2727-2762`: the guard is validated first, inside the
-same `try` as the bindings. `if (ctx->state == READY)` is outside the formula
-grammar → `FormulaError` → `continue` → the arm's bindings are lost. A guard
-can only ever *narrow* an answer; discarding the answer because the guard is
-inexpressible is backwards.
-
-**P10 — The formula grammar excludes ordinary C. (Confirmed)**
-
-`value_flow/transfers.py:196-236` (`_validate_node`) accepts only
-`parenthesized_expression`, literals, identifiers, `unary_expression`,
-`binary_expression`. No field access, subscript, dereference, ternary, or call.
-
-**P11 — Literal/evidence check is a raw substring match. (Confirmed)**
-
-`value_flow/transfers.py:255-262`: `if literal not in evidence: raise`. `0x10`
-vs `16`, `1U` vs `1`, `'\n'` vs `10` all fail even when the answer is right.
-
-### C. Structural UNRESOLVED that never reaches the model
-
-**P12 — Missing `ast_node` ⇒ `parameters = []` ⇒ every arm rejected. (Confirmed mechanism, Likely frequency)**
-
-`_build_function_index` (`value_flow/resolver.py:472-479`) matches a registry
-function to a Tree-sitter `function_definition` **by name only**. Anything
-Tree-sitter does not parse as a plain `function_definition` — macro-decorated
-signatures (`EXTERN`, `CALLBACK`, `PASCAL`, `__declspec`), K&R definitions, a
-definition inside an unresolved conditional — leaves `ast_node = None` and
-therefore `parameters = []`. Then:
-
-- the prompt reports `FORMAL PARAMETERS (1-based): (void)`;
-- `validate_formula(parameter_count=0)` rejects any `$N` with
-  "parameter $N does not exist" (`value_flow/transfers.py:222-224`);
-- `_mark_external_or_unknown` with empty `parameter_names` yields UNKNOWN
-  instead of EXTERNAL_ENTRY (`value_flow/resolver.py:2988-2997`);
-- the entry-point shortcut at `value_flow/resolver.py:3179-3195` can never fire.
-
-One index miss turns every hop through that function into UNRESOLVED, silently.
-
-**P13 — Handle-dependent targets fail before any model call. (Confirmed)**
-
-`_opening_for_route` (`value_flow/resolver.py:3312`) accepts only
-`len(bindings) == 1`. Zero candidate opens *and also* two-or-more both return
-`None`; `_resolve_seed_with_transfers` then emits
-`Binding(index, "UNKNOWN", "HANDLE_AMBIGUOUS")` for the whole seed
-(`value_flow/resolver.py:3484-3493`). Two opens in an if/else branch on the
-same FCB is ordinary C, and the engine already supports multiple arms.
-
-**P14 — Macro sites poison arms that do not depend on them. (Confirmed)**
-
-`_substitute_arm` (`value_flow/resolver.py:2928-2931`) returns `None` on
-`site.macro_args_unmapped` **before** checking whether the arm contains any
-`$N` placeholder at all. And the caller routes that `None` to
-`_mark_external_or_unknown(child, external=False)`
-(`value_flow/resolver.py:3266-3268`) → **UNKNOWN**, whereas the structurally
-equivalent callback bail-out uses `external=True` → EXTERNAL_ENTRY.
-
-`macro_args_unmapped` is set generously by `_macro_call_arguments`: macro not in
-`builder_macros`, any `##` or stringification, variadic, or arity mismatch.
-
-**P15 — `_macro_call_arguments` can return an empty argument list marked reliable. (Confirmed)**
-
-`value_flow/resolver.py:648` — `return [], True`. Every `site.argument(i)` is
-then `None`, so `initial_route_arm` emits `Binding(index, "UNKNOWN", "missing argument")`
-(`value_flow/resolver.py:2530`) with no model call. This looks like a plain bug.
-
-**P16 — `start_byte` falls back to a list ordinal. (Confirmed)**
-
-`_build_call_index`: when `call_site.start_byte < 0` and `ast_node is None`,
-`start_byte = ordinal` — an index used as a byte offset. That produces a
-garbage `site_id`, a garbage `SELECTED OUTGOING CALL (n:m)` in the prompt, and
-an empty `selected_site_source` slice in the cache key. `call_text` also
-degrades to the bare `callee_name`, so the model is asked about a call it
-cannot see.
-
-### D. Information destroyed at the output boundary
-
-**P17 — UNKNOWN bindings discard the traced expression. (Confirmed)**
-
-`_fact_from_transfer_binding` (`value_flow/resolver.py:3049-3050`):
-
-```python
-value = "UNRESOLVED"
-origin = "RECURSIVE" if binding.text == "RECURSIVE" else "UNRESOLVED"
-```
-
-`_mark_external_or_unknown` carefully preserves the substituted expression in
-`binding.text`, and this then throws it away.
-
-Compare the legacy engine for the same situation — `_resolve_expression`
-(`value_flow/resolver.py:1284-1298`) returns
-`Fact(value=raw, origin_kind="EXTERNAL_DATA" | "UNKNOWN_INDIRECT")`, i.e. it
-hands back `cfg->file_no`. This asymmetry is a plausible reason the transfer
-engine *feels* far more unresolved than what it replaced.
-
-**P18 — `_legacy_rows` silently drops whole groups. (Confirmed)**
-
-`value_flow/outputs.py:157-163`: if a correlated group's argument indices do
-not exactly equal the configured `indices`, `continue` — the target invocation
-vanishes from the legacy CSV entirely. Some rows believed "unresolved" may
-actually be missing.
-
-### E. Bugs
-
-**P19 — `active` set leaks on transfer failure, mislabelling later arms RECURSIVE. (Confirmed)**
-
-`active.add(state_key)` at `value_flow/resolver.py:3212`;
-`active.discard(state_key)` at `3278`; but the failure path at `3219-3226`
-`continue`s and skips the discard. Any later arm in the same route walk with an
-identical state is then labelled `RECURSIVE` rather than retried. This also
-corrupts the diagnostics you would use to debug all of the above.
-
-### F. Speed
-
-**P20 — Every LLM hop forks a process. (Confirmed)**
-
-`run_with_retry` (`project_aware.py:812`) uses `multiprocessing` fork with
-`process.join(timeout=600)` and `retries=2`. Each child copy-on-writes a parent
-holding all trees, ASTs and the registry; CPython refcounting dirties those
-pages for real. Worst case per hop is 20 minutes before returning `None` →
-UNRESOLVED. There is also a pipe-capacity hazard: the child `conn.send`s while
-the parent is inside `join()`, so a payload exceeding the pipe buffer blocks the
-child, the join times out, and a *successful* answer is killed and recorded as
-a timeout.
-
-**P21 — The whole cache is discarded whenever any file changes. (Confirmed)**
-
-`_load_cache` (`value_flow/resolver.py:993-998`) returns early on a
-`cache_fingerprint` mismatch, and `cache_fingerprint` digests every byte of
-every project file (`value_flow/resolver.py:427-433`). One edit throws away
-every transfer answer — even though `make_transfer_cache_key` already digests
-the function source, the site source, the prompt version and the model id, and
-is therefore self-validating per entry.
-
-**P22 — `routes_for_seed` is an uncached exponential DFS called repeatedly. (Confirmed)**
-
-Five call sites (`value_flow/resolver.py:3363, 3423, 3459, 3483, 3486`), and
-`_resolve_seed_with_transfers` reaches it twice for a single seed. Cap is 10000
-routes, each re-walking shared suffixes.
-
-**P23 — `_transfer_visible_names` is rebuilt 2N times per arm. (Confirmed)**
-
-Called once for the guard and once per binding inside `_validate_transfer_answer`
-(`value_flow/resolver.py:2731, 2742`), each time copying the file's macro set
-and unioning the enum set.
-
-**P24 — The transfer prompt runs an agentic tool loop plus a second prose→JSON pass. (Confirmed)**
-
-`client/llm.py:463-471` calls `chat.completions.create(..., tools=self.tools,
-tool_choice="auto")` in a loop of up to 100 iterations × 5 attempts. When the
-model finally answers in prose, a **second** model call converts that prose to
-JSON (`client/llm.py:494-560`), so byte spans must survive a prose round-trip.
-
-**P25 — The prose→JSON pass injects the legacy scalar contract into transfer requests. (Confirmed)**
-
-`client/llm.py:513-527`: the guard is
-`if self.output_model.__name__ != "outputModelForReturn"`, which is **true** for
-`TransferAnswerModel`. So a transfer request is told:
-
-> "For answer use argument number and its value like 1:value,2:value" …
-> "If argument's value is not resolved then report as UNRESOLVED" …
-> "DONT RETURN A LIST."
-
-while simultaneously being handed the `arms: [...]` schema. Additionally
-`argument_number_to_track` is `None` for transfer prompts
-(`client/llm.py:174-176`), so it prints "we are only tracking these arguments
-None". This is a direct contract collision on every transfer hop, and is a
-strong candidate for the bulk of `model_validate` failures.
+## 1. Hard constraints
+
+### 1.1 Files and data that must not be read
+
+- Do not open or inspect `forkproc_checker/build_index.py` unless the user gives explicit permission in a later message.
+- Do not open or inspect company source code under `/home/chukyu`.
+- Do not use proprietary process source as a development fixture.
+- The wrapper argument mappings in this plan come from the existing C-Visualizer analysis files, not from the old regex implementation.
+
+### 1.2 Minimal-diff rules
+
+- Change the smallest responsible function. Do not rewrite a whole module to fix one decision.
+- Reuse the existing AST indexes, `Query` types, `Fact`, `ResolvedSeed`, reachability sets, local reaching-definition logic, table resolver, macro resolver, async worker queue, and CSV writers.
+- Do not add a second resolver beside `ValueFlowResolver`.
+- Do not add a new dependency.
+- Do not change public command-line arguments unless a safety requirement cannot be met through the existing constructor/environment seams.
+- Preserve existing function signatures when practical. Add optional keyword arguments only when necessary.
+- Append CSV columns; do not rename or reorder existing columns.
+- Keep old compatibility output files at their current paths.
+- Do not delete the existing route enumerator in the first implementation. Stop calling it from the normal value-flow path, retain it as commented/deprecated reference code, and remove it only in a later cleanup after production evidence proves it is unused.
+- Do not leave two active algorithms that can both emit facts for the same seed.
+- Edit small recursive walkers in place. Do not create a general traversal framework merely to replace four short recursive functions.
+- Delete code only when it is unreachable, demonstrably wrong, and retaining it would confuse which result is authoritative.
+
+### 1.3 Accuracy rules
+
+- A search optimization may reduce stored path strings. It must not silently reduce the set of possible values.
+- If a safety limit is reached before all relevant states are checked, emit the values already found as evidence plus an incomplete-search fact. The final semantic status for that target must be `UNRESOLVED`.
+- Never choose the first value merely to produce one answer.
+- Never flatten a runtime set into one exact value.
+- Never promote an LLM-only candidate to exact.
+- Never treat an undefined symbol as runtime merely because its name is known.
+- Never bind a local handle to an open in another function only because the variable spelling is the same.
+- A close before use invalidates an earlier handle open.
+- Existing `EXACT` JSON indexes must continue to accept only one source-proven value with accepted reachability.
+
+### 1.4 Explicit non-goals
+
+- Do not attempt a general C compiler, symbolic executor, or whole-program alias analyzer.
+- Do not infer every pointer target.
+- Do not make LLM answers authoritative.
+- Do not restore comment/dead-code matches merely to match regex counts.
+- Do not enumerate and save every call path. One or a few source-to-target witness paths are enough.
+- Do not remove the legacy resolver mode from `project_aware.py`.
+- Do not broadly refactor `project_aware.py`.
+- Do not tune against one proprietary process.
+- Do not declare success only because unit tests pass; the new stress fixtures must also prove bounded work.
 
 ---
 
-## Part 2 — Repair plan
+## 2. Current behavior that must be preserved
 
-Five phases. Phases 0–2 are the ones that should move the numbers. Phases 3–4
-are follow-ups to run only after Phase 0 gives you measurements.
+The implementation model must understand these existing seams before editing them.
 
-### Phase 0 — Measure and stop the bleeding (zero behavioural risk)
+### 2.1 Discovery flow
 
-Do this first. Every later decision depends on knowing which failure actually
-dominates. All four changes are additive; none alters resolution behaviour.
+The current flow is:
 
----
+1. `project_aware.py` loads and preprocesses project files.
+2. It builds Tree-sitter trees and a complete call graph.
+3. `identify_funs_to_trace()` creates a subset of configured functions seen by a preliminary scan.
+4. `discovery_index.build_target_site_inventory()` scans parsed call expressions.
+5. `ValueFlowResolver` builds its own function and call-site indexes.
+6. Resolver records are converted by `valueflow_records_to_facts()`.
+7. `write_discovery_index()` writes compatible JSON and evidence CSV files.
 
-#### Fix 0.1 — Record why an arm was rejected (P5–P11)
+The problem is that step 4 currently filters the supposedly independent AST inventory through the subset produced by step 3. A miss in the preliminary scan can therefore hide a call from the final inventory.
 
-**File:** `value_flow/resolver.py`, `_validate_transfer_answer` (~2677-2764).
+### 2.2 Value-flow flow
 
-`self.transfer_diagnostics` already exists (`:412`) and is already surfaced in
-run stats (`project_aware.py:1954`). It is currently written from exactly one
-place (`:2490`).
+Useful current behavior already exists and must be reused:
 
-Add a counter dict in `__init__` next to the existing counters:
+- `ValueFlowResolver._resolve_expression()` already prefers literal, table, macro/enum, parameter, local assignment, LLM, and external/unknown handling in that order.
+- `_local_reaching_definitions()` already finds the latest local assignment and complete `if`/`else if`/`else` value sets.
+- `_resolve_table_expression()` already represents a runtime table lookup as multiple `CONST_TABLE` facts and resolves a literal table index to one entry.
+- `_binding_opens()` already limits ordinary candidates to `sites_by_caller[caller_id]` and removes opens before the last close.
+- `resolve()` already memoizes query results and uses `in_flight` futures so concurrent seeds can share a subproblem safely.
+- `run()` already uses a bounded `asyncio.Queue`, multiple workers, and stable seed-order output.
+- `_compute_reachability()` already computes whether a function is reachable from a root. Therefore, value resolution does not need every full root path merely to prove that the function is reachable.
+- `classify_records()` already groups all records for one target argument and distinguishes a single resolved value from a multi-value runtime set.
+- `facts.csv` and `discovery_facts.csv` already contain source location fields.
+- `paths.csv` already links a fact to its traced path using `fact_id`.
 
-```python
-self.transfer_rejections: dict[str, int] = defaultdict(int)
-```
+### 2.3 Current expensive behavior
 
-Then at each `continue` / early `return None` in `_validate_transfer_answer`,
-increment a distinct key before continuing:
+`ValueFlowResolver.routes_for_seed()` recursively enumerates complete simple routes from every accepted root to the target. It stops only after 10,000 complete routes for one seed. `_resolve_seed_with_transfers()` calls this before it knows whether the target is a direct literal, macro, local assignment, or locally bound handle.
 
-| Location (approx.) | Key |
-|---|---|
-| `:2693` pydantic parse failure | `"schema_invalid"` |
-| `:2700` index-set mismatch | `"pending_mismatch"` |
-| `:2709` file unresolved | `"file_unresolved"` |
-| `:2713` end_byte out of range | `"span_out_of_range"` |
-| `:2724` no spans / no current-function span | `"no_current_span"` |
-| `:2761` guard formula error | `"guard_formula"` (see 2.4) |
-| `:2761` binding formula error | `"binding_formula"` |
+This causes three separate costs:
 
-Also increment in `request_local_transfer`: `"llm_returned_none"` when
-`raw_answer is None` (`:2830`), and `"all_arms_rejected"` when
-`validated` is falsy (`:2831`).
+- CPU is spent constructing route combinations that carry no new value information.
+- One semantic value is repeated under many route/correlation IDs.
+- `_deduplicate_records()` keeps route-correlated duplicates, so output size also grows with the call-path combinations.
 
-Expose it alongside the existing counters in `project_aware.py:1951-1956`:
+The performance change must remove the need for full route enumeration from the normal value-flow path. Lowering 10,000 to another number is not the fix.
 
-```python
-"transfer_rejections": dict(resolver.transfer_rejections),
-```
+### 2.4 Existing safety/experimental switches
 
-**Risk:** none. Pure instrumentation.
-**Verification:** run one process, read the new dict in run stats.
+The current resolver already has these switches. Preserve their current defaults and meanings unless a phase below explicitly says otherwise:
 
----
+- `TRACER_VF_GRAMMAR_EXTENDED`
+- `TRACER_VF_EXTERNAL_UNKNOWN`
+- `TRACER_VF_MULTI_OPEN`
+- `TRACER_VF_KEEP_PARTIAL_ROWS`
+- `TRACER_VF_STRUCTURED_OUTPUT`
+- `TRACER_VF_NO_FORK`
+- `TRACER_VF_TRANSFER_TIMEOUT`
 
-#### Fix 0.2 — Distinguish a model/transport failure from a genuine unknown (P20)
+Read environment values once during setup, as the current code does. Do not read them repeatedly in a hot loop. The backward-search replacement is a correctness/performance repair, not a second long-lived resolver mode, so do not add an old-search/new-search feature flag. The old route method remains in the source temporarily for rollback reference, but normal value-flow execution has one authoritative algorithm.
 
-**File:** `value_flow/resolver.py`, `_await_llm` (~1778-1782).
-
-The `except Exception` swallows transport errors into `None`, which is
-indistinguishable from "model says unknown". Add a counter before returning:
-
-```python
-except Exception as exc:
-    self.transfer_rejections["llm_exception"] += 1
-    print(f"Value-flow LLM query failed, continuing without it: {exc}")
-    return None
-```
-
-**Risk:** none.
+When editing comments in code that point to sections of an older `implementation_plan.md`, update only the comments next to changed code. Do not sweep the repository merely to renumber old comments.
 
 ---
 
-#### Fix 0.3 — Warn about functions with no `ast_node` (P12)
+## 3. Final status contract
 
-**File:** `value_flow/resolver.py`, end of `_build_function_index` (~505).
+Use these meanings consistently in `value_flow/status.py`, `facts.csv`, `discovery_facts.csv`, and the compatibility CSV.
 
-```python
-missing = [fid for fid, info in self.functions.items() if info.ast_node is None]
-if missing:
-    print(f"VALUEFLOW: WARNING {len(missing)} function(s) have no AST node; "
-          f"their parameters are empty and every transfer through them will "
-          f"fail. First 10: {missing[:10]}")
-```
+| `resolution_status` | Meaning | Exact index allowed? |
+| --- | --- | --- |
+| `RESOLVED` | The source proves one concrete value for every live alternative considered. | Yes, if resource formatting, operation, scope, and reachability checks also pass. |
+| `RUNTIME` | The backward trace completed, but runtime data selects among values or supplies the value. The genesis/boundary is known. | No. Keep as evidence. |
+| `EXTERNAL` | The trace completed at a known boundary outside the analyzed process/source scope, such as an entry parameter or recognized input API. | No. Keep as evidence. |
+| `UNRESOLVED` | The trace did not complete, a required source was missing, alternatives were only partly traced, syntax was unsupported, a handle remained ambiguous, or a safety limit was reached. | No. Keep as evidence. |
+| `NO_TARGET` | The configured API has no value argument to resolve. | No value index entry. |
 
-**Risk:** none. This one line tells you immediately whether P12 is a real
-problem in your codebase or a theoretical one. If the count is non-trivial,
-prioritise it above almost everything else.
+The simple rule is:
 
----
+- `RUNTIME` means tracing succeeded and the value is dynamic.
+- `UNRESOLVED` means tracing did not finish reliably.
 
-#### Fix 0.4 — Fix the `active` set leak (P19)
+### 3.1 Examples
 
-**File:** `value_flow/resolver.py:3219-3226`.
+- Direct `2818` at the target: `RESOLVED`.
+- Macro `ChaOnlineELDNo` whose visible definition is `2818`: `RESOLVED`, even inside an `if`.
+- Local variable assigned `2818` before the target: `RESOLVED`.
+- Complete branch merge assigning `2818` or `2819`: `RUNTIME`, with two source-backed value rows and one shared `value_set_id`.
+- Runtime table index over a completely known constant table: `RUNTIME`.
+- Literal table index selecting one proven table entry: `RESOLVED`.
+- Message field traced to a recognized receive/input assignment inside the process: `RUNTIME`.
+- Formal entry parameter with no in-scope caller: `EXTERNAL`.
+- Global read with no visible producer and no recognized boundary: `UNRESOLVED`, not automatically `RUNTIME`.
+- Undefined macro/symbol: `UNRESOLVED`.
+- Two complete caller branches and one missing caller branch: `UNRESOLVED` because the set is incomplete.
+- Search state/depth limit reached: `UNRESOLVED` with `failure_reason=SEARCH_LIMIT_REACHED`.
+- LLM candidate not independently confirmed by syntax: `UNRESOLVED`.
 
-Add one line before the `continue`:
+### 3.2 Relationship between evidence status and semantic status
 
-```python
-if not transferred:
-    arm.bindings = [...]
-    terminal.append(arm)
-    active.discard(state_key)      # <-- add
-    continue
-```
+`discovery_facts.csv` currently has both `status` and `resolution_status`. Keep both.
 
-**Risk:** none — it restores the intended symmetry with `:3278`.
-**Why it matters now:** without it your RECURSIVE counts include failures that
-are not recursion, which would mislead the Phase 0 measurements.
-
----
-
-### Phase 1 — Stop wasting completed LLM work (P5, P6, P7, P8)
-
-This phase recovers answers the model already produced correctly. It is the
-highest value-per-line in the plan, and it directly targets the reported
-`start_byte == end_byte` waste.
-
----
-
-#### Fix 1.1 — Make evidence spans repairable instead of fatal (P5)
-
-**File A: `models.py:28-40`.**
-
-```python
-class TransferEvidenceModel(BaseModel):
-    """An exact source span supporting one local value transfer."""
-
-    model_config = ConfigDict(extra="forbid")
-    file: str
-    start_byte: int = Field(ge=0)
-    end_byte: int = Field(ge=0)          # was gt=0
-    snippet: str = ""                    # new, optional
-
-    # NOTE: no model_validator. A degenerate or inverted span is repaired in
-    # ValueFlowResolver._validate_transfer_answer, not rejected here. Rejecting
-    # here discards the whole answer including correct bindings.
-```
-
-Delete the `validate_range` validator.
-
-Both edits are backward compatible with the persisted cache: `snippet` has a
-default, and loosening a constraint never invalidates a stored entry.
-
-**File B: `value_flow/resolver.py`, `_validate_transfer_answer`,
-the evidence loop (~2702-2725).**
-
-Replace the per-span body with a repair sequence. Keep the existing
-`spans` / `current_span` variables and the final
-`if not spans or not current_span: continue` check unchanged.
-
-```python
-function_node = current_function.ast_node
-fn_start = function_node.start_byte if function_node is not None else 0
-fn_end = function_node.end_byte if function_node is not None else 0
-
-for evidence in model_arm.evidence:
-    file_name = self._resolve_project_file(evidence.file)
-    if file_name is None:
-        self.transfer_rejections["file_unresolved"] += 1
-        continue                          # was: valid_spans = False; break
-    source = self.trees[file_name][1]
-    span = self._repair_span(evidence, source, fn_start, fn_end,
-                             same_file=file_name == current_function.node.file_name)
-    if span is None:
-        self.transfer_rejections["span_unrepairable"] += 1
-        continue                          # drop this span, keep the arm
-    start, end = span
-    spans.append(EvidenceSpan(file_name, start, end))
-    if (file_name == current_function.node.file_name
-            and function_node is not None
-            and start < fn_end and end > fn_start):
-        current_span = True
-```
-
-The `valid_spans` flag becomes unnecessary; delete it and its use in the
-final guard, leaving `if not spans or not current_span: continue`.
-
-**New helper**, placed next to `_evidence_texts` (~2653):
-
-```python
-def _repair_span(self, evidence, source, fn_start, fn_end, *, same_file):
-    """Return a usable (start, end) byte span, or None.
-
-    Models reliably get byte arithmetic wrong. The common failures are a
-    degenerate span (start == end), an inverted span, and offsets given
-    relative to the function body rather than the file. Each is repairable
-    from source, so none of them should cost a whole answer.
-    """
-    limit = len(source)
-    start = max(0, min(int(evidence.start_byte), limit))
-    end = max(0, min(int(evidence.end_byte), limit))
-
-    # 1. An exact snippet beats any offset the model computed.
-    snippet = (evidence.snippet or "").strip()
-    if snippet:
-        raw = snippet.encode("latin-1", errors="replace")
-        found = source.find(raw, fn_start, fn_end) if same_file and fn_end else -1
-        if found < 0:
-            found = source.find(raw)
-        if found >= 0:
-            return found, found + len(raw)
-
-    # 2. Offsets given relative to the function body.
-    if same_file and fn_end and end > start and end <= (fn_end - fn_start):
-        shifted_start, shifted_end = fn_start + start, fn_start + end
-        if shifted_end <= fn_end:
-            return shifted_start, shifted_end
-
-    # 3. A well-formed absolute span.
-    if end > start:
-        return start, end
-
-    # 4. Degenerate or inverted: widen to the line containing `start`.
-    #    This is the reported start_byte == end_byte case.
-    anchor = start if start else end
-    if not (0 <= anchor < limit):
-        return None
-    line_start = source.rfind(b"\n", 0, anchor) + 1
-    line_end = source.find(b"\n", anchor)
-    line_end = limit if line_end < 0 else line_end
-    return (line_start, line_end) if line_end > line_start else None
-```
-
-**Why step 2 matters for safety:** the existing fake resolvers in
-`tests/test_llm_transfer_value_flow.py:67-78, 318-319` compute offsets from
-`request.function_source` and treat them as file-absolute. That works today
-only because `function_source` is the whole file. Once Fix 2.1 slices it,
-those tests would produce function-relative offsets — and step 2 accepts
-exactly that. So Fix 1.1 must land **before** Fix 2.1, and it makes Fix 2.1
-non-breaking for the existing tests.
-
-**Risk:** low. Every branch is strictly more permissive than today; nothing
-that currently validates stops validating. Step 4 widens to a line boundary,
-which can only make the evidence text *larger* — and evidence text is used
-only to confirm literals (`validate_formula`) and to locate a source witness
-(`_settle_transfer_arm`), both of which tolerate a wider span.
-
-**One thing to watch:** a wider span makes the literal-coverage check *more*
-permissive, so a literal could be "covered" by a neighbouring token on the same
-line. That is a small, bounded loss of strictness in exchange for recovering
-whole answers. If you want it tighter, restrict step 4 to the case where the
-line contains a `=`, `(` or `return`.
-
-**Verification:** unit-test `_repair_span` directly with (start==end),
-(end<start), (relative offsets), (snippet present), (snippet absent). This is
-a pure function — it is the one piece here that is cheap to test properly.
+- `status=EXACT` is the narrow compatibility promotion gate for exact JSON indexes.
+- `resolution_status` explains the value semantics.
+- A complete multi-value set should use evidence `status=DYNAMIC` and semantic `resolution_status=RUNTIME`.
+- A known runtime genesis with no finite numeric set should also use `status=DYNAMIC` and `resolution_status=RUNTIME`.
+- External boundaries remain `status=EXTERNAL` and `resolution_status=EXTERNAL`.
+- Incomplete search remains `status=UNRESOLVED` and `resolution_status=UNRESOLVED`.
+- Reachability remains a separate field. Do not use value status to encode whether a call is reachable from a process root.
 
 ---
 
-#### Fix 1.2 — Ask the model for a snippet (P5)
+## 4. Output and provenance contract
 
-**File:** `project_aware.py`, `llm_calls_transfer` user prompt (~712-717).
+Every fact row must tell the user two different things:
 
-Replace the evidence instruction:
+1. Target location: where the interesting API is called.
+2. Source/genesis location: where the selected value was introduced or where the trace stopped.
 
-```
-Cite byte spans as file/start_byte/end_byte.
-```
+### 4.1 Required location rules
 
-with:
+| Fact kind | `source_file` / `source_line` / `source_expr` |
+| --- | --- |
+| Literal passed directly | Target expression location. |
+| Literal local assignment | Assignment/initializer location. |
+| Macro or enum | Definition location and symbol expression. |
+| Constant table | Table definition/entry location. Put selector provenance in metadata. |
+| Same-function handle | The open call's value source, not the read/write call. |
+| Runtime local/message value | Earliest meaningful in-scope assignment or recognized input/read site. |
+| External value | Entry parameter or recognized external API boundary. |
+| Unresolved value | Last source location that was actually proven. If nothing was proven, use the target location and mark it as a fallback, not genesis. |
+| No-target API | Target call location. |
 
-```
-For each evidence item set "snippet" to the exact source text you are citing,
-copied verbatim from CURRENT FUNCTION SOURCE (one line is enough), and set
-"file" to its file. Byte offsets are optional; if you are unsure, set
-start_byte and end_byte to 0 and rely on the snippet.
-```
+### 4.2 Required provenance metadata
 
-**Risk:** none structurally — `snippet` defaults to `""` and the repair
-sequence falls through to the existing offset behaviour. This turns the
-model's hardest sub-task (byte arithmetic) into its easiest (copying text).
+Reuse `Fact.metadata`; do not add many new top-level dataclass fields. Add these keys only where relevant:
 
-**Must be paired with:** bumping `transfer_prompt_version` (see Fix 2.2).
+- `source_role`: `GENESIS`, `BOUNDARY`, `LAST_PROVEN`, `TARGET_FALLBACK`, or `TABLE_VALUE`.
+- `trace_complete`: boolean.
+- `termination_reason`: for example `LITERAL`, `MACRO`, `ENUM`, `LOCAL_ASSIGNMENT`, `TABLE_SET`, `RUNTIME_INPUT`, `EXTERNAL_ENTRY`, `NO_TARGET`, `UNSUPPORTED_SYNTAX`, `HANDLE_AMBIGUOUS`, `RECURSIVE_STATE`, or `SEARCH_LIMIT_REACHED`.
+- `search_truncated`: boolean, only when true.
+- `search_states_expanded`: per-seed count.
+- `search_max_frontier`: per-seed maximum.
+- `path_mode`: `QUERY_PROVENANCE` or `WITNESS`.
+- Existing guard, table, callback, correlation, and transfer metadata must remain.
 
----
+For a runtime table lookup, keep the table as the main `source_*` location and store these selector fields in metadata when known:
 
-#### Fix 1.3 — Accept partial arms (P8)
+- `selector_source_file`
+- `selector_source_line`
+- `selector_source_expr`
 
-**File:** `value_flow/resolver.py:2698-2701`.
+Do not pretend the selector and the table are one source.
 
-```python
-bindings = model_arm.bindings
-indices = [item.target_arg for item in bindings]
-if len(indices) != len(set(indices)) or not set(indices) <= pending_set:
-    self.transfer_rejections["pending_mismatch"] += 1
-    continue
-if not indices:
-    continue
-```
+### 4.3 Multiple genesis points
 
-The arm-construction code at `value_flow/resolver.py:2870-2876` already
-handles a partial answer correctly — it looks each binding up by index and
-falls back to the parent arm's binding:
+- Emit one fact row per distinct proven source/value.
+- Give all rows for the same complete runtime set the same `value_set_id`.
+- Deduplicate by semantic source and value, not by complete call-route identity.
+- Keep one or a small bounded number of witness paths for each fact.
+- Do not multiply fact rows merely because several root paths reach the same semantic source.
 
-```python
-model_bindings.get(binding.target_arg, binding)
-```
+### 4.4 Compatibility CSV
 
-So an unanswered pending argument simply stays `EXPRESSION` and is carried to
-the next hop, which is the desired behaviour.
+Do not rename the existing `LEGACY_COLUMNS` in `value_flow/outputs.py`. Append these columns at the end:
 
-**Risk:** low. The change is `!=` → `not ⊆`, plus an empty guard. Duplicate
-detection is unchanged.
+1. `resolution_status`
+2. `value_source->path`
+3. `value_source->line_number`
+4. `value_source->expression`
+5. `resolution_reason`
 
-**Watch for:** an arm answering *zero* pending args would loop — the `if not
-indices: continue` guard prevents that. Also confirm no infinite loop: if the
-model returns the same partial answer at the same site, the `active` state key
-(now correctly maintained by Fix 0.4) catches it as RECURSIVE.
-
----
-
-#### Fix 1.4 — Resolve ambiguous file paths by longest suffix (P7)
-
-**File:** `value_flow/resolver.py:2674-2675`.
-
-```python
-matches = [name for name in self.trees if Path(name).name == Path(candidate).name]
-if len(matches) == 1:
-    return matches[0]
-# Several files share this basename. Prefer the longest matching path suffix,
-# then the file the current walk is already in (passed by the caller when
-# available). Ambiguity that survives both is still None.
-parts = tuple(Path(candidate).parts)
-best, best_score = None, 0
-for name in matches:
-    other = tuple(Path(name).parts)
-    score = 0
-    while score < min(len(parts), len(other)) and parts[-1 - score] == other[-1 - score]:
-        score += 1
-    if score > best_score:
-        best, best_score = name, score
-    elif score == best_score:
-        best = None            # tie: still ambiguous
-return best
-```
-
-**Risk:** low, and strictly additive — the `len(matches) == 1` fast path is
-unchanged, so today's successful resolutions are untouched. Ties still return
-`None`.
+Existing consumers reading the old column names continue to work. New consumers can jump directly to the genesis/boundary.
 
 ---
 
-### Phase 2 — Cut the context (P1, P2, P3, P4)
+## 5. Implementation order
 
-This is the prefill fix. Land it after Phase 1 so the span repair is already in
-place to absorb the offset-convention change.
+Implement in the order below. Each phase has its own test gate. Do not combine all phases into one large edit.
 
----
+### Phase 0: freeze the current behavior with tests
 
-#### Fix 2.1 — Send the function, not the file
+#### Files
 
-**File A: `value_flow/transfers.py`, `TransferRequest` (~66-83).**
+- `tests/test_value_flow.py`
+- `tests/test_llm_transfer_value_flow.py`
+- `tests/test_value_flow_status.py`
+- `tests/test_discovery_index.py`
+- `tests/test_valueflow_pipeline.py`
+- `tests/test_valueflow_scheduler.py`
+- `tests/test_preprocess.py`
 
-Add one defaulted field. Additive only — the dataclass is documented as the
-stable seam for fake tests, and a default keeps every existing constructor call
-valid:
+#### Work
 
-```python
-    macro_context: str = ""
-    function_start_byte: int = 0   # file offset of function_source[0]
-```
+1. Run the existing focused suite before editing production code:
 
-**File B: `value_flow/resolver.py`, `request_local_transfer` (~2804-2818).**
+   ```bash
+   PYTHONPATH=. .venv/bin/pytest -q \
+     tests/test_value_flow_status.py \
+     tests/test_discovery_index.py \
+     tests/test_value_flow.py \
+     tests/test_llm_transfer_value_flow.py \
+     tests/test_phase4_value_flow.py \
+     tests/test_valueflow_pipeline.py \
+     tests/test_valueflow_scheduler.py \
+     tests/test_preprocess.py
+   ```
 
-Add a small helper next to `_evidence_texts`:
+2. Record the baseline pass count and failures in the implementation handoff. Do not change assertions merely because the new code produces a different answer.
+3. Add small synthetic C fixtures for each behavior below before changing the implementation:
+   - guarded direct macro;
+   - complete two-branch macro assignment;
+   - incomplete branch assignment with no `else`;
+   - runtime and literal-index table lookup;
+   - two functions that each declare a local variable named `fcb`;
+   - open, close, then use;
+   - configured target present while `functions_identified` is empty;
+   - deep AST nesting that exceeds ordinary Python recursion depth if walked recursively;
+   - diamond/fan-out call graph that has exponentially many complete paths but few semantic states;
+   - one combinatorial caller branch plus one shallow branch that resolves immediately.
+4. Use fake in-memory trees and fake LLM callbacks. Do not depend on proprietary source.
+5. In performance fixtures, count state expansions and callback calls. Do not assert wall-clock milliseconds, because timing assertions are unstable.
 
-```python
-def _function_slice(self, function: FunctionInfo) -> tuple[str, int]:
-    """Return (source text, file offset) for one function.
+#### Gate
 
-    FunctionInfo.source is the whole file, because reaching-definition
-    analysis indexes it with absolute Tree-sitter offsets. The model needs
-    only the function, so slice here rather than shipping the file.
-    """
-    node = function.ast_node
-    if node is None:
-        # No AST node: fall back to today's behaviour rather than send
-        # nothing. See the _build_function_index warning (Fix 0.3).
-        return function.source.decode("latin-1", errors="replace"), 0
-    return (
-        function.source[node.start_byte:node.end_byte].decode("latin-1", errors="replace"),
-        node.start_byte,
-    )
-```
-
-and use it:
-
-```python
-function_text, function_base = self._function_slice(current_function)
-...
-request = TransferRequest(
-    ...
-    function_source=function_text,
-    function_start_byte=function_base,
-    ...
-)
-```
-
-**File C: `project_aware.py`, `llm_calls_transfer` user prompt (~698-701).**
-
-```
-CURRENT FUNCTION SOURCE (starts at file byte {function_start_byte}):
-{function_source}
-```
-
-and add `"function_start_byte": request.function_start_byte,` to the
-`user_prompt` dict (~730).
-
-**Risk:** medium — this is the largest behavioural change in the plan, so note
-the guards:
-
-- Fake resolvers in `tests/test_llm_transfer_value_flow.py` compute offsets
-  from `function_source`. After the slice these become function-relative.
-  **Fix 1.1 step 2 accepts function-relative offsets**, so those tests should
-  continue to pass. Confirm this by running that file first; if any test still
-  fails, the correct fix is in the test's fake, not in the resolver.
-- The `ast_node is None` fallback preserves today's exact behaviour, so P12
-  functions do not regress — they just stay bad until P12 is fixed.
-- `function_source` is sliced from the same `trees` bytes the spans are
-  validated against, so offsets stay internally consistent. Do **not** be
-  tempted to substitute `parseFiles` output here: it reads from disk and runs
-  `_format_code()`, so its text does not share offsets with `trees`.
-
-**Expected effect:** prompt size drops by roughly the file-to-function ratio —
-commonly 10–100×. This is the prefill fix.
+- Existing tests pass before production edits.
+- New characterization tests fail only for the intended missing behavior.
 
 ---
 
-#### Fix 2.2 — Key the cache on the function slice, and bump the prompt version
+### Phase 1: remove recursion failures from whole-tree plumbing
 
-**File: `value_flow/resolver.py`, `request_local_transfer` (~2810).**
+This phase fixes stack safety without changing value semantics.
 
-```python
-function_source=function_text,     # was current_function.source
-```
+#### Files
 
-**File: `project_aware.py:1902`.**
+- `project_aware.py`
+- `helpers/Preprocess/preprocess.py`
+- `makefile_resolver/extract_includes.py`
+- `value_flow/resolver.py` only for provenance-path recursion
+- `tests/test_preprocess.py`
+- one focused pipeline test file if needed
 
-```python
-transfer_prompt_version="valueflow-transfer-v2",
-```
+#### Exact edits
 
-The prompt has changed (Fixes 1.2, 2.1, 2.3), so the version **must** be bumped
-or stale answers computed under the old contract will be served as hits. Bumping
-it invalidates the transfer cache once, which is expected and correct.
+1. Change `project_aware.extract_function_calls()` from nested recursive `traverse(node)` to an explicit stack:
 
-**Risk:** none beyond the one-time cache miss. Note that both effects — the
-narrower key and the version bump — land together, so there is exactly one
-invalidation, not two.
+   ```python
+   stack = [tree.root_node]
+   while stack:
+       node = stack.pop()
+       # existing call-expression logic unchanged
+       stack.extend(reversed(node.children))
+   ```
 
----
+   Preserve source order by pushing reversed children.
 
-#### Fix 2.3 — Give the model the macro and enum values it is allowed to use (P4)
+2. In `helpers/Preprocess/preprocess.py`, make the same local iterative change in:
+   - `extract_all_macros()`;
+   - `extract_includes()`;
+   - `Preprocess.remove_comments()`'s `collect_comments()` walk.
 
-The transfer grammar permits macro and enum identifiers but never says what
-they expand to. This mirrors what `parseFiles` already does for the legacy
-prompt (`parser/parser_files.py:177 all_macros_in_file`, and the
-`//NAME=value` block appended in `parse_for_path`), using data the resolver
-already holds so byte offsets are unaffected.
+   Keep the existing collection and sorting logic unchanged.
 
-**File: `value_flow/resolver.py`, `request_local_transfer`, just before
-`macro_context` is built (~2779).**
+3. In `makefile_resolver/extract_includes.py`, replace its nested recursive Tree-sitter traversal with a stack.
 
-```python
-# NOTE: the module-level _IDENTIFIER (value_flow/resolver.py:46) is anchored
-# with ^...$ and is only usable with fullmatch(). Use a separate scan pattern.
-_IDENT_SCAN = re.compile(r"[A-Za-z_]\w*")     # module scope, next to _IDENTIFIER
+4. In `makefile_resolver.extract_includes()`, keep returning `None` for a failed preprocess in this minimal patch if other callers depend on it. At the caller in `resolve()`, change only:
 
-names = set(_IDENT_SCAN.findall(function_text)) & self._transfer_visible_names(
-    current_function.node.file_name
-)
-constants: dict[str, str] = {}
-for name in sorted(names)[:200]:          # bounded: this goes in the prompt
-    resolved = self._constant_from_text(name, current_function.node.file_name)
-    if resolved is not None:
-        constants[name] = resolved[0]
-```
+   ```python
+   raw_lines = extract_includes(current_path) or []
+   ```
 
-Then add one key to the existing `macro_context` dict (~2782-2790):
+   This avoids `TypeError` without a wider return-type migration.
 
-```python
-macro_context = json.dumps(
-    {
-        "name": selected_site.macro_name,
-        "unmapped": selected_site.macro_args_unmapped,
-        "expanded_arguments": [item.text for item in selected_site.arguments],
-        "source_arguments": [item.text for item in selected_site.target_arguments],
-        "constants": constants,          # <-- add
-    },
-    sort_keys=True,
-)
-```
+5. In `project_aware.identify_funs_to_trace()`, do not assume every `project_structure` key has a parsed tree:
 
-**Why fold it into `macro_context` rather than add a new field:** `macro_context`
-is already hashed into `macro_digest` (so the cache key updates automatically)
-and already interpolated into the prompt as `{macro_context}` (so the model
-already sees it). Zero new plumbing, and it cannot desynchronise the cache.
+   ```python
+   if file_name.endswith(".h") or file_name not in trees:
+       continue
+   ```
 
-The 200-entry cap keeps a macro-heavy header from re-inflating the prompt you
-just shrank. `_constant_from_text(text, file_name)` and `_transfer_visible_names(file_name)`
-are existing helpers with exactly these signatures.
+   This safely skips `.def`, missing, or unsupported files while leaving them in the project map for diagnostics.
 
-**Risk:** low. `_constant_from_text` and `_transfer_visible_names` are both
-existing, already-used helpers. Worst case the model ignores the block.
+6. Convert the recursive helpers inside `_provenance_token_paths()` and `provenance_tokens()` to iterative stack/queue logic. Preserve:
+   - cycle detection;
+   - deterministic sorted-parent order;
+   - `path_cap` output truncation;
+   - exact path counts when cheaply computable.
 
-**Verification:** confirm `sorted(names)` is deterministic so cache keys are
-stable across runs — it is, because `constants` is a dict built in sorted order
-and `json.dumps(..., sort_keys=True)` normalises it.
+7. Do not raise `sys.setrecursionlimit()`. A higher limit only moves the crash and can exhaust the C stack.
+
+8. Do not convert every small bounded AST recursion in the repository. Only change the whole-tree or unbounded graph walks listed above unless a test proves another recursion failure.
+
+#### Tests
+
+- A deeply nested synthetic source file completes macro, include, comment, and call extraction without `RecursionError`.
+- Failed preprocess produces an empty include list at the resolver loop and does not crash.
+- A project-map entry absent from `trees` is skipped and the configured C file is still scanned.
+- Existing extraction order is unchanged on a normal fixture.
+- Provenance cycles terminate.
+- Path output remains deterministic.
+
+#### Gate
+
+- No recursion-limit changes exist.
+- Normal fixtures produce byte-for-byte identical extracted macro/include/call lists.
+- The deep fixture completes.
 
 ---
 
-#### Fix 2.4 — Do not let an inexpressible guard destroy valid bindings (P9)
+### Phase 2: make AST inventory independent and visible
 
-**File: `value_flow/resolver.py:2727-2762`.**
+#### Files
 
-Split the guard out of the bindings' `try`:
+- `discovery_index.py`
+- `project_aware.py`
+- `value_flow/outputs.py` only if shared atomic CSV helpers are reused
+- `tests/test_discovery_index.py`
+- `tests/test_valueflow_pipeline.py`
 
-```python
-evidence_texts = self._evidence_texts(spans)
-visible = self._transfer_visible_names(current_function.node.file_name) | {"NULL", "nullptr"}
-guard = model_arm.guard
-try:
-    validate_formula(
-        guard,
-        parameter_count=len(current_function.parameters),
-        visible_names=visible,
-        evidence_texts=evidence_texts,
-        allow_boolean_literals=True,
-    )
-except (FormulaError, ValueError, TypeError):
-    # A guard only ever narrows an answer. If it cannot be expressed in the
-    # formula grammar, drop the guard and keep the bindings rather than
-    # discarding a correct transfer.
-    self.transfer_rejections["guard_formula"] += 1
-    guard = "true"
-try:
-    for binding in bindings:
-        ...   # unchanged
-except (FormulaError, ValueError, TypeError):
-    self.transfer_rejections["binding_formula"] += 1
-    continue
-```
+#### Exact edits
 
-The dropped guard must be reflected downstream. `model_arm.guard` is read in
-two places — the cache write (`:2843`) and the child arm's guard list
-(`:2878-2880`). The simplest safe approach is to mutate the validated model
-before appending:
+1. In `build_target_site_inventory()`, use the full target registry from `spec["targets"]` when it is present.
 
-```python
-if guard != model_arm.guard:
-    model_arm = model_arm.model_copy(update={"guard": "true"})
-valid.append((model_arm, spans))
-```
+   Current wrong dependency:
 
-`model_copy` keeps the cached payload consistent with what was actually used.
-(Pydantic v2 — confirmed by the `ConfigDict` / `model_validator(mode="after")`
-API already in use in `models.py`.)
+   ```python
+   for name, config in functions_identified.items():
+   ```
 
-**Risk:** low-medium. This admits arms that were previously discarded, so an
-arm that a guard would have excluded can now appear. It never invents a value —
-the bindings are unchanged and still evidence-checked. If you want to keep the
-provenance visible, also record it: `metadata["guard_dropped"] = True` in
-`_fact_from_transfer_binding`. Recommended.
+   Required behavior:
 
----
+   ```python
+   configured_targets = (spec or {}).get("targets") or functions_identified
+   for name, config in configured_targets.items():
+       if discovery_args_for(config):
+           discovery_targets[name] = config
+   ```
 
-### Phase 3 — Recover destroyed information and unblock structural dead ends
+   Keep `functions_identified` in the signature as a fallback for project-local fixtures and old callers. Do not break its callers.
 
-Run these after Phase 0 tells you which ones actually matter in your codebase.
+2. The inventory must remain a pure AST scan:
+   - no root reachability filter;
+   - no value resolution;
+   - no LLM;
+   - no requirement that a target seed was produced.
 
----
+3. In the value-flow branch of `project_aware.py`, build `valueflow_configs` from the full normalized `State()["FUNCTION_TYPES"]` registry. The resolver already creates seeds only for call sites that exist, so passing the full registry does not perform resolution for absent APIs.
 
-#### Fix 3.1 — Keep the traced expression on UNKNOWN bindings (P17)
+4. Keep the small detected subset for the old resolver branch. Do not alter old resolver behavior.
 
-**Recommended (zero risk) version.** In `_fact_from_transfer_binding`
-(`value_flow/resolver.py:3049-3050`), leave `value` alone and record the text
-in metadata:
+5. Change the empty-detection early return:
+   - old resolver: keep the current return when `functions_identified == {}`;
+   - value-flow resolver: do not return; run with the full registry and let the resolver/inventory decide whether sites exist.
 
-```python
-else:
-    value = "UNRESOLVED"
-    origin = "RECURSIVE" if binding.text == "RECURSIVE" else "UNRESOLVED"
-    if binding.text not in {"RECURSIVE", "UNRESOLVED", "missing argument",
-                            "HANDLE_AMBIGUOUS"}:
-        metadata_extra = binding.text     # applied to `metadata` below
-```
+6. Add `target_sites.csv` to `build_discovery_payloads()` and `write_discovery_index()`.
 
-then add `metadata["unresolved_expr"] = metadata_extra` where `metadata` is
-built (~3052-3062).
+   Use these columns in this order:
 
-This changes no CSV column and no downstream contract, but the expression stops
-being lost — you can immediately measure how many "UNRESOLVED" rows actually
-carry a perfectly good source expression.
+   1. `target_function`
+   2. `target_site_file`
+   3. `target_site_line`
+   4. `arg_index`
+   5. `target_expression`
+   6. `operation`
+   7. `aux_lock`
+   8. `macro_name`
+   9. `unmapped_args`
+   10. `in_process`
 
-**Aggressive version — only after reviewing that number.** Emit the expression
-as the value with `origin_kind="EXTERNAL_DATA"`, matching what
-`_resolve_expression` already does at `value_flow/resolver.py:1284-1298`. This
-*does* change the `target_number->ans` column in the legacy CSV, so it needs a
-downstream check first. Gate it behind an env var
-(`TRACER_VALUEFLOW_EXTERNAL_UNKNOWN=1`) so it can be turned on and off without
-a code change.
+7. Reuse `_csv_text()` and the existing atomic payload writer. Do not create another CSV-writing implementation.
+
+8. Keep `_unreachable_facts()` as the mechanism that turns inventory sites with no resolver record into visible evidence rows.
+
+9. Add a consistency diagnostic to `index_metadata.json`:
+   - `inventory_sites_without_facts` count;
+   - `facts_without_inventory_site` count.
+
+   Do not fail the run merely because an unreachable site has no resolved record. It must be visible and counted.
+
+10. A successful run with a non-empty `target_sites.csv` and zero facts must have an explicit diagnostic. It must never look like a clean zero-target project.
+
+#### Tests
+
+- `functions_identified={}` plus a full spec and one AST call yields one inventory row.
+- A target absent from the preliminary subset but present in the full registry appears in `target_sites.csv`.
+- An unreachable target appears in both `target_sites.csv` and `discovery_facts.csv` with an unreachable status.
+- No-target APIs remain represented correctly.
+- Macro-renamed targets retain the current argument-mapping behavior.
+- Existing index JSON shapes are unchanged except for additive metadata and the new CSV file.
+
+#### Gate
+
+- Inventory count equals the number of configured AST call arguments in the synthetic fixture.
+- Empty preliminary detection cannot hide a configured AST target in value-flow mode.
 
 ---
 
-#### Fix 3.2 — Do not let an unrelated macro site poison an arm (P14)
+### Phase 3: fix guard demotion and unify status decisions
 
-**File: `value_flow/resolver.py:2928-2931`.** Move the guard after `indexes` is
-computed:
+#### Files
 
-```python
-site = self.sites.get(edge.site_id)
-if site is None:
-    return None
-indexes = { ... }          # unchanged
-indexes.update( ... )      # unchanged
-if site.macro_args_unmapped and indexes:
-    # Positions through this macro are untrustworthy, but only matters if
-    # this arm actually reads an argument position.
-    return None
+- `value_flow/status.py`
+- `discovery_index.py`
+- `tests/test_value_flow_status.py`
+- `tests/test_discovery_index.py`
+
+#### Exact edits
+
+1. Keep `classify_records()` as the owner of whole-site semantic classification. It sees every alternative and is the correct place to decide single value versus runtime set.
+
+2. Pass `semantic.status` into `_classify_valueflow_fact()` instead of calculating it and then ignoring it.
+
+3. Remove the rule that demotes `CONST`/`MACRO` solely because `fact.metadata["guards"]` is non-empty.
+
+4. Do not remove guard metadata. Guards still explain when a branch executes and remain useful for alternative correlation.
+
+5. Implement classification in this order:
+
+   1. `resource == "none"` or `NO TARGET` -> `NO_TARGET` behavior unchanged.
+   2. `origin_kind == "LLM_CANDIDATE"` -> `UNRESOLVED` regardless of suggested value.
+   3. semantic `UNRESOLVED` -> evidence `UNRESOLVED`.
+   4. semantic `EXTERNAL` -> evidence `EXTERNAL`.
+   5. semantic `RUNTIME` -> evidence `DYNAMIC`.
+   6. semantic `RESOLVED` plus a source-grounded constant/macro/enum/single table value -> run existing resource validation and then return `EXACT`.
+   7. Failed numeric/package/operation validation -> `UNRESOLVED`.
+
+6. Keep the existing exact-format checks:
+   - file/queue values require `to_decimal(value)` and a valid operation;
+   - forkproc values require `package_name(value)`;
+   - exact index promotion still requires accepted reachability and in-process scope.
+
+7. Update `_fact_kind()` only as needed for the final contract:
+   - source-backed literal `CONST`, `MACRO`, single `CONST_TABLE`, and `BOUNDED_SET` facts count as resolved alternatives;
+   - multiple distinct resolved alternatives become `RUNTIME` at group level;
+   - a new explicit runtime-genesis origin, if introduced in Phase 6, maps to `RUNTIME`;
+   - any mixture containing an incomplete fact remains `UNRESOLVED`.
+
+8. Do not promote all table facts to exact. Only a one-value complete group can be `RESOLVED`; a multi-value complete group is `RUNTIME`.
+
+#### Tests
+
+- Unguarded macro -> `RESOLVED` / `EXACT`.
+- The same macro with arbitrary runtime guard metadata -> identical `RESOLVED` / `EXACT`.
+- Empty guard list behaves the same.
+- Two guarded branch values -> shared runtime set, not two exact index entries.
+- One resolved branch plus one unresolved branch -> `UNRESOLVED`.
+- LLM candidate plus a guard stays unresolved.
+- External and no-target behavior is unchanged.
+
+#### Gate
+
+- A guard affects path/branch evidence but never changes a single proven constant's value status.
+- Multi-value and partial results do not enter exact JSON indexes.
+
+---
+
+### Phase 4: deterministic resolution before inter-function search
+
+This is the first performance change. It should remove most unnecessary route work with a small refactor.
+
+#### Files
+
+- `value_flow/resolver.py`
+- `tests/test_value_flow.py`
+- `tests/test_llm_transfer_value_flow.py`
+
+#### Exact edits
+
+1. Extract the current non-transfer body of `_resolve_seed()` into a small private helper, for example:
+
+   ```python
+   async def _resolve_seed_from_queries(self, seed: Seed) -> list[ResolvedSeed]:
+       ...existing non-transfer query code...
+   ```
+
+   Move code; do not duplicate it.
+
+2. Keep `_resolve_seed()` as the dispatcher:
+
+   ```python
+   async def _resolve_seed(self, seed):
+       if self._seed_has_no_value(seed):
+           return await self._resolve_seed_from_queries(seed)
+       if self._locally_provable(seed.site):
+           return await self._resolve_seed_from_queries(seed)
+       if self.transfer_resolver is not None:
+           return await self._resolve_seed_with_transfers(seed)
+       return await self._resolve_seed_from_queries(seed)
+   ```
+
+   Use existing configuration fields to implement `_seed_has_no_value`; do not introduce a new registry field.
+
+3. Extend `_locally_provable()` only enough to cover the deterministic cases the resolver can already resolve:
+   - literal;
+   - visible macro;
+   - visible enum;
+   - local string initializer;
+   - complete local reaching assignments;
+   - complete branch-merge constants;
+   - table expression for which `_resolve_table_expression()` returns a complete source-backed set;
+   - exactly one same-function handle open whose configured value arguments are locally provable.
+
+4. Reuse `_resolve_table_expression()` for the table proof. Do not create a second table parser.
+
+5. Reuse `_local_reaching_definitions()` for assignments and branch merges. Do not add regex assignment matching.
+
+6. Reuse `_binding_opens()` for same-function handles. Do not add proximity fallback.
+
+7. The proof helper must return false for:
+   - formal parameters;
+   - unrecognized calls;
+   - unresolved fields/pointers;
+   - incomplete branch chains;
+   - multiple handle opens not proven mutually exclusive;
+   - unsupported macro argument mapping.
+
+8. The query helper may be used with a transfer callback installed only after `_locally_provable()` says the selected value cannot escape to a caller or LLM. Add a test that the transfer callback count remains zero.
+
+9. No-target APIs must be emitted directly. They must never call `routes_for_seed()`.
+
+10. Add counters to the resolver:
+    - `fast_path_seed_count`;
+    - `search_seed_count`.
+
+    Add them to `run_stats.json` later in Phase 8.
+
+#### Tests
+
+- Monkeypatch `routes_for_seed()` to raise. Literal, macro, enum, local assignment, complete branch set, table set, same-function handle, and no-target tests must still pass.
+- The fake transfer callback is never called for these cases.
+- Direct macro source location remains the macro definition.
+- Branch merge emits all values and becomes `RUNTIME`.
+- Runtime table emits all table values and becomes `RUNTIME`.
+- Literal table index emits one `RESOLVED` value.
+- Incomplete branch chain does not take the fast path.
+- Ambiguous handle does not take the fast path.
+
+#### Gate
+
+- All locally provable seeds complete without route enumeration.
+- Their values, source locations, and semantic statuses equal the existing query resolver's output.
+
+---
+
+### Phase 5: replace complete-route enumeration with bounded backward state search
+
+This is the main algorithm change. Keep it inside `ValueFlowResolver` and reuse the current transfer machinery.
+
+#### Files
+
+- `value_flow/resolver.py`
+- `value_flow/transfers.py` only if one small state dataclass clearly belongs there
+- `tests/test_llm_transfer_value_flow.py`
+- `tests/test_valueflow_scheduler.py`
+
+#### 5.1 Search direction
+
+Start from the target/effective value site and move only when the selected value still depends on a caller.
+
+Do not start from `main` and do not build every `main -> target` combination.
+
+At each state:
+
+1. Resolve literal/macro/formula leaves with `_settle_transfer_arm()`.
+2. Evaluate source-backed guards with `_evaluate_arm_guards()`.
+3. Ask `request_local_transfer()` only if a non-terminal expression remains.
+4. If all bindings are terminal, emit the arm and stop expanding that branch.
+5. If an expression still contains formal-parameter placeholders, expand only the caller edges that can supply those parameters.
+6. Substitute the actual caller arguments with `_substitute_arm()`.
+7. Enqueue the resulting caller states.
+8. If the branch reaches a root formal parameter, mark it `EXTERNAL`.
+9. If it reaches a recognized in-scope runtime input, mark it `RUNTIME`.
+10. If it reaches unsupported or incomplete syntax, mark it `UNRESOLVED`.
+
+The already-computed `reachable` set proves that the starting function has at least one root path. A full root path is needed only as a display witness, not as a prerequisite for resolving a local constant.
+
+#### 5.2 State shape
+
+Add one small private dataclass near the existing resolver dataclasses, for example `BackwardState`:
+
+- `current_function_id`
+- `selected_site_id`
+- `arm`
+- `suffix_edges`: the value-carrying caller edges already traversed toward the target
+- `depth`
+- `branch_id`: the first caller edge chosen below the target, used for fairness
+
+Do not put whole AST nodes or source buffers in the state. Store stable IDs and look them up through existing indexes.
+
+#### 5.3 Semantic deduplication key
+
+Before enqueueing, normalize a key containing:
+
+- current function ID;
+- selected call-site ID;
+- ordered `(target_arg, binding_kind, normalized_binding_text)` tuples;
+- normalized remaining guards;
+- handle root when doing handle search.
+
+Do not include:
+
+- complete route ID;
+- correlation ID derived only from route identity;
+- display path labels.
+
+Two routes that reach the same semantic state should be processed once. Store an additional witness predecessor/path for display instead of duplicating the computation.
+
+Keep branch correlations that represent different value alternatives. Remove only correlation caused solely by different call-path spelling.
+
+#### 5.4 Fair breadth-first scheduling
+
+Use breadth-first order by caller depth. Within one depth, use round-robin order across `branch_id` groups.
+
+Required properties:
+
+- Every shallow branch gets a chance before one combinatorial branch consumes deeper work.
+- A branch that resolves at depth 1 is not skipped because another branch produces thousands of depth-2 states.
+- Caller edges are sorted by `(site_id, caller_id)` before enqueueing, so output is deterministic.
+- `seen` is checked before enqueueing.
+- A state is counted when first accepted for processing, not once per duplicate route.
+
+One acceptable data structure is:
+
+```text
+depth -> ordered map(branch_id -> deque[BackwardState])
 ```
 
-**File: `value_flow/resolver.py:3266-3268`.** Match the callback branch:
+For the current minimum depth, pop at most one state from each active branch, then repeat while that depth still has states. Move to the next depth only after the current depth is empty.
+
+#### 5.5 Early branch exit
+
+Stop expanding one branch as soon as all selected bindings are one of:
+
+- `EXACT`
+- `EXTERNAL`
+- explicit runtime genesis
+- `UNKNOWN`
+
+`UNKNOWN` is terminal only for computation; it produces `UNRESOLVED`, not success.
+
+Do not continue walking toward a root after a value is exact and all remaining guards are settled or safely retained as execution conditions.
+
+#### 5.6 Handle backwalk
+
+Replace the route-dependent handle opening search with the same backward-state idea:
+
+1. Start with `(consumer function, normalized handle, consumer byte offset)`.
+2. Call `_binding_opens()` in that exact function before the use.
+3. If exactly one valid opening exists, use it as the effective value site and stop the handle search branch.
+4. If the handle is a formal parameter, expand each ordinary reverse caller edge, substitute the caller's actual handle argument, and continue BFS.
+5. A synthetic callback edge is an external boundary unless callback metadata proves a concrete binding.
+6. If multiple opens are all source-proven mutually exclusive branches, keep all as a runtime set.
+7. If multiple opens cannot be correlated safely, emit `HANDLE_AMBIGUOUS`.
+8. Do not search another function for a plain local variable of the same name.
+9. Continue respecting the last close before the use.
+
+Reuse `_binding_opens()`, `_handle_candidates()`, `normalise_handle()`, function parameter lists, and reverse caller indexes.
+
+#### 5.7 Safety budget
+
+Add a small internal search budget. Use deterministic count limits, not a wall-clock timeout.
+
+Recommended constructor defaults:
+
+- `search_state_cap=5000` unique states per seed;
+- `search_depth_cap=256` caller hops per seed;
+- cooperative event-loop yield every 64 expanded states.
+
+Allow environment overrides only through:
+
+- `TRACER_VF_SEARCH_STATE_CAP`
+- `TRACER_VF_SEARCH_DEPTH_CAP`
+
+Read and validate these once in `ValueFlowResolver.__init__()`. Values below 1 fall back to 1. Do not add CLI flags in this patch.
+
+When a limit is reached:
+
+1. Stop adding new states for that seed.
+2. Keep already proven facts as evidence.
+3. Add one unresolved fact with:
+   - `origin_kind="UNRESOLVED"`;
+   - `termination_reason="SEARCH_LIMIT_REACHED"`;
+   - `trace_complete=false`;
+   - `search_truncated=true`;
+   - expanded/frontier/depth counters.
+4. Ensure `classify_records()` sees the unresolved fact in the same target-argument group, making the group `UNRESOLVED`.
+5. Add a human-readable transfer diagnostic.
+6. Increment a run-stat counter.
+
+Never return only the early exact values with `RESOLVED` after truncation. That would silently hide unvisited alternatives.
+
+#### 5.8 Concurrency safety
+
+- Keep the existing seed worker queue.
+- Keep all search structures for one seed local to that seed coroutine.
+- Continue sharing only the existing immutable indexes and memoized query/transfer caches.
+- Continue using `_query_lock` and `in_flight` for shared query results.
+- Do not mutate another seed's frontier.
+- Do not use threads for AST traversal.
+- Call `await asyncio.sleep(0)` after each configured batch of CPU-only state expansions so another seed can run.
+- Keep the LLM semaphore as the only LLM concurrency gate.
+- Keep final record ordering by original seed index.
+
+#### 5.9 Witness paths
+
+During `_compute_reachability()`, retain one deterministic predecessor edge for each reachable function. This is a small addition to the existing BFS.
+
+For a terminal fact:
+
+1. Reconstruct one root-to-current reachability prefix from the predecessor map.
+2. Append the value-carrying `suffix_edges` from current to target.
+3. Render with the existing `_route_labels()` logic or a tiny reused helper.
+4. Mark `path_mode="WITNESS"`.
+
+Do not enumerate alternative root prefixes. The fact represents a semantic source, not every execution route.
+
+#### 5.10 Integration approach
+
+- Refactor `_walk_route_backward_transfers()` into a state-processing helper instead of copying all of its transfer logic.
+- Reuse `_initial_route_arms()`, `_settle_transfer_arm()`, `request_local_transfer()`, `_evaluate_arm_guards()`, `_substitute_arm()`, `_mark_external_or_unknown()`, and `_resolved_transfer_seed()`.
+- Change `_resolve_seed_with_transfers()` to invoke the new backward search directly.
+- Stop calling `routes_for_seed()` from normal value-flow resolution.
+- Retain `routes_for_seed()` in the first patch with a clear comment that it is no longer used by the value-flow execution path and is kept temporarily for rollback/reference tests.
+- Do not use the old enumerator as an automatic fallback after a search limit. That would recreate the failure this phase fixes.
+
+#### Tests
+
+1. Diamond graph: many complete root paths collapse to one semantic state and one fact.
+2. Different caller values: distinct values remain distinct and become a complete runtime set.
+3. Same value from many callers: one semantic fact plus bounded witness paths, not one fact per route.
+4. Local terminal after one transfer: no ancestor callers are explored.
+5. Fairness fixture: one exploding branch plus one shallow literal branch; the shallow value is found before the budget ends.
+6. Cap fixture: search emits evidence plus `SEARCH_LIMIT_REACHED`, and final status is `UNRESOLVED`.
+7. Depth cap fixture behaves the same.
+8. Recursive call graph terminates through the semantic `seen` set.
+9. Callback edge produces external/boundary behavior unchanged.
+10. Two concurrently resolving seeds share cached subqueries and do not duplicate LLM calls.
+11. Output order is stable across at least three runs.
+12. Monkeypatch `routes_for_seed()` to raise; nonlocal value-flow tests still pass, proving it is unused.
+
+#### Gate
+
+- Search work grows with unique value-flow states, not the number of complete root paths.
+- The stress fixture stays below the configured state cap.
+- Truncation can never produce `RESOLVED` or exact-index promotion.
+- All pre-existing transfer correctness tests pass.
+
+---
+
+### Phase 6: represent runtime genesis and unresolved failure honestly
+
+#### Files
+
+- `value_flow/resolver.py`
+- `value_flow/status.py`
+- `value_flow/outputs.py`
+- `discovery_index.py`
+- `tests/test_value_flow_status.py`
+- `tests/test_discovery_index.py`
+
+#### Exact edits
+
+1. Introduce one explicit origin for successfully traced dynamic in-scope data, for example `RUNTIME_DATA`.
+
+2. Produce `RUNTIME_DATA` only when the backwalk reaches a meaningful terminal source such as:
+   - recognized input/receive API output;
+   - source-backed runtime selector whose producer is known;
+   - local assignment from a runtime field where the read site is known and the trace has no missing branch.
+
+3. Do not produce `RUNTIME_DATA` for:
+   - unsupported pointer expressions;
+   - undefined symbols;
+   - partial caller coverage;
+   - missing AST/source;
+   - ambiguous handles;
+   - recursion/search truncation.
+
+4. Keep `EXTERNAL_ENTRY` and `EXTERNAL_DATA` for known outside boundaries. Do not merge `EXTERNAL` into `RUNTIME`; users need to know whether the producer is outside the process.
+
+5. Update `_fact_kind()` so `RUNTIME_DATA` maps directly to semantic `RUNTIME`.
+
+6. For all fact constructors, set `source_role`, `trace_complete`, and `termination_reason` consistently. Prefer a small helper that merges provenance metadata rather than repeating dictionaries in many branches.
+
+7. Fix `_fact_from_transfer_binding()` so falling back to `seed.site.file_path` is marked `source_role=TARGET_FALLBACK`. Do not present it as a proven genesis.
+
+8. On unresolved output, preserve the last proven source site if one exists. Put the specific failure in metadata and the compatibility `resolution_reason` field.
+
+9. Ensure all rows have non-empty source location fields:
+   - use actual definition/assignment/boundary whenever proven;
+   - otherwise use target file/line/expression as a clearly marked fallback;
+   - never invent a line number.
+
+10. Keep one row per source when there are several genesis points. Reuse `value_set_id` from `classify_records()`.
+
+11. Update output comments: `paths.csv` stores retained source-to-target proof/witness paths, not every possible root route.
+
+12. Append the compatibility CSV columns listed in Section 4.4. Populate them from the representative fact without changing old columns.
+
+#### Tests
+
+- Known runtime input -> `RUNTIME`, correct genesis line, `trace_complete=true`.
+- Root parameter -> `EXTERNAL`, boundary line/expression.
+- Unsupported pointer -> `UNRESOLVED`, last proven or target fallback, failure reason.
+- Undefined symbol -> `UNRESOLVED`.
+- Complete finite branch/table set -> `RUNTIME` with shared `value_set_id`.
+- Partial set -> `UNRESOLVED`.
+- Search limit -> `UNRESOLVED` even when one value was found first.
+- Literal and macro rows contain target/definition source locations.
+- Compatibility CSV retains all old headers in the same order and appends the five new headers.
+
+#### Gate
+
+- Every fact CSV row has target and source location fields.
+- `RUNTIME` is used only for completed dynamic traces.
+- Analyzer failures remain visibly `UNRESOLVED`.
+
+---
+
+### Phase 7: handle scope and branch-set accuracy
+
+The analysis report describes false file-scope handle ambiguity, but the current `_binding_opens()` already looks in `sites_by_caller[caller_id]`. Therefore, test first and change production code only if the current version still reproduces the bug.
+
+#### Files
+
+- `value_flow/resolver.py` only if the regression test fails
+- `tests/test_value_flow.py`
+- `tests/test_llm_transfer_value_flow.py`
+
+#### Exact work
+
+1. Add a fixture with two functions, each declaring local `fcb`, opening it once, and using it once.
+2. Assert each use binds only to the open in its own function.
+3. If the test already passes, make no handle-scope production change. Record the report item as already fixed/stale.
+4. If it fails, patch the exact stage that loses caller identity. The binding key must include function/caller identity plus normalized handle, not file plus variable spelling.
+5. Keep file-static and global/field behavior separate:
+   - automatic local -> same function only;
+   - file-static -> same translation unit;
+   - global/struct field -> reachable candidate functions, with ambiguity preserved.
+6. Add open-close-use fixture. An open before the last matching close cannot bind a later use.
+7. For several mutually exclusive local opens, reuse the existing multi-open/arm machinery to retain all source-proven alternatives.
+8. Promote those alternatives to `RUNTIME` only if every live branch is represented and tracing completed.
+9. If branch correlation is incomplete, keep `HANDLE_AMBIGUOUS` / `UNRESOLVED`.
+10. Do not enable nearest-open or first-open fallback.
+11. Do not let an LLM candidate settle ambiguity without syntax confirmation.
+
+#### Branch assignments
+
+The Phase 4 fast path should automatically fix complete branch-merged constants because `_local_reaching_definitions()` already returns every arm. Add explicit tests here to prevent regression:
+
+- `if/else` with two macros -> two-value `RUNTIME` set;
+- `if/else if/else` with three macros -> three-value set;
+- missing `else` -> unresolved unless an earlier reaching value is also proven;
+- one branch with unsupported expression -> whole group unresolved;
+- guards remain attached as evidence but do not demote each source constant.
+
+#### Gate
+
+- Same-named locals in different functions cannot collide.
+- Use-after-close cannot resolve from a stale open.
+- Complete alternatives remain complete; incomplete alternatives remain unresolved.
+
+---
+
+### Phase 8: register six semantic queue wrappers without hiding their nature
+
+These mappings are already stated in C-Visualizer analysis material:
+
+| Wrapper | Queue-number argument | Canonical operation |
+| --- | ---: | --- |
+| `Dac_EnqSem` | 2 | `ADDQUE` |
+| `Dac_EnqSem2` | 2 | `ADDQUE` |
+| `SimEnqueSem` | 3 | `ADDQUE` |
+| `MsgEnqSem` | 2 | `ADDQUE` |
+| `DxiEnqEvent` | 2 | `ADDQUE` |
+| `DxiEnqEvent2` | 2 | `ADDQUE` |
+
+#### Files
+
+- `target_specs/build_index_targets.json`
+- target-spec loader/validation only if unknown metadata is currently rejected
+- `tests/test_target_compatibility.py`
+- `tests/test_discovery_index.py`
+- `tests/test_value_flow.py`
+
+#### Exact edits
+
+1. Add one normal target entry per wrapper with:
+   - `type="QUEUEF"`;
+   - `launch="FORK"`;
+   - the argument index in the table above;
+   - `get_upper=true`;
+   - no dependent functions;
+   - discovery resource `mfs_queue`;
+   - matching argument operation `ADDQUE`.
+
+2. Add additive metadata:
+   - `semantic_wrapper=true`;
+   - `canonical_target="mpf_mfs_addque"`.
+
+3. Preserve the wrapper name as `target_function` and put the canonical operation in metadata. This lets users see the actual caller-level site while understanding its meaning.
+
+4. Increment the target-spec version and allow its digest to change through the existing digest function. Do not hand-edit a digest.
+
+5. Do not copy hard-coded wrapper logic into `project_aware.py` or the resolver. The registry is the single owner.
+
+6. Raw AST inventory must keep both locations when both exist:
+   - the caller-level wrapper call is a `WRAPPER_CALL`;
+   - the `mpf_mfs_addque` call inside the wrapper body is a `WRAPPER_IMPLEMENTATION`.
+
+   They are two real source sites, so both belong in `target_sites.csv` and evidence output.
+
+7. Do not let those two levels create two authoritative access records for one runtime queue operation. Keep this logic in the discovery adapter, not in parsing or value resolution:
+   - attach the enclosing caller function name to normalized fact metadata;
+   - group source-proven wrapper-call facts by wrapper, operation, and resolved value;
+   - identify canonical inner facts whose enclosing function is that wrapper;
+   - mark an inner fact `alias_internal=true` and keep it evidence-only only when a complete caller-level wrapper fact covers the same operation and value;
+   - keep the inner fact authoritative when caller-level coverage is absent, unresolved, external, or truncated;
+   - never suppress a value that appears only at the inner site;
+   - never suppress anything merely to make counts match.
+
+8. The exact JSON access indexes must receive at most one authoritative record for a covered wrapper operation/value. `target_sites.csv` and `discovery_facts.csv` still show both source sites and their roles.
+
+9. Implement the evidence-only alias state additively. Either use a clear non-exact evidence status such as `ALIAS_INTERNAL`, or keep the existing non-exact status and add `alias_internal=true`; whichever choice requires fewer downstream changes. `resolution_status` may remain `RESOLVED` because the value itself is proven—the row is excluded only because it is the internal half of an already represented semantic operation.
+
+10. Do not infer new wrappers by naming convention. Only the six reviewed mappings are in scope.
+
+#### Tests
+
+- Each wrapper is discovered at the configured argument position.
+- Direct literal/macro wrapper values use the deterministic fast path.
+- Runtime wrapper parameter values use backward search.
+- Wrapper metadata names `mpf_mfs_addque` as canonical.
+- Ordinary `mpf_mfs_addque` behavior is unchanged.
+- A covered wrapper call plus its inner implementation yields two evidence sites but only one authoritative exact access record for that operation/value.
+- If wrapper caller coverage is incomplete, the inner source-proven fact is not suppressed.
+- Target-spec schema/digest tests pass.
+
+#### Gate
+
+- All six wrappers are visible and resolve under the same proof rules as ordinary queue calls.
+- No wrapper value is guessed.
+
+---
+
+### Phase 9: counters, diagnostics, and final output wiring
+
+#### Files
+
+- `value_flow/resolver.py`
+- `project_aware.py`
+- `value_flow/outputs.py`
+- `discovery_index.py`
+- relevant output tests
+
+#### Add these `run_stats.json` fields
+
+- `fast_path_seed_count`
+- `search_seed_count`
+- `search_state_count`
+- `search_deduplicated_state_count`
+- `search_limit_seed_count`
+- `search_max_frontier`
+- `search_max_depth`
+- `witness_path_count`
+
+Keep all existing run-stat fields.
+
+#### Diagnostics
+
+- Replace the old normal-path `route limit 10000 reached` message with explicit backward-search diagnostics.
+- Diagnostic text must include target site ID, limit type, configured limit, states expanded, maximum frontier, and deepest level.
+- Include inventory/fact mismatch counts in index metadata.
+- Keep failed-run partial evidence writing.
+- Do not turn diagnostics into exceptions unless an existing correctness invariant is violated.
+
+#### Summary output
+
+Add a small performance section to the existing per-process `summary.md` using the counters above. Do not create a new report format.
+
+#### Gate
+
+- A user can tell whether a run used only fast paths, performed search, or stopped at a safety limit.
+- A green zero-target run is distinguishable from a target-containing run with zero resolver facts.
+
+---
+
+## 6. Detailed backward-search pseudocode
+
+The implementation may use different private names, but it must preserve these decisions.
 
 ```python
-substituted = self._substitute_arm(child, edge)
-if substituted is None:
-    terminal.append(
-        self._mark_external_or_unknown(
-            child, external=True,
-            parameter_names=tuple(current_function.parameters),
+async def _search_seed_backward(seed, start_site, indices, operation):
+    initial_arms = _initial_arms_without_full_route(seed, start_site, indices)
+    frontier = FairBreadthFirstFrontier()
+    seen = set()
+    terminal_arms = []
+    incomplete = False
+
+    for arm in initial_arms:
+        frontier.add(
+            BackwardState(
+                current_function_id=start_site.caller_id,
+                selected_site_id=start_site.site_id,
+                arm=arm,
+                suffix_edges=(),
+                depth=0,
+                branch_id="local",
+            )
         )
-    )
-    continue
+
+    while frontier:
+        state = frontier.pop_fair_bfs()
+
+        key = semantic_state_key(state)
+        if key in seen:
+            remember_extra_witness(key, state)
+            continue
+        seen.add(key)
+
+        if len(seen) > search_state_cap or state.depth > search_depth_cap:
+            incomplete = True
+            break
+
+        site = sites[state.selected_site_id]
+        function = functions[state.current_function_id]
+        arms = settle_and_transfer_locally(state.arm, site, function)
+
+        for arm in arms:
+            if guard_is_impossible(arm):
+                continue
+
+            if all_bindings_terminal(arm) and no_unsettled_parameter_guard(arm):
+                terminal_arms.append((arm, state))
+                continue
+
+            caller_edges = relevant_reverse_callers(function, arm)
+
+            if not caller_edges:
+                terminal_arms.append(mark_boundary_or_unknown(arm, function))
+                continue
+
+            for edge in sorted(caller_edges, key=edge_sort_key):
+                child = substitute_arm(arm, edge)
+                if child is None:
+                    terminal_arms.append(mark_unknown(arm, "SUBSTITUTION_FAILED"))
+                    continue
+
+                frontier.add(
+                    BackwardState(
+                        current_function_id=edge.caller_id,
+                        selected_site_id=edge.site_id,
+                        arm=child,
+                        suffix_edges=(edge, *state.suffix_edges),
+                        depth=state.depth + 1,
+                        branch_id=(state.branch_id if state.depth else edge.site_id),
+                    )
+                )
+
+        if len(seen) % 64 == 0:
+            await asyncio.sleep(0)
+
+    rows = materialize_semantic_terminal_arms(terminal_arms)
+
+    if incomplete:
+        rows.append(search_limit_unresolved_row(seed, counters))
+
+    return rows
 ```
 
-**Risk:** low. The second edit converts UNKNOWN → EXTERNAL_ENTRY *only* for
-bindings that are a placeholder or a formal-parameter name —
-`_mark_external_or_unknown` already applies that test internally
-(`value_flow/resolver.py:2988-2997`). Everything else still becomes UNKNOWN.
+Important differences from the current route enumerator:
+
+- No complete routes are built first.
+- Local terminal values stop their branch immediately.
+- States are deduplicated before expensive work.
+- Search is breadth-first and fair across the first caller branches.
+- A root prefix is reconstructed only for output.
+- Truncation is visible and prevents false completion.
 
 ---
 
-#### Fix 3.3 — Two candidate opens should be two arms, not a dead end (P13)
+## 7. Deduplication rules
 
-**File: `value_flow/resolver.py:3327`.**
+Current record deduplication includes `correlation_id`, which keeps semantically identical route results separate. Do not simply remove correlation everywhere; some correlations represent real mutually exclusive value alternatives.
 
-```python
-bindings = self._binding_opens(current_id, root, before, dependencies)
-if len(bindings) == 1:
-    return bindings[0]
-```
+Use two levels:
 
-The minimal, low-risk step is *not* to restructure `_opening_for_route` (it
-returns a single site and three call sites depend on that). Instead add a
-sibling that returns the list, and use it only in `_resolve_seed_with_transfers`:
+### 7.1 Computation deduplication
 
-```python
-def _openings_for_route(self, seed, route, dependencies) -> list[IndexedSite]:
-    """Every candidate open, where _opening_for_route requires exactly one."""
-```
+The semantic state key in Phase 5 prevents repeated work. Route ID is excluded.
 
-— a copy of `_opening_for_route` whose first branch is
-`if bindings: return bindings` and whose failure paths return `[]`. Then in
-`_resolve_seed_with_transfers` (~3459-3477) iterate the returned list, creating
-one `effective` entry per opening. `_route_for_opening` already takes a single
-opening, so nothing else changes.
+### 7.2 Output deduplication
 
-**Risk:** medium — it increases row count for handle targets (each opening
-becomes its own correlated arm, which is the correct representation). Confirm
-`_deduplicate_records` and `_legacy_rows` grouping behave as expected before
-enabling. Consider gating behind an env var for the first run.
+Merge records only when all of these match:
 
-**Do not attempt this before Fix 0.1** tells you how many seeds are hitting
-`HANDLE_AMBIGUOUS`; if the number is small it is not worth the risk.
+- target site ID;
+- argument index;
+- value;
+- origin kind;
+- source file;
+- source line;
+- source expression/source site ID;
+- operation;
+- semantic alternative/set identity.
 
----
+When merging:
 
-#### Fix 3.4 — `_macro_call_arguments` must not claim an empty list is reliable (P15)
+- retain distinct witness paths up to the existing `path_cap`;
+- increment a separate metadata count such as `equivalent_route_count` if known;
+- combine `paths_truncated` with logical OR;
+- do not merge different source lines that happen to produce the same value;
+- do not merge an external fact with an unresolved fact;
+- do not merge different branch-set IDs.
 
-**File: `value_flow/resolver.py:648`.**
-
-```python
-if arguments is None:
-    return [], False        # was: return [], True
-```
-
-An empty argument list is not a usable mapping, and marking it reliable causes
-`initial_route_arm` to emit `"missing argument"` with no model call. Marking it
-unreliable routes the site through the macro path instead.
-
-**Risk:** low, but it changes which sites are `macro_args_unmapped`. Land it
-together with Fix 3.2, which softens what that flag costs.
+If it is unclear whether two arms are semantically the same, keep both evidence rows. Safety is more important than smaller output.
 
 ---
 
-### Phase 4 — Speed
+## 8. Test matrix
+
+Every row below needs a synthetic regression test.
+
+| Case | Expected status | Search? | LLM? | Important assertion |
+| --- | --- | --- | --- | --- |
+| Direct number | `RESOLVED` | No | No | Source is target line. |
+| Direct string fork target | `RESOLVED` | No | No | Package validation unchanged. |
+| Visible macro | `RESOLVED` | No | No | Source is macro definition. |
+| Visible enum | `RESOLVED` | No | No | Source is enum definition. |
+| Guarded macro | `RESOLVED` | No | No | Guard stays metadata only. |
+| Local assignment | `RESOLVED` | No | No | Source is assignment. |
+| Complete 2-arm assignment | `RUNTIME` | No | No | Two values, one set ID. |
+| Incomplete branch | `UNRESOLVED` | Maybe | Optional | No false complete set. |
+| Literal table index | `RESOLVED` | No | No | One table entry. |
+| Runtime table index | `RUNTIME` | No | No | Complete table set. |
+| Same-function handle/open | `RESOLVED` | No | No | Open value source used. |
+| Same handle name in two functions | separate results | No | No | No cross-function collision. |
+| Open-close-use | `UNRESOLVED` | No/limited | No | Stale open rejected. |
+| Parameter from one caller literal | `RESOLVED` | Yes | Only if local transfer needs it | One value. |
+| Parameter from callers with two values | `RUNTIME` | Yes | Bounded | Both values kept. |
+| Root parameter | `EXTERNAL` | Yes | No | Boundary recorded. |
+| Recognized runtime input | `RUNTIME` | Yes | Optional | Genesis recorded. |
+| Undefined symbol | `UNRESOLVED` | Limited | Optional | Never runtime/exact. |
+| Function pointer unsupported | `UNRESOLVED` | Limited | Optional | Failure reason. |
+| Recursive call graph | complete or `UNRESOLVED` | Bounded | Bounded | No recursion error. |
+| Exponential route diamond | correct semantic set | Bounded | Bounded | States, not routes, determine work. |
+| State cap reached | `UNRESOLVED` | Bounded | Bounded | Exact promotion blocked. |
+| Exploding branch plus shallow branch | `UNRESOLVED` if capped | Bounded | Bounded | Shallow evidence still found. |
+| Unreachable AST target | unreachable evidence | No seed required | No | Present in inventory. |
+| Empty preliminary detection | normal inventory | As needed | As needed | No silent zero. |
+| Wrapper direct macro | `RESOLVED` | No | No | Correct wrapper arg. |
+| Deep AST | normal result | No recursion crash | No | Iterative walker. |
 
 ---
 
-#### Fix 4.1 — Build the request only on a cache miss (P3)
+## 9. Verification commands
 
-**File: `value_flow/resolver.py`, `request_local_transfer` (~2790-2830).**
+Run from `forkproc_checker/c-visualizer`.
 
-Reorder so the cache lookup happens before the expensive construction. This is
-safe because **`_validate_transfer_answer` does not use its `request`
-parameter** — verified: no reference to `request` appears anywhere in its body
-(`:2685-2764`). Keep the parameter for signature stability, or pass `None` on
-the cache-hit path.
+### 9.1 Focused tests after each phase
 
-Order becomes: compute `constants` and `macro_context` → `macro_digest` →
-`function_text, function_base = self._function_slice(...)` → `key` → cache
-lookup → construct `TransferRequest` **only if** it is a miss.
-
-`function_text` is still needed for the key, so the slice stays before the
-lookup — but after Fix 2.1 that is a function-sized slice, not a whole file, so
-the cost is already an order of magnitude lower.
-
-**Additionally**, memoise the slice per function:
-
-```python
-self._function_slice_cache: dict[str, tuple[str, int]] = {}   # in __init__
+```bash
+PYTHONPATH=. .venv/bin/pytest -q \
+  tests/test_value_flow_status.py \
+  tests/test_discovery_index.py \
+  tests/test_value_flow.py \
+  tests/test_llm_transfer_value_flow.py \
+  tests/test_phase4_value_flow.py \
+  tests/test_valueflow_pipeline.py \
+  tests/test_valueflow_scheduler.py \
+  tests/test_preprocess.py \
+  tests/test_target_compatibility.py
 ```
 
-with a lookup at the top of `_function_slice`. Function sources do not change
-during a run.
+### 9.2 Full repository gate
 
-**Risk:** low. Pure reordering plus a memo on immutable data.
+```bash
+PYTHONPATH=. .venv/bin/pytest -q
+```
+
+### 9.3 Static checks
+
+Use the repository's existing formatter/linter commands if configured. Do not introduce a formatter or reformat unrelated files.
+
+### 9.4 Required deterministic checks
+
+- Run the diamond/fan-out stress test three times.
+- Compare fact values, statuses, set IDs, and row ordering.
+- Confirm state counts are stable.
+- Confirm `routes_for_seed()` is not called.
+- Confirm no test changes Python's recursion limit.
 
 ---
 
-#### Fix 4.2 — Keep the transfer cache across file edits (P21)
+## 10. Acceptance criteria
 
-**File: `value_flow/resolver.py`, `_load_cache` (~988-1018).**
+The work is complete only when all of these are true.
 
-Restructure so the fingerprint gates only the query results, not the transfer
-cache:
+### Correctness
 
-```python
-payload = json.loads(self.cache_path.read_text(encoding="utf-8"))
-if payload.get("schema_version") != 3:
-    return
-# Transfer entries are self-validating: make_transfer_cache_key already
-# digests the function slice, the selected site source, the prompt version
-# and the model id. A change to an unrelated file cannot produce a false hit,
-# so these survive a project fingerprint change.
-self.transfer_cache = {
-    str(key): value
-    for key, value in (payload.get("transfer_cache") or {}).items()
-    if isinstance(value, dict)
-}
-if payload.get("fingerprint") != self.cache_fingerprint:
-    return
-self.results = {...}          # unchanged from here
-```
+- Existing source-proven exact values remain exact.
+- A single source-proven constant or macro is exact regardless of execution guards.
+- Complete multi-value alternatives are `RUNTIME`, never flattened.
+- Partial alternatives are `UNRESOLVED`.
+- LLM-only candidates remain unresolved.
+- Undefined symbols remain unresolved.
+- Local handle scope and close ordering are respected.
+- Search truncation prevents exact promotion.
 
-**Risk:** low **once Fix 2.2 has landed.** Before Fix 2.2 the key digests the
-whole file, so this change would be safe but nearly useless. After it, the key
-digests only the function, so an edit elsewhere in the same file correctly
-keeps the hit. This ordering matters — do not land 4.2 before 2.2.
+### Discovery
 
-**Verification:** run twice, edit one unrelated function, run a third time;
-`transfer_cache_hits` should stay high on the third run.
+- The full configured target registry drives AST inventory in value-flow mode.
+- `target_sites.csv` lists every configured AST target argument.
+- Inventory does not depend on root reachability or preliminary detection.
+- Untraced targets are visible as evidence.
+- A target-containing successful run cannot silently report a clean zero.
+- All six reviewed queue wrappers are registered at the documented argument indexes.
 
----
+### Performance and safety
 
-#### Fix 4.3 — Memoise `routes_for_seed` (P22)
+- Deterministic targets do not enumerate routes and do not call the LLM.
+- Nonlocal resolution starts at the target and expands backward only while the value depends on callers.
+- Work is deduplicated by semantic state.
+- Search is breadth-first and fair across shallow caller branches.
+- Per-seed state and depth caps always terminate the search.
+- CPU-only search yields periodically to other async seed workers.
+- Whole-tree plumbing does not depend on Python recursion depth.
 
-**File: `value_flow/resolver.py:2437`.**
+### Output
 
-```python
-def routes_for_seed(self, seed: Seed) -> list[RouteGuide]:
-    key = (seed.site.site_id, seed.local_backwalk)
-    cached = self._route_cache.get(key)
-    if cached is not None:
-        return cached
-    ...
-    routes = sorted(routes, key=lambda item: item.route_id)
-    self._route_cache[key] = routes
-    return routes
-```
+- Every fact has target location and source/last-proven location.
+- Runtime and external genesis/boundary are clearly different.
+- Paths are retained as proof/witness paths without full enumeration.
+- Existing CSV columns and file locations remain compatible.
+- New compatibility fields are appended only.
+- Run stats show fast-path, search, deduplication, and truncation counts.
 
-with `self._route_cache: dict[tuple[str, bool], list[RouteGuide]] = {}` in
-`__init__`.
+### Diff size
 
-**Risk:** none. `RouteGuide` is a frozen dataclass and the result depends only
-on immutable index state. Callers do not mutate the returned list — confirm
-that at the five call sites (`:3363, 3423, 3459, 3483, 3486`); if any does,
-return `list(routes)` instead.
+- No new dependency.
+- No broad module rewrite.
+- No change to the old resolver implementation beyond shared crash-safe plumbing needed by both modes.
+- No removal of the old route enumerator in the first patch.
+- No unrelated cleanup or formatting.
 
 ---
 
-#### Fix 4.4 — Memoise `_transfer_visible_names` (P23)
+## 11. Stop conditions and rollback points
 
-**File: `value_flow/resolver.py:2552`.** Add a dict cache keyed by file name.
-Fix 2.4 already hoists it to one call per arm; this makes the remaining calls
-free.
+Stop implementation and investigate before continuing if any of these happens:
 
-**Risk:** none. Macro and enum indexes are built once in `__init__`.
+- A previously exact, source-proven fixture becomes runtime or unresolved.
+- A previously retained alternative disappears.
+- A capped search returns `RESOLVED`.
+- LLM call count increases for a deterministic fixture.
+- Inventory count decreases for the same parsed fixture.
+- Existing compatibility CSV columns move or disappear.
+- Same-named local handles begin sharing opens across functions.
+- Search output changes across identical runs.
+- The implementation requires reading prohibited legacy or proprietary files.
 
----
+Each phase is independently reversible:
 
-#### Fix 4.5 — Stop the transfer prompt from running an agentic tool loop (P24)
+- Phase 1 changes only traversal mechanics and two defensive guards.
+- Phase 2 changes inventory/config selection and adds one CSV.
+- Phase 3 changes classification policy.
+- Phase 4 adds the deterministic dispatch fast path.
+- Phase 5 changes only the nonlocal transfer search path while retaining the old route method for rollback reference.
+- Phase 6 adds semantic/provenance output behavior.
+- Phase 7 is test-first and may require no production edit.
+- Phase 8 is registry-only plus metadata handling.
+- Phase 9 is additive telemetry/output wiring.
 
-**File: `client/llm.py:465-471`.** Build the kwargs conditionally so a caller
-that passes no tools gets a single completion instead of a loop:
-
-```python
-create_kwargs = {
-    "model": self.model,
-    "messages": self.messages,
-    "temperature": self.temp,
-}
-if self.tools:
-    create_kwargs["tools"] = self.tools
-    create_kwargs["tool_choice"] = "auto"
-response = self.client.chat.completions.create(**create_kwargs)
-```
-
-**File: `project_aware.py`, `llm_calls_transfer` (~721-731).** Pass no tools:
-
-```python
-"tools": None,
-"tool_functions": {},
-```
-
-The system prompt already says "Analyze only the selected function and selected
-outgoing call … Do not select another call site and do not follow callers", so
-the tools were never appropriate for this prompt. With no tools the model
-answers on the first turn, `msg.tool_calls` is empty, and the loop falls
-straight through to the formatting stage.
-
-**Risk:** medium — `client/llm.py` is shared with the legacy one-hop and
-return-use prompts. The guard is `if self.tools:`, so those callers (which pass
-real tools) hit exactly the code path they hit today. Verify by checking that
-`resolve_return_use` and the one-hop resolver still pass a non-empty
-`TOOL_DEFINITION`.
-
-**Expected effect:** one round trip instead of up to 100, per hop.
+Do not proceed to the next phase until the focused gate for the current phase passes.
 
 ---
 
-#### Fix 4.6 — Stop injecting the legacy scalar contract into transfer prompts (P25)
-
-**File: `client/llm.py:513`.**
-
-```python
-if self.output_model.__name__ not in {"outputModelForReturn", "TransferAnswerModel"}:
-    format_prompt_content += """ ... 1:value,2:value ... """
-elif self.output_model.__name__ == "outputModelForReturn":
-    format_prompt_content += ("- **YOU JUST HAVE TO RETURN WHETHER ...")
-```
-
-Today the condition is `!= "outputModelForReturn"`, which is **true** for
-`TransferAnswerModel`, so every transfer request is told to answer
-`1:value,2:value`, to write `UNRESOLVED` when unsure, and not to return a list —
-while being handed the `arms: [...]` schema.
-
-**Risk:** none. It removes instructions that are wrong for this schema.
-**This is a one-line change and is probably the single highest
-value-per-character fix in the document.** Land it in Phase 0 if you want an
-early signal.
-
----
-
-#### Fix 4.7 — Replace fork-per-hop with a direct call (P20) — deferred
-
-`run_with_retry` (`project_aware.py:812`) forks a process per LLM hop, with a
-600 s join and 2 retries, and has a pipe-capacity hazard that can kill a
-successful answer and record it as a timeout.
-
-This is a real cost, but it is **not a minimal change** — `run_with_retry` is
-shared by every LLM entry point and the fork context is deliberate
-(`project_aware.py:770-780`: the child inherits the `State()` singleton). Do
-not touch it in the same batch as everything above.
-
-If Phase 0 shows a significant `llm_exception` or timeout count, the smallest
-safe intervention is to lower the transfer-specific timeout — pass
-`timeout=120` from `resolve_transfer` (`project_aware.py:1786-1790`) rather
-than inheriting the 600 s default. A transfer prompt that has not answered in
-two minutes is not going to.
-
----
-
-## Part 3 — Deliberately not doing
-
-- **Widening the formula grammar (P10).** It is a real limitation, but it is
-  the change most likely to admit wrong answers, and Phase 0 will show whether
-  it is still the binding constraint after the prompt is fixed. Revisit with
-  data. If you do proceed, add node types one at a time in this order:
-  `field_expression`, `subscript_expression`, `conditional_expression`,
-  `pointer_expression` — each treated as an opaque named leaf that yields
-  EXTERNAL rather than an evaluated value.
-- **Normalising the literal/evidence check (P11).** Correct, but it interacts
-  with the widened spans from Fix 1.1 step 4. Do it after, not with.
-- **Fixing `_build_function_index` name-only matching (P12).** The real fix is
-  to match on name *and* line range, which touches the index everything else is
-  built on. Fix 0.3 measures it first; only act if the count is non-trivial.
-- **`_legacy_rows` group-dropping (P18)** and **the `start_byte`/ordinal
-  fallback (P16).** Both real, both narrow, neither on the UNRESOLVED critical
-  path. Log them and move on.
-- **Removing the prose→JSON second pass (P24, second half).** Fix 4.5 removes
-  the tool loop, which is the expensive half. Removing the second pass means
-  moving to native structured output, which is a larger change to a shared
-  client.
-
----
-
-## Part 4 — Sequencing and verification
-
-Land in this order. Each step is independently revertable.
-
-| Step | Fixes | Expected signal |
-|---|---|---|
-| 0 | 0.1–0.4, **4.6** | Rejection histogram exists; RECURSIVE counts become truthful |
-| 1 | 1.1–1.4 | `schema_invalid` and `no_current_span` collapse; UNRESOLVED drops |
-| 2 | 2.1–2.4 | Prompt tokens per hop drop 10–100×; prefill time drops |
-| 3 | 3.1, 3.2, 3.4 | UNRESOLVED reclassified as EXTERNAL_*; `unresolved_expr` populated |
-| 4 | 4.1–4.4 | Wall-clock drop on re-runs; cache hit rate stays high after edits |
-| 5 | 4.5 | One model round trip per hop |
-| 6 | 3.3, then reassess P10/P11/P12 | Handle-target coverage |
-
-**Before starting**, capture a baseline on one representative process:
-
-- total facts by `origin_kind` (UNRESOLVED / RECURSIVE / EXTERNAL_* / CONST / MACRO)
-- `transfer_request_count`, `transfer_cache_hits`, `transfer_cache_misses`
-- wall-clock, and mean prompt tokens per transfer (from `record_stats`)
-
-Re-measure after each step. The `origin_kind` histogram is the number to watch:
-success is UNRESOLVED shrinking while CONST/MACRO stay accurate and
-EXTERNAL_ENTRY/EXTERNAL_DATA grow — an expression that is honestly external is
-a useful answer; "UNRESOLVED" is not.
-
-**Regression suite to run at every step:**
-
-```
-tests/test_llm_transfer_value_flow.py     # transfer contract + fake resolvers
-tests/test_valueflow_pipeline.py
-tests/test_value_flow.py
-tests/test_no_target_pipeline.py
-```
-
-`tests/test_llm_transfer_value_flow.py` is the one that guards this surface —
-its fake resolvers exercise the evidence path directly (`:67-78`, `:318-319`,
-`:434`, `:465`, `:495`). If Fix 2.1 breaks it, the cause is the offset
-convention and Fix 1.1 step 2 is what is meant to absorb it; check that first
-before changing any test.
-
-**Cache note:** Fix 2.2 bumps `transfer_prompt_version` to
-`valueflow-transfer-v2`. The first run after Phase 2 is a full cache miss by
-design. Do not interpret it as a regression.
-
----
-
-# Part 5 — Remaining work (P10–P24), implementation-ready
-
-Part 3 listed these as "deliberately not doing" and gave only sketches. This
-part turns them into specs the implementer can execute.
-
-## 5.0 — Two corrections that change the priorities
-
-**Correction 1: P10 is much smaller than it looked.**
-
-`_validate_transfer_answer` grammar-checks only two things: the **guard**, and
-**EXPRESSION** bindings. An **EXTERNAL** binding is *not* passed through
-`validate_formula` at all — it is only checked for "not a literal" and
-"placeholder indices in range" (`value_flow/resolver.py:2897-2911`).
-
-So a model that wants to report `cfg->sensor.raw_pressure` can already do so
-today, as `kind: "EXTERNAL"`, and it validates. The prompt already directs it
-there: *"Do not use local variable names in a completed EXPRESSION: resolve
-them or return EXTERNAL/UNKNOWN."*
-
-And Fix 2.4 already made an inexpressible **guard** non-fatal.
-
-What is left of P10 is therefore narrow: only an **EXPRESSION** binding — a
-value the model wants the coordinator to keep tracing — is still grammar-bound.
-Check `transfer_rejections["binding_formula"]` before doing 5.4 at all. If it is
-small, P10 is a non-issue and 5.4 should be skipped.
-
-**Correction 2: the headline UNRESOLVED count cannot move without 5.5.**
-
-Fix 3.1 only added `metadata["unresolved_expr"]`. The `value` column still reads
-`"UNRESOLVED"`. Every other fix changes *whether* a hop resolves; only 5.5
-changes how an unresolved-but-known expression is *reported*. If the goal is
-"fewer UNRESOLVED rows in the CSV", 5.5 is the fix that does it.
-
-## 5.1 — Design rule for this part: default to today's behaviour
-
-Everything in Part 5 that can change a resolved value is behind an environment
-flag that **defaults to off**. With no flags set, the pipeline behaves exactly
-as it does after Part 2. That is what makes this batch safe to land unmeasured:
-it is inert until switched on, and tuning is flag-flipping, not editing.
-
-| Flag | Default | Fix | Effect when on |
-|---|---|---|---|
-| `TRACER_VF_GRAMMAR_EXTENDED` | off | 5.4 | EXPRESSION may use field/index/deref/ternary as opaque leaves |
-| `TRACER_VF_EXTERNAL_UNKNOWN` | off | 5.5 | UNKNOWN bindings report their expression instead of `"UNRESOLVED"` |
-| `TRACER_VF_MULTI_OPEN` | off | 5.6 | Several candidate opens become several arms |
-| `TRACER_VF_KEEP_PARTIAL_ROWS` | off | 5.7 | Legacy CSV keeps groups whose indices are incomplete |
-| `TRACER_VF_TRANSFER_TIMEOUT` | `120` | 5.3 | Per-hop model timeout in seconds |
-
-Read every flag **once**, in `ValueFlowResolver.__init__` (or
-`make_value_flow_calls` for the two that live outside the resolver), into a
-plain attribute. Never call `os.environ` inside a hot path, and never let a flag
-change a cache key's meaning — see 5.4 for the one case where it must.
-
-Fixes 5.2, 5.3, 5.8 are unflagged: they are strictly corrective.
-
----
-
-## 5.2 — P12: match function definitions by name *and* line range
-
-**File:** `value_flow/resolver.py`, `_build_function_index` (~470-490).
-
-Today the match is name-only, first hit wins:
-
-```python
-for candidate in definitions_by_file.get(function_node.file_name, []):
-    name = _extract_declarator_identifier(candidate.child_by_field_name("declarator"), source)
-    if name == function_node.name:
-        ast_node = candidate
-        break
-```
-
-Two failures: a `static` and an external function sharing a name in one file
-bind to the same node, and a definition Tree-sitter did not shape as a plain
-`function_definition` binds to nothing at all (`parameters = []`, which fails
-every downstream transfer — see P12).
-
-Replace the loop with a two-pass match. `FunctionNode.start_line` /
-`end_line` exist (`call_graph/data_classes.py:23-24`) and are 1-based, with
-`-1` meaning unknown.
-
-```python
-candidates = []
-for candidate in definitions_by_file.get(function_node.file_name, []):
-    name = _extract_declarator_identifier(
-        candidate.child_by_field_name("declarator"), source
-    )
-    if name == function_node.name:
-        candidates.append(candidate)
-
-ast_node = None
-if len(candidates) == 1:
-    ast_node = candidates[0]
-elif candidates:
-    # Several same-named definitions in one file: pick the one whose byte
-    # range contains the registry's recorded start line. Name alone would
-    # bind a static and an extern of the same name to the same body.
-    start = function_node.start_line
-    if start > 0:
-        for candidate in candidates:
-            first = candidate.start_point.row + 1
-            last = candidate.end_point.row + 1
-            if first <= start <= last:
-                ast_node = candidate
-                break
-    ast_node = ast_node or candidates[0]     # preserve today's fallback
-```
-
-**Do not** add a fuzzy fallback for the "no candidate at all" case in this pass.
-Fixing *that* means understanding why Tree-sitter did not produce a
-`function_definition`, which is a preprocessing question, not an indexing one.
-Keep the Fix 0.3 warning and use its count to decide whether it is worth
-chasing.
-
-**Risk:** low. With one candidate the behaviour is byte-identical to today. With
-several it becomes more correct. With none it is unchanged.
-
-**Verify:** the Fix 0.3 warning count should not increase. If your codebase has
-same-named statics, spot-check that two such functions now get distinct
-`parameters`.
-
----
-
-## 5.3 — P20: a transfer-specific timeout
-
-**File:** `project_aware.py`, `resolve_transfer` (~1789-1795).
-
-`run_with_retry` defaults to `timeout=600, retries=2` — up to 20 minutes on one
-hop before it returns `None` and the binding becomes UNRESOLVED. A transfer
-prompt that has not answered in two minutes is not going to.
-
-`loop.run_in_executor` takes no keyword arguments, so bind them with `partial`
-(already imported, `project_aware.py:16`):
-
-```python
-result = await loop.run_in_executor(
-    llm_executor,
-    partial(run_with_retry, timeout=transfer_timeout, retries=2),
-    llm_calls_transfer,
-    (project_structure, request),
-)
-```
-
-with, once, near the other environment reads in `make_value_flow_calls`:
-
-```python
-transfer_timeout = int(os.environ.get("TRACER_VF_TRANSFER_TIMEOUT", "120"))
-```
-
-**Do not** touch `run_with_retry` itself. It is shared with every other LLM
-entry point, and its `fork` context is deliberate — the child inherits the
-`State()` singleton (`project_aware.py:770-780`). Replacing fork-per-hop with a
-direct async call is the right end state but is not a minimal change and does
-not belong in this batch.
-
-**Risk:** low, and reversible without a code change by raising the env var.
-Note it can *increase* UNRESOLVED if your endpoint is genuinely slow — watch
-`transfer_rejections["llm_returned_none"]` after enabling.
-
----
-
-## 5.4 — P10: extended grammar as opaque leaves (flagged)
-
-**Read 5.0 first.** Only do this if `binding_formula` is a material fraction of
-rejections.
-
-The safety property that makes this benign: an extended node is accepted by
-`_validate_node` but is **never evaluable**. `evaluate_formula`'s inner
-`evaluate()` returns `None` for any node kind it does not handle
-(`value_flow/transfers.py`, final `return None`), so `ok` is `False`,
-`_settle_transfer_arm` leaves the binding as `EXPRESSION`, and it can never
-become an `EXACT` numeric fact. Widening the grammar therefore cannot produce a
-wrong number — it can only let the model *name* a source it currently cannot
-name.
-
-**File A: `value_flow/transfers.py`, `validate_formula` / `_validate_node`.**
-
-Thread one flag through:
-
-```python
-def validate_formula(
-    formula: str,
-    *,
-    parameter_count: int,
-    visible_names: set[str] | None = None,
-    evidence_texts: tuple[str, ...] = (),
-    allow_boolean_literals: bool = False,
-    allow_opaque: bool = False,          # new, defaulted
-) -> tuple[dict[str, int], tuple[str, ...]]:
-```
-
-and in `_validate_node`, immediately before the final
-`raise FormulaError(f"unsupported expression node {node_type}")`:
-
-```python
-_OPAQUE_NODES = {
-    "field_expression",        # cfg->mode, cfg.mode
-    "subscript_expression",    # table[i]
-    "pointer_expression",      # *p, &x
-    "conditional_expression",  # a ? b : c
-}
-
-if allow_opaque and node_type in _OPAQUE_NODES:
-    # An opaque leaf: the model may NAME this source, but the expression is
-    # deliberately not evaluable, so it can never become an EXACT value.
-    # Do not identifier-check the children -- `cfg` in `cfg->mode` is a local
-    # and is not in visible_names by design. Only collect nested literals so
-    # they still have to be covered by evidence.
-    for descendant in _walk(node):
-        if descendant.type in {"number_literal", "char_literal", "string_literal"}:
-            text = _node_text(descendant)
-            if _literal_value(text) is not None:
-                literals.append(text)
-    return
-```
-
-`_validate_node` must accept and forward `allow_opaque` on each of its recursive
-calls (parenthesized, unary, binary).
-
-Deliberately **not** included: `call_expression`. A call has side effects and an
-unknown return; naming it as a value source is misleading, and `UNKNOWN` is the
-honest answer.
-
-**File B: `value_flow/resolver.py`.**
-
-```python
-self.allow_opaque_formula = os.environ.get("TRACER_VF_GRAMMAR_EXTENDED") == "1"
-```
-
-in `__init__`, passed as `allow_opaque=self.allow_opaque_formula` at the
-**EXPRESSION binding** call site only (`~2892`). Leave the guard call site
-(`~2875`) alone: Fix 2.4 already made guard failure non-fatal, so widening there
-buys nothing and only weakens a check.
-
-**Cache-key interaction — important.** The flag changes which answers validate,
-so an answer cached with the flag on must not be served with it off. Fold it
-into the prompt version rather than inventing a new key input:
-
-```python
-transfer_prompt_version="valueflow-transfer-v2"
-    + ("-opaque" if resolver_flags.grammar_extended else "")
-```
-
-Simplest correct placement: compute it in `make_value_flow_calls` where the
-version string is already passed (`project_aware.py:1906`).
-
-**Risk:** low for correctness of EXACT values (impossible by construction),
-moderate for output shape — more bindings stay `EXPRESSION` longer and reach
-the caller, so expect more hops. Watch `transfer_request_count`.
-
----
-
-## 5.5 — P17: report the expression instead of `"UNRESOLVED"` (flagged)
-
-**This is the fix that moves the headline number.**
-
-**File:** `value_flow/resolver.py`, `_fact_from_transfer_binding` (~3238-3245).
-
-`_mark_external_or_unknown` already preserves the substituted expression in
-`binding.text`; Fix 3.1 put it in `metadata["unresolved_expr"]`. This promotes
-it to the value, matching what the legacy engine already does for the same
-situation (`value_flow/resolver.py:1284-1298`).
-
-```python
-else:
-    sentinel = binding.text in {
-        "RECURSIVE", "UNRESOLVED", "missing argument", "HANDLE_AMBIGUOUS",
-    }
-    if self.external_unknown and not sentinel and binding.text.strip():
-        # An expression we could not trace further is still an answer: the
-        # legacy engine reports it as EXTERNAL_DATA rather than discarding it.
-        value = binding.text
-        origin = "UNKNOWN_INDIRECT" if "(*" in binding.text else "EXTERNAL_DATA"
-    else:
-        value = "UNRESOLVED"
-        origin = "RECURSIVE" if binding.text == "RECURSIVE" else "UNRESOLVED"
-```
-
-with `self.external_unknown = os.environ.get("TRACER_VF_EXTERNAL_UNKNOWN") == "1"`
-in `__init__`. Keep `metadata["unresolved_expr"]` populated either way, so the
-two modes stay comparable.
-
-**Before enabling, check the downstream consumers**, because this changes the
-`value` column and therefore `target_number->ans` in the legacy CSV:
-
-- `value_flow/outputs.py:169-172` joins values with `_` for multi-index targets.
-  An expression containing `_` or spaces will appear there.
-- `rehydrate_interactions` and anything else reading `<process>.csv`.
-- Any dashboard filtering on `value == "UNRESOLVED"` or
-  `origin_kind == "UNRESOLVED"`.
-
-The flag exists precisely so you can diff one process's CSV both ways before
-committing to it.
-
-**Risk:** none to correctness — an `EXTERNAL_DATA` fact is explicitly *not* an
-exact value and is already an existing `OriginKind` (`value_flow/queries.py`).
-The risk is entirely downstream formatting.
-
----
-
-## 5.6 — P13: several candidate opens become several arms (flagged)
-
-**File:** `value_flow/resolver.py`.
-
-`_opening_for_route` (~3327) requires `len(bindings) == 1` and returns `None`
-for zero *or* two-plus, which makes the whole seed `HANDLE_AMBIGUOUS`
-(~3694). Two opens in an if/else on the same FCB is ordinary C.
-
-Do **not** restructure `_opening_for_route` — three call sites depend on its
-single-site return. Add a sibling:
-
-```python
-def _openings_for_route(self, seed, route, dependencies) -> list[IndexedSite]:
-    """Every candidate open, where _opening_for_route requires exactly one.
-
-    A handle written by two branches has two legitimate origins; the engine
-    already represents alternatives as separate correlated arms.
-    """
-```
-
-It is `_opening_for_route` with two changes: `if bindings: return bindings`
-instead of `if len(bindings) == 1: return bindings[0]`, and every `return None`
-becomes `return []`.
-
-Then in `_resolve_seed_with_transfers` (~3459-3477), when the flag is on, call
-it and append one `effective` entry per opening. `_route_for_opening` already
-takes a single opening, so nothing downstream changes:
-
-```python
-openings = (
-    self._openings_for_route(seed, consumer_route, dependencies)
-    if self.multi_open
-    else [o for o in [self._opening_for_route(seed, consumer_route, dependencies)] if o]
-)
-for opening in openings:
-    effective_route = self._route_for_opening(consumer_route, opening)
-    ...
-```
-
-**Risk:** medium — row count rises for handle targets, and each opening becomes
-its own correlated arm. Confirm `_deduplicate_records` (~4346, keyed partly on
-`correlation_id`) and `_legacy_rows` grouping produce what you expect before
-trusting the output. This is the item most worth leaving off until measured.
-
----
-
-## 5.7 — P18: stop silently dropping legacy rows (flagged)
-
-**File:** `value_flow/outputs.py:157-163`.
-
-```python
-if expected and set(ordered_indices) != expected:
-    continue
-```
-
-A correlated group whose indices do not exactly equal the configured `indices`
-vanishes from the legacy CSV — so a target invocation can be missing rather
-than unresolved, which is worse for triage than an honest UNRESOLVED.
-
-```python
-if expected and set(ordered_indices) != expected:
-    if not keep_partial_rows:
-        continue
-    # Emitting a partial bundle is more honest than dropping the invocation:
-    # a missing row is indistinguishable from a target that was never found.
-```
-
-`keep_partial_rows` is read once in `write_outputs` / `_legacy_rows`'s caller
-and threaded down as a parameter — do not read the environment inside the row
-loop.
-
-**Risk:** low, but it changes row counts in the legacy CSV, which is why it is
-flagged. Note Fix 1.3 (partial arms) makes this case more common than it was.
-
----
-
-## 5.8 — P16: stop using a list ordinal as a byte offset
-
-**File:** `value_flow/resolver.py`, `_build_call_index` (~700-706).
-
-```python
-start_byte = (
-    call_site.start_byte
-    if call_site.start_byte >= 0
-    else (ast_node.start_byte if ast_node is not None else ordinal)
-)
-```
-
-That final `ordinal` is a list index standing in for a byte offset. It yields a
-`site_id` that collides with a real offset, a meaningless
-`SELECTED OUTGOING CALL (n:m)` in the prompt, and an empty
-`selected_site_source` slice in the cache key.
-
-The `site_id` format cannot change without invalidating caches and outputs, so
-keep the ordinal as the *identity* fallback but stop presenting it as a byte
-range. Add one field to `IndexedSite`:
-
-```python
-byte_range_known: bool = True
-```
-
-set to `False` on exactly that fallback path. Then in `request_local_transfer`,
-when it is `False`, send `selected_call_start_byte=-1`,
-`selected_call_end_byte=-1`, and have the prompt render "(byte range unknown)"
-instead of a fake range. The snippet-based evidence from Fix 1.2 already
-works without offsets, so nothing else needs to change.
-
-**Risk:** low and narrow. Confirm how often it fires first — add
-`self.transfer_rejections["site_without_bytes"]` at the fallback and check
-whether the count is non-zero before spending time here.
-
----
-
-## 5.9 — P24: remove the prose→JSON second pass (last, largest)
-
-Fix 4.5 removed the tool loop, which was the expensive half. What remains: when
-the model answers, `client/llm.py:494-560` makes a **second** model call to
-convert prose into JSON, with up to 5 retries. Every transfer hop is still two
-round trips, and structured fields still traverse a prose intermediary.
-
-The correct fix is native structured output —
-`client.chat.completions.parse(..., response_format=self.output_model)` on the
-first call, falling back to the existing path when the endpoint does not support
-it. That is a real change to a client shared by three prompts, so:
-
-- gate it on `TRACER_VF_STRUCTURED_OUTPUT=1`;
-- apply it only when `self.output_model is TransferAnswerModel`, leaving the
-  legacy prompts on today's path entirely;
-- keep the existing prose→JSON code as the `except` fallback, so an endpoint
-  that rejects `response_format` degrades instead of failing.
-
-Do this **after** everything above has been measured. It is the largest
-remaining latency win and the change most likely to break an endpoint.
-
----
-
-## 5.10 — Order and gates
-
-| Step | Fix | Gate before doing it |
-|---|---|---|
-| 1 | 5.2 (P12 indexing), 5.3 (timeout), 5.8 (P16) | none — corrective |
-| 2 | 5.5 (P17) **flag off**, land the code | none; enable only after a CSV diff |
-| 3 | 5.7 (P18) **flag off** | none |
-| 4 | 5.6 (P13) **flag off** | enable only if `HANDLE_AMBIGUOUS` count is material |
-| 5 | 5.4 (P10) **flag off** | enable only if `binding_formula` count is material |
-| 6 | 5.9 (P24) | after a measured baseline exists |
-
-Land steps 1–5 in one batch if you like: with every flag off, the only live
-changes are the three corrective ones, so the batch is inert by construction.
-Then tune by flipping flags one at a time and diffing `facts.csv`.
-
-**P11 (literal/evidence substring matching) is still deferred**, and now for a
-specific reason: Fix 1.1's step 4 widens a degenerate span to its whole line,
-which already makes literal coverage more permissive. Normalising `0x10` against
-`16` on top of that compounds two relaxations of the same check. Measure the
-false-positive rate on literals first.
-
----
-
-# Part 6 — Closing status
-
-P11 and P20 (the two Part 3/Part 5 deferrals) are now implemented. Every
-problem in the Part 1 inventory is addressed.
-
-## 6.1 — P11: literal grounding is now value-based, not spelling-based
-
-**File:** `value_flow/transfers.py`, `validate_formula`.
-
-The exact-substring check runs first and is unchanged. Only when it fails does
-the check fall back to comparing integer **values**: the literal is parsed with
-`_literal_value`, and the evidence is scanned by `_EVIDENCE_LITERAL` for
-integer and character literals in any C base, parsed the same way.
-
-`0x10` now matches evidence spelling `16`, `1U` matches `1`, and `10` matches
-`'\n'`. An ungrounded number still has no matching value and still fails.
-
-This was deferred in 5.10 out of concern that it compounds Fix 1.1's
-line-widening. On implementation that concern does not hold: the widened span
-already admits every literal spelled on that line, and this change only removes
-a *spelling* artifact from a check that was always meant to be about the
-number. It is a bug fix, not a second relaxation.
-
-## 6.2 — P20: the fork per hop is now bypassable
-
-Two changes, the first unflagged and the second gated.
-
-**`client/llm.py`, `OllamaClient.__init__`** — the OpenAI client now accepts
-`data["timeout"]` and, when given, passes `timeout=` and `max_retries=0`.
-Callers that pass nothing are unaffected. `llm_calls_transfer` passes
-`TRACER_VF_TRANSFER_TIMEOUT` (default 120s).
-
-This matters on its own: the SDK default is what made a hung call unstoppable,
-which is the reason `run_with_retry` forks and terminates in the first place.
-With the request bounded, the fork is no longer load-bearing for the transfer
-path.
-
-**`project_aware.py`, `resolve_transfer`** — with `TRACER_VF_NO_FORK=1`,
-`llm_calls_transfer` runs directly on the LLM thread pool instead of through
-`run_with_retry`. A raised exception is caught by
-`ValueFlowResolver._await_llm` and counted as `llm_exception`, exactly as a
-fork failure is today.
-
-`run_with_retry` itself is still untouched, as the plan required — the legacy
-one-hop and return-use prompts keep forking.
-
-**Why this is flagged rather than default-on:** it changes crash-isolation
-semantics for the transfer path, and it cannot be validated without a live
-endpoint. Enable it once a real run confirms the timeout behaves, then it is
-the single largest remaining latency and memory win: no forked child per hop,
-each of which copy-on-writes a parent holding every tree, AST and registry.
-
-## 6.3 — Final flag table
-
-| Flag | Default | Fix | Effect when on |
-|---|---|---|---|
-| `TRACER_VF_GRAMMAR_EXTENDED` | off | 5.4 | EXPRESSION may use field/index/deref/ternary as opaque leaves |
-| `TRACER_VF_EXTERNAL_UNKNOWN` | off | 5.5 | UNKNOWN bindings report their expression instead of `"UNRESOLVED"` |
-| `TRACER_VF_MULTI_OPEN` | off | 5.6 | Several candidate opens become several arms |
-| `TRACER_VF_KEEP_PARTIAL_ROWS` | off | 5.7 | Legacy CSV keeps groups whose indices are incomplete |
-| `TRACER_VF_STRUCTURED_OUTPUT` | off | 5.9 | Transfer prompt parses natively; falls back to prose→JSON |
-| `TRACER_VF_NO_FORK` | off | 6.2 | Transfer prompt runs in-thread instead of forking |
-| `TRACER_VF_TRANSFER_TIMEOUT` | `120` | 5.3 / 6.2 | Per-hop model timeout, seconds |
-
-With no flags set, behaviour equals the end of Part 2 plus the unflagged
-corrective fixes. Tuning is flag-flipping, not editing.
-
-## 6.4 — What is verified, and what is not
-
-**Verified:** the full suite passes identically (183 passed / 5 pre-existing
-unrelated failures) with every flag off *and* with every flag on. `_repair_span`
-and the P11 value check were exercised directly against their edge cases.
-
-**Not verified, and cannot be here:** no part of this has run against a real
-project with a live model. Every recall claim remains a hypothesis until
-`transfer_rejections` and the `origin_kind` histogram are read from a real run.
-That measurement is still the next step, and it is what should decide which
-flags to enable.
+## 12. Final implementation handoff requirements
+
+The implementation model must report:
+
+1. Exact files changed.
+2. Which phases were completed.
+3. Tests added for every fixed failure.
+4. Focused and full-suite results.
+5. Before/after state-expansion and LLM-call counts for synthetic stress fixtures.
+6. Any behavior intentionally left unresolved.
+7. Whether the handle-scope report reproduced; if it did not, explicitly say no production handle-scope change was made.
+8. Whether any safety cap was hit during verification.
+9. Confirmation that neither `forkproc_checker/build_index.py` nor `/home/chukyu` was read.
+
+Stop when the acceptance criteria pass. Do not add further refactors, configuration systems, dashboards, or cleanup in the same change.
